@@ -1,0 +1,122 @@
+# 手动在 GitHub 的 Mac 云主机上编 NX2Apple 启动器（Mac App）
+# 放到 Wilderness01/NX2Apple 的 .github/workflows/build-launcher-manual.yml
+# 注意：不要用通用的 xcodebuild -project workflow —— 这个仓库根目录没有
+# .xcodeproj，Mac 启动器是 Swift Package（frontend/Package.swift），
+# 正确的编法是上游 build-mac-app.yml 那套：swift build + 手工组装 .app。
+# 这个文件就是那套做法的手动版：只在 Actions 里点 Run workflow 才跑，
+# 不发 release、不上传引擎，只产出 NX2Apple-macOS-arm64.zip。
+# 上游已有的 build-mac-app.yml 不用动，它负责 push/tag 时的正式构建。
+name: Build NX2Apple launcher (manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 120
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile app icon
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/app-icon"
+          mkdir -p "$OUT"
+          xcrun actool frontend/AppIcon.icon --compile "$OUT" --platform macosx --minimum-deployment-target 13.0 \
+            --app-icon AppIcon --output-partial-info-plist "$OUT/partial.plist"
+          ls -la "$OUT/Assets.car" "$OUT/AppIcon.icns"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install signing tool package
+        run: python -m pip install -r tools/requirements-release.txt
+
+      - name: Engine tree
+        run: |
+          set -euo pipefail
+          python tools/engine.py sync
+          python tools/engine.py tree --out "$RUNNER_TEMP/engine-tree" --zip "$RUNNER_TEMP/engine-out/NX2Apple-engine.zip"
+          du -sh "$RUNNER_TEMP/engine-tree" "$RUNNER_TEMP/engine-out/NX2Apple-engine.zip"
+
+      - name: Version from source
+        id: ver
+        run: |
+          set -euo pipefail
+          v=$(sed -n 's/.*static let appVersion = "\(.*\)".*/\1/p' frontend/Sources/NXModel/AppUpdateStore.swift)
+          test -n "$v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "version: $v"
+
+      - name: Build launcher
+        working-directory: frontend
+        run: swift build -c release
+
+      - name: Assemble bundle
+        working-directory: frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="NX2Apple.app"
+          rm -rf "$APP"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp .build/release/NX2Apple "$APP/Contents/MacOS/NSPortBuilder"
+          cp "$RUNNER_TEMP/app-icon/Assets.car" "$RUNNER_TEMP/app-icon/AppIcon.icns" "$APP/Contents/Resources/"
+          tools/bundle_tools.sh "$APP/Contents/Resources" "$RUNNER_TEMP/bundle-tools-work"
+          python3 tools/nxbuild.py fetch "$APP/Contents/Resources" "$RUNNER_TEMP/nxbuild-work"
+          ditto "$RUNNER_TEMP/engine-tree" "$APP/Contents/Resources/engine"
+          tools/sign_engine_tree.sh "$APP/Contents/Resources/engine" "$RUNNER_TEMP/engine-tree"
+          rsync -a --exclude .build --exclude .swiftpm ../frontend-ios/ "$APP/Contents/Resources/frontend-ios/"
+          rsync -a l10n/ "$APP/Contents/Resources/l10n/"
+          V="${{ steps.ver.outputs.version }}"
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key><string>NSPortBuilder</string>
+            <key>CFBundleIconFile</key><string>AppIcon</string>
+            <key>CFBundleIconName</key><string>AppIcon</string>
+            <key>CFBundleIdentifier</key><string>org.nxnative.NSPortBuilder</string>
+            <key>CFBundleName</key><string>NX2Apple</string>
+            <key>CFBundleDisplayName</key><string>NX2Apple</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$V</string>
+            <key>CFBundleVersion</key><string>$V</string>
+            <key>CFBundleDevelopmentRegion</key><string>en</string>
+            <key>CFBundleLocalizations</key><array><string>en</string><string>zh-Hans</string><string>sv</string><string>de</string><string>fr</string><string>it</string></array>
+            <key>LSMinimumSystemVersion</key><string>13.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          plutil -lint "$APP/Contents/Info.plist"
+          codesign --force --deep --sign - "$APP"
+          codesign -v --deep --strict "$APP"
+
+      - name: Check bundle
+        working-directory: frontend
+        run: |
+          set -euo pipefail
+          tools/check_bundle.sh NX2Apple.app
+          codesign -v --deep --strict NX2Apple.app
+
+      - name: Package
+        working-directory: frontend
+        run: |
+          set -euo pipefail
+          ditto -c -k --keepParent NX2Apple.app NX2Apple-macOS-arm64.zip
+          ls -lh NX2Apple-macOS-arm64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NX2Apple-macOS-arm64
+          path: frontend/NX2Apple-macOS-arm64.zip
+          if-no-files-found: error
