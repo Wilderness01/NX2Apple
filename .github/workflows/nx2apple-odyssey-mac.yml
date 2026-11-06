@@ -115,15 +115,20 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out
-          # IPA 和 romfs.img 可能落在工作区或 RUNNER_TEMP，先都收到 out/ 里再上传
-          find . "$RUNNER_TEMP" \( -name '*.ipa' -o -name 'romfs.img' \) -exec cp -v {} out/ \;
+          # IPA 和游戏数据可能落在工作区或 RUNNER_TEMP，先都收到 out/ 里再上传。
+          # 注意：解包出来的数据镜像在磁盘上叫 RomFS.img（大写 R/F），不是小写的
+          # romfs.img，find 必须用 -iname 忽略大小写，否则永远找不到；
+          # 拷出来后改回小写 romfs.img，iPhone 上 App 认的是小写名字。
+          find "$RUNNER_TEMP" \( -iname '*.ipa' -o -iname 'romfs.img' \) -exec cp -v {} out/ \;
+          find . -not -path './out/*' \( -iname '*.ipa' -o -iname 'romfs.img' \) -exec cp -v {} out/ \;
+          if [ -f out/RomFS.img ]; then mv out/RomFS.img out/romfs.img; fi
           ls -lh out/
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
           name: SuperMarioOdyssey-ipa
-          path: "out/*.ipa"
+          path: "out/SuperMarioOdyssey.ipa"
           if-no-files-found: error
 
       - name: Upload game data (romfs.img)
@@ -131,4 +136,4 @@ jobs:
         with:
           name: SuperMarioOdyssey-romfs
           path: "out/romfs.img"
-          if-no-files-found: warn
+          if-no-files-found: error
