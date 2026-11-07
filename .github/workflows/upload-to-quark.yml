@@ -1,0 +1,60 @@
+# 把某次构建的产物传到夸克网盘（手动触发，不用重新编译）——试验用
+# 用法：先在自己电脑上 pip install quarkpan，跑 quarkpan auth login 扫码登录一次，
+# 把登录后生成的 config/cookies.json 内容存进 GitHub Secret QUARK_COOKIES（别发聊天里），
+# 再触发这个 workflow。文件传到夸克网盘根目录（先验证账号能不能用、能不能传）。
+# 如果登录时夸克提示账号被封禁，这个办法就走不通，改回阿里云盘。
+name: Upload artifacts to Quark (manual, test)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: '要取产物的 GitHub run ID（默认是壳构建 #10）'
+        required: true
+        default: '42343684121'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  upload:
+    runs-on: xcode-27
+    timeout-minutes: 180
+    steps:
+      - name: Download artifacts from run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          gh run download "$RUN_ID" -n NX2Apple-shell-ipa -D out
+          gh run download "$RUN_ID" -n SuperMarioOdyssey-romfs -D out
+          ls -lh out/
+
+      - name: Upload to Quark
+        env:
+          QUARK_COOKIES: ${{ secrets.QUARK_COOKIES }}
+        run: |
+          set -euo pipefail
+          if [ -z "$QUARK_COOKIES" ]; then echo "QUARK_COOKIES secret not set"; exit 1; fi
+          python3 -m venv .venv
+          .venv/bin/pip install -q quarkpan
+          mkdir -p config
+          printf '%s' "$QUARK_COOKIES" > config/cookies.json
+          chmod 600 config/cookies.json
+          Q=.venv/bin/quarkpan
+          "$Q" auth status || echo "auth status check failed, continuing to upload test"
+          "$Q" upload out/NX2Apple.ipa --folder /NX2Apple --create-dirs
+          "$Q" upload out/romfs.img --folder /NX2Apple --create-dirs
+          "$Q" ls --folder-id 0
+          {
+            echo "## 夸克网盘上传完成（试验）"
+            echo ""
+            echo "文件已传到夸克网盘的 /NX2Apple/ 文件夹："
+            echo "- NX2Apple.ipa"
+            echo "- romfs.img"
+            echo ""
+            echo "在夸克 App 里查看/分享下载即可。"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
