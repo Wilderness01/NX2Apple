@@ -1,0 +1,64 @@
+# 把某次构建的产物传到阿里云盘（手动触发，不用重新编译）
+# 用法：先在自己电脑上用 aliyunpan login 扫码登录一次，
+# 把登录后生成的 aliyunpan_config.json 内容存进 GitHub Secret ALIYUNPAN_CONFIG（别发聊天里），
+# 再触发这个 workflow。文件传到你阿里云盘自己的 /NX2Apple/ 文件夹，用官方客户端下载。
+# 注意：aliyunpan 的登录配置会过期，过期后重新登录并更新 Secret 即可。
+name: Upload artifacts to Aliyun Drive (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: '要取产物的 GitHub run ID（默认是壳构建 #10）'
+        required: true
+        default: '42343684121'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  upload:
+    runs-on: xcode-27
+    timeout-minutes: 180
+    steps:
+      - name: Download artifacts from run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          gh run download "$RUN_ID" -n NX2Apple-shell-ipa -D out
+          gh run download "$RUN_ID" -n SuperMarioOdyssey-romfs -D out
+          ls -lh out/
+
+      - name: Upload to Aliyun Drive
+        env:
+          ALIYUNPAN_CONFIG: ${{ secrets.ALIYUNPAN_CONFIG }}
+        run: |
+          set -euo pipefail
+          if [ -z "$ALIYUNPAN_CONFIG" ]; then echo "ALIYUNPAN_CONFIG secret not set"; exit 1; fi
+          curl -sL -o aliyunpan.zip https://github.com/tickstep/aliyunpan/releases/download/v0.4.0/aliyunpan-v0.4.0-darwin-macos-arm64.zip
+          unzip -q aliyunpan.zip
+          chmod +x aliyunpan-v0.4.0-darwin-macos-arm64/aliyunpan
+          AP=aliyunpan-v0.4.0-darwin-macos-arm64/aliyunpan
+          export ALIYUNPAN_CONFIG_DIR="$RUNNER_TEMP/aliyunpan-config"
+          mkdir -p "$ALIYUNPAN_CONFIG_DIR"
+          printf '%s' "$ALIYUNPAN_CONFIG" > "$ALIYUNPAN_CONFIG_DIR/aliyunpan_config.json"
+          chmod 600 "$ALIYUNPAN_CONFIG_DIR/aliyunpan_config.json"
+          "$AP" who
+          "$AP" quota
+          "$AP" mkdir /NX2Apple || true
+          "$AP" upload -ow out/NX2Apple.ipa /NX2Apple
+          "$AP" upload -ow out/romfs.img /NX2Apple
+          "$AP" ls -l /NX2Apple
+          {
+            echo "## 阿里云盘上传完成"
+            echo ""
+            echo "文件已传到你阿里云盘的 /NX2Apple/ 文件夹："
+            echo "- NX2Apple.ipa"
+            echo "- romfs.img"
+            echo ""
+            echo "用阿里云盘官方客户端打开 /NX2Apple/ 下载即可。"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
