@@ -1,0 +1,81 @@
+# 把某次构建的产物发成 GitHub Release（手动触发，不用重新编译）
+# GitHub 单个 Release 附件不能超过 2GB，所以 5.3GB 的 romfs.img 会切成 3 段上传，
+# 下载后用 copy /b 拼回去（说明写在 Release 正文里）。
+# 发完后国内下载可以在链接前加镜像前缀，例如：
+# https://mirror.ghproxy.com/https://github.com/Wilderness01/NX2Apple/releases/download/v1.0.0/NX2Apple.ipa
+name: Publish artifacts as Release (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: '要取产物的 GitHub run ID（默认是壳构建 #10）'
+        required: true
+        default: '42343684121'
+      tag:
+        description: 'Release 的 tag（重跑会先删掉同名 Release 再重建）'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: xcode-27
+    timeout-minutes: 120
+    steps:
+      - name: Download artifacts from run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          gh run download "$RUN_ID" -n NX2Apple-shell-ipa -D out
+          gh run download "$RUN_ID" -n SuperMarioOdyssey-romfs -D out
+          ls -lh out/
+
+      - name: Split romfs and create Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          ls -lh out/
+          # romfs.img 约 5.3GB，GitHub 单个附件上限 2GB，切成 1900MB 一段
+          split -b 1900M -d out/romfs.img out/romfs.img.part
+          ls -lh out/
+          IPA_SHA=$(shasum -a 256 out/NX2Apple.ipa | awk '{print $1}')
+          ROMFS_SHA=$(shasum -a 256 out/romfs.img | awk '{print $1}')
+          cat > NOTES.md <<EOF
+          壳 App（NX2Apple）+ 奥德赛游戏数据，来自壳构建 #10（run ${{ inputs.run_id }}）。
+
+          文件说明：
+          - NX2Apple.ipa：壳 App（未签名），用 AltStore 安装；游戏数据不在包里。
+          - romfs.img.part00 / part01 / part02：游戏数据 romfs.img 切成的 3 段（GitHub 单个附件不能超过 2GB）。
+
+          拼合方法（Windows，在下载文件夹里打开 cmd）：
+          copy /b romfs.img.part00+romfs.img.part01+romfs.img.part02 romfs.img
+
+          拼好后把 romfs.img 放到壳 App 的 Documents/games/0100000000010000/ 文件夹里。
+
+          校验：
+          - NX2Apple.ipa sha256: $IPA_SHA
+          - romfs.img sha256: $ROMFS_SHA
+
+          国内下载慢的话，在下载链接前面加上镜像前缀，例如：
+          https://mirror.ghproxy.com/https://github.com/Wilderness01/NX2Apple/releases/download/$TAG/NX2Apple.ipa
+          EOF
+          # 重跑时先删掉同名 Release（避免 tag 已存在报错）
+          gh release delete "$TAG" -y --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" \
+            --title "Super Mario Odyssey (Shell) V1.0.0" \
+            --notes-file NOTES.md \
+            out/NX2Apple.ipa out/romfs.img.part00 out/romfs.img.part01 out/romfs.img.part02
+          {
+            echo "## Release 已发布"
+            echo ""
+            echo "https://github.com/Wilderness01/NX2Apple/releases/tag/$TAG"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
