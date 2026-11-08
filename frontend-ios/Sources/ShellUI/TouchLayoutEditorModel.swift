@@ -10,7 +10,7 @@ import UIKit
 @MainActor @Observable final class TouchLayoutEditorModel {
     typealias Control = TouchLayout.Control
 
-    @ObservationIgnored let store: ShellSettingsStore
+    @ObservationIgnored let store: any TouchLayoutStore   // patch 0098: the shared store, or one game's store (the in-game editor)
     /// The device held sideways, and upright where the controls can sit below the picture (an iPad, iPhone Duo), else nil.
     let sideways: PadScreen
     let upright: PadScreen?
@@ -34,7 +34,7 @@ import UIKit
     /// Reset all was asked for and waits for its answer: the editor asks before it puts every control of the shown layout back.
     private(set) var confirmingReset = false
 
-    init(store: ShellSettingsStore = .current, sideways: PadScreen = .proMax, upright: PadScreen? = nil, kind: TouchLayout.Kind? = nil) {
+    init(store: any TouchLayoutStore = ShellSettingsStore.current, sideways: PadScreen = .proMax, upright: PadScreen? = nil, kind: TouchLayout.Kind? = nil, pillVariant: Bool = false) {
         self.store = store
         initialLayout = store.touchLayout
         initialSize = store.touchSize
@@ -45,7 +45,7 @@ import UIKit
         initialFull = kind.full
         let k = upright == nil && kind.split ? TouchLayout.Kind.of(full: kind.full, split: false) : kind
         editing = TouchLayoutEditing(layout: store.touchLayout, kind: k, screen: k.split ? (upright ?? sideways) : sideways,
-                                     size: store.touchSize, stick: store.touchStick)
+                                     size: store.touchSize, stick: store.touchStick, pillVariant: pillVariant)
     }
 
     var hasChanges: Bool {
@@ -196,13 +196,27 @@ import UIKit
 
 extension TouchLayoutEditorModel {
     /// Opens the saved global layout; live geometry decides the overlay/split variant.
-    static func forDevice(window: CGSize, insets: EdgeInsets, store: ShellSettingsStore = .current) -> TouchLayoutEditorModel {
+    static func forDevice(window: CGSize, insets: EdgeInsets, store: any TouchLayoutStore = ShellSettingsStore.current) -> TouchLayoutEditorModel {
         #if os(iOS)
         let screens = TouchLayoutScreens.device(window: window, insets: insets, isPad: UIDevice.current.userInterfaceIdiom == .pad)
         #else
         let screens = (sideways: PadScreen.proMax, upright: PadScreen?.none)
         #endif
         return TouchLayoutEditorModel(store: store, sideways: screens.sideways, upright: screens.upright)
+    }
+
+    /// Opens the saved layout of one game, over that running game (patch 0098: the gear menu's "Move buttons…");
+    /// live geometry decides the overlay/split variant. The store is the game's own: confirming saves there.
+    /// The editor previews the pill variant when the game is Odyssey (0100000000010000), so what it shows is
+    /// what that game draws; every other game previews the classic layout.
+    static func forGame(window: CGSize, insets: EdgeInsets, store: any TouchLayoutStore, titleID: String) -> TouchLayoutEditorModel {
+        #if os(iOS)
+        let screens = TouchLayoutScreens.device(window: window, insets: insets, isPad: UIDevice.current.userInterfaceIdiom == .pad)
+        #else
+        let screens = (sideways: PadScreen.proMax, upright: PadScreen?.none)
+        #endif
+        return TouchLayoutEditorModel(store: store, sideways: screens.sideways, upright: screens.upright,
+                                      pillVariant: titleID == "0100000000010000")
     }
 
     /// A change of one of the editor's rows from the list of choices (a row too narrow for its segments).

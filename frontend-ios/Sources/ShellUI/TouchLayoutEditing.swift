@@ -14,10 +14,12 @@ struct TouchLayoutEditing: Equatable {
     var screen: PadScreen
     var size = "medium"
     var stick = "corner"
+    /// The pill variant (Odyssey's designed layout): the editor previews the same geometry the game draws.
+    var pillVariant = false
     /// A B X Y move as one diamond. Off, each key moves on its own (the engine keeps the diamond for a key that does not fit).
     var together = true
 
-    func geometry(_ l: TouchLayout) -> PadGeo { PadGeo.make(screen, full: kind.full, size: size, stick: stick, layout: l) }
+    func geometry(_ l: TouchLayout) -> PadGeo { PadGeo.make(screen, full: kind.full, size: size, stick: stick, layout: l, pillVariant: pillVariant) }
     var geo: PadGeo { geometry(layout) }
 
     /// The control a touch on `c` moves: the whole diamond while its keys move together.

@@ -3,6 +3,9 @@ import Foundation
 
 /// A screen the touch controls are laid out on, as the engine sees it: the game view's size in points, its safe-area insets and,
 /// on a foldable, the fold.
+///
+/// The pill variant (Odyssey's designed layout) is the same code with a second constant set, switched by `PadGeo.pillVariant`:
+/// horizontal pill shoulders, bigger keys. Only Odyssey uses it; every other game keeps the classic teardrops.
 public struct PadScreen: Equatable, Sendable {
     public struct Insets: Equatable, Sendable {
         public var top: CGFloat, left: CGFloat, bottom: CGFloat, right: CGFloat
@@ -17,12 +20,9 @@ public struct PadScreen: Equatable, Sendable {
     public var division: CGRect?
     /// iPhone Duo's inner display upright: the picture keeps only the top inset (front_ios.m's duoPortrait).
     public var topSafeOnly = false
-    /// Only custom controls on Duo outer landscape may extend beyond safe insets.
-    public var customControlsFullBounds = false
 
-    public init(size: CGSize, insets: Insets = Insets(), partiallyOpen: Bool = false, division: CGRect? = nil, topSafeOnly: Bool = false, customControlsFullBounds: Bool = false) {
+    public init(size: CGSize, insets: Insets = Insets(), partiallyOpen: Bool = false, division: CGRect? = nil, topSafeOnly: Bool = false) {
         self.size = size; self.insets = insets; self.partiallyOpen = partiallyOpen; self.division = division; self.topSafeOnly = topSafeOnly
-        self.customControlsFullBounds = customControlsFullBounds
     }
 
     /// iPhone Pro Max held sideways, the screen the settings preview has always shown.
@@ -59,13 +59,14 @@ struct PadGeo: Equatable {
 
     var u: CGFloat = 0
     var safe: CGRect = .null, corner: CGRect = .null
-    var customBounds: CGRect?
     var portrait = false
     var face: CGPoint = .zero, faceGap: CGFloat = 0, faceR: CGFloat = 0, faceHitR: CGFloat = 0
     var stick: CGPoint = .zero, stickR: CGFloat = 0, knobR: CGFloat = 0
     var dpad: CGPoint = .zero, dpadR: CGFloat = 0, armW: CGFloat = 0, armIn: CGFloat = 0
     var drop: [CGPoint] = Array(repeating: .zero, count: 4), dropR: [CGFloat] = Array(repeating: 0, count: 4)   // ZL, L, ZR, R
     var click: [CGPoint] = [.zero, .zero], clickR: CGFloat = 0                                                   // L3, R3
+    var shoulder: [CGRect] = Array(repeating: .zero, count: 4), clickRect: [CGRect] = [.zero, .zero]             // the pill variant: ZL, L, ZR, R and L3, R3 as rectangles
+    var pillVariant = false                                                                                            // the pill variant is in use
     var pill: [CGRect] = [.zero, .zero]                                                                          // −, +
     var swap: CGPoint = .zero, swapR: CGFloat = 0
     var faceKey: [CGPoint] = Array(repeating: .zero, count: 4)                                                  // A, B, X, Y
@@ -74,8 +75,9 @@ struct PadGeo: Equatable {
     var full = false
     var region = Region(game: .zero, controls: .zero, separated: false, topSafeOnly: false)
 
-    /// A quarter of a face key's width: one step of the arrangement.
-    var step: CGFloat { faceR / 2 }
+    /// One step of the arrangement: a fixed 13.5u (a quarter of the classic face key's width), not faceR / 2, so the
+    /// pill variant's bigger face (38u) does not reinterpret the steps players already saved.
+    var step: CGFloat { 13.5 * u }
 
     // MARK: DmLayout.h
 
@@ -121,11 +123,17 @@ struct PadGeo: Equatable {
         switch i { case 0: CGPoint(x: c.x + d, y: c.y); case 1: CGPoint(x: c.x, y: c.y + d); case 2: CGPoint(x: c.x, y: c.y - d); default: CGPoint(x: c.x - d, y: c.y) }
     }
 
-    static func at(_ screen: PadScreen, _ region: Region, full: Bool, u: CGFloat) -> PadGeo {
+    static func at(_ screen: PadScreen, _ region: Region, full: Bool, u: CGFloat, pillVariant: Bool = false) -> PadGeo {
         let bounds = CGRect(origin: .zero, size: screen.size), insets = screen.insets
         var g = PadGeo()
         let sep = region.separated
-        g.u = u; g.full = full; g.region = region
+        g.u = u; g.full = full; g.region = region; g.pillVariant = pillVariant
+        // The variant's constants, picked as one set (the classic set is the default); the rest reads only these.
+        let faceGap = pillVariant ? 68 : 50, faceR = pillVariant ? 38 : 27, faceX = pillVariant ? 240 : 81, faceY = pillVariant ? 150 : 82,
+            stickX = pillVariant ? 120 : 81, stickY = pillVariant ? 125 : 82, stickR = pillVariant ? 80 : 77, knobR = pillVariant ? 28 : 30,
+            lowX = pillVariant ? 331 : 231, lowY = pillVariant ? 121 : 64, dpadR = pillVariant ? 64 : 48, armW = pillVariant ? 23 : 17,
+            armIn = pillVariant ? 15 : 11, pillDX = pillVariant ? 88 : 52, pillY = pillVariant ? 34 : 22, pillW = pillVariant ? 72 : 50,
+            pillH = pillVariant ? 40 : 28, swapR = pillVariant ? 24 : 15
         g.safe = region.controls.intersection(inset(bounds, gameSafeInsets(bounds, insets, region.topSafeOnly)))
         var ci = insets; ci.left *= 0.5; ci.right *= 0.5
         g.corner = sep ? g.safe : inset(bounds, ci)
@@ -133,33 +141,52 @@ struct PadGeo: Equatable {
         let s = g.safe, c = g.corner
         let thumbL = CGPoint(x: s.minX + s.width * 0.28, y: s.minY + s.height * 0.58)
         let thumbR = CGPoint(x: s.minX + s.width * 0.72, y: thumbL.y)
-        g.faceGap = 50 * u; g.faceR = 27 * u; g.faceHitR = max(g.faceR * 1.25, sep ? 22 : 0)
-        g.stickR = 77 * u; g.knobR = 30 * u
-        g.dpadR = 48 * u; g.armW = 17 * u; g.armIn = 11 * u
+        g.faceGap = CGFloat(faceGap) * u; g.faceR = CGFloat(faceR) * u; g.faceHitR = max(g.faceR * 1.25, sep ? 22 : 0)
+        g.stickR = CGFloat(stickR) * u; g.knobR = CGFloat(knobR) * u
+        g.dpadR = CGFloat(dpadR) * u; g.armW = CGFloat(armW) * u; g.armIn = CGFloat(armIn) * u
         if g.portrait {
             g.face = thumbR
             g.stick = thumbL; if full { g.stick.x -= g.dpadR + 6 * u }
             g.dpad = CGPoint(x: thumbL.x + g.stickR + 6 * u, y: thumbL.y)
         } else {
             let edge: CGFloat = sep ? g.faceGap + g.faceHitR : 0
-            g.face = side(c, right: true, max(81 * u, edge), c.maxY - max(82 * u, edge))
-            g.stick = side(c, right: false, 81 * u, c.maxY - 82 * u)
-            g.dpad = side(c, right: false, 231 * u, c.maxY - 64 * u)
+            g.face = side(c, right: true, max(CGFloat(faceX) * u, edge), c.maxY - max(CGFloat(faceY) * u, edge))
+            g.stick = side(c, right: false, CGFloat(stickX) * u, c.maxY - CGFloat(stickY) * u)
+            g.dpad = side(c, right: false, CGFloat(lowX) * u, c.maxY - CGFloat(lowY) * u)
         }
         let edge: CGFloat = sep ? 22 : 0
-        for i in 0..<4 {
-            let z = i == 0 || i == 2
-            g.drop[i] = side(s, right: i >= 2, max((z ? 44 : 44) * u, edge), s.minY + max((z ? 40 : 108) * u, edge))
-            g.dropR[i] = (z ? 26 : 24) * u
+        if pillVariant {
+            // Horizontal pills: centre (X from the outer edge, Y from the top) + size. The circle fields keep the
+            // rect's centre, so a reader that only knows circles still sees the pill's middle.
+            for i in 0..<4 {
+                let z = i == 0 || i == 2
+                let w = CGFloat(z ? 84 : 72) * u, h = CGFloat(z ? 44 : 38) * u
+                let c = side(s, right: i >= 2, max(CGFloat(z ? 84 : 86) * u, edge), s.minY + max(CGFloat(z ? 52 : 122) * u, edge))
+                g.shoulder[i] = CGRect(x: c.x - w / 2, y: c.y - h / 2, width: w, height: h)
+                g.drop[i] = c; g.dropR[i] = h / 2
+            }
+            for i in 0..<2 {
+                let w = CGFloat(62) * u, h = CGFloat(36) * u
+                let c = side(s, right: i == 1, max(CGFloat(168) * u, edge), s.minY + max(CGFloat(52) * u, edge))
+                g.clickRect[i] = CGRect(x: c.x - w / 2, y: c.y - h / 2, width: w, height: h)
+                g.click[i] = c
+            }
+            g.clickR = 18 * u
+        } else {
+            for i in 0..<4 {
+                let z = i == 0 || i == 2
+                g.drop[i] = side(s, right: i >= 2, max((z ? 44 : 44) * u, edge), s.minY + max((z ? 40 : 108) * u, edge))
+                g.dropR[i] = (z ? 26 : 24) * u
+            }
+            for i in 0..<2 { g.click[i] = side(s, right: i == 1, max(102 * u, edge), s.minY + max(40 * u, edge)) }
+            g.clickR = 17 * u
         }
-        for i in 0..<2 { g.click[i] = side(s, right: i == 1, max(102 * u, edge), s.minY + max(40 * u, edge)) }
-        g.clickR = 17 * u
-        let top = s.minY + max(22 * u, sep ? 14 : 0), w = 50 * u, h = 28 * u
+        let top = s.minY + max(CGFloat(pillY) * u, sep ? 14 : 0), w = CGFloat(pillW) * u, h = CGFloat(pillH) * u
         for i in 0..<2 {
-            let x = s.midX + (i == 1 ? 52 : -52) * u
+            let x = s.midX + (i == 1 ? CGFloat(pillDX) : -CGFloat(pillDX)) * u
             g.pill[i] = CGRect(x: x - w / 2, y: top - h / 2, width: w, height: h)
         }
-        g.swap = CGPoint(x: s.midX, y: top); g.swapR = 15 * u
+        g.swap = CGPoint(x: s.midX, y: top); g.swapR = CGFloat(swapR) * u
         for i in 0..<4 { g.faceKey[i] = diamondKey(g.face, g.faceGap, i) }
         return g
     }
@@ -171,16 +198,22 @@ struct PadGeo: Equatable {
 
     var shapes: [Shape] {
         var out: [Shape] = []
-        for i in 0..<4 { out.append(Shape(c: faceKey[i], r: faceR, within: customBounds ?? corner, id: Self.shapeFace + i)) }
-        out.append(Shape(c: stick, r: stickR, within: customBounds ?? corner, id: Self.shapeStick))
-        if full { out.append(Shape(c: dpad, r: hypot(dpadR, armW), within: customBounds ?? corner, id: Self.shapeDpad)) }
+        for i in 0..<4 { out.append(Shape(c: faceKey[i], r: faceR, within: corner, id: Self.shapeFace + i)) }
+        out.append(Shape(c: stick, r: stickR, within: corner, id: Self.shapeStick))
+        if full { out.append(Shape(c: dpad, r: hypot(dpadR, armW), within: corner, id: Self.shapeDpad)) }
         for i in 0..<4 {
-            out.append(Shape(c: drop[i], r: dropR[i], within: customBounds ?? safe, id: Self.shapeDrop + i))
-            out.append(Shape(c: dropTip(i), r: 0, within: customBounds ?? safe, id: Self.shapeTip + i))
+            if pillVariant { out.append(Shape(rect: shoulder[i], isRect: true, within: safe, id: Self.shapeDrop + i)) }   // the pill variant: rectangles, no teardrop tips
+            else {
+                out.append(Shape(c: drop[i], r: dropR[i], within: safe, id: Self.shapeDrop + i))
+                out.append(Shape(c: dropTip(i), r: 0, within: safe, id: Self.shapeTip + i))
+            }
         }
-        if full { for i in 0..<2 { out.append(Shape(c: click[i], r: clickR, within: customBounds ?? safe, id: Self.shapeClick + i)) } }
-        for i in 0..<2 { out.append(Shape(rect: pill[i], isRect: true, within: customBounds ?? safe, id: Self.shapePill + i)) }
-        out.append(Shape(c: swap, r: swapR, within: customBounds ?? safe, id: Self.shapeSwap))
+        if full { for i in 0..<2 {
+            if pillVariant { out.append(Shape(rect: clickRect[i], isRect: true, within: safe, id: Self.shapeClick + i)) }
+            else { out.append(Shape(c: click[i], r: clickR, within: safe, id: Self.shapeClick + i)) }
+        } }
+        for i in 0..<2 { out.append(Shape(rect: pill[i], isRect: true, within: safe, id: Self.shapePill + i)) }
+        out.append(Shape(c: swap, r: swapR, within: safe, id: Self.shapeSwap))
         return out
     }
     static func inside(_ s: Shape) -> Bool {
@@ -221,14 +254,14 @@ struct PadGeo: Equatable {
     static func scale(_ size: String) -> CGFloat { size == "small" ? 0.8 : size == "large" ? 1.2 : 1 }
 
     /// The geometry before the arrangement: the size, moved toward medium until it fits, and the left stick's place.
-    static func placed(_ screen: PadScreen, full: Bool, size: String, stick place: String) -> PadGeo {
+    static func placed(_ screen: PadScreen, full: Bool, size: String, stick place: String, pillVariant: Bool = false) -> PadGeo {
         let region = region(screen)
         let u0 = baseUnit(screen, region)
         var scale = Self.scale(size)
-        var g = at(screen, region, full: full, u: u0 * scale)
+        var g = at(screen, region, full: full, u: u0 * scale, pillVariant: pillVariant)
         while scale != 1 && !g.fits {
             scale = scale > 1 ? max(1, scale - 0.05) : min(1, scale + 0.05)
-            g = at(screen, region, full: full, u: u0 * scale)
+            g = at(screen, region, full: full, u: u0 * scale, pillVariant: pillVariant)
         }
         if place == "higher" || place == "inward" {
             let up = place == "higher"
@@ -276,11 +309,11 @@ struct PadGeo: Equatable {
         case .y: shift(&faceKey[3])
         case .stick: shift(&stick)
         case .dpad: shift(&dpad)
-        case .l3: shift(&click[0])
-        case .r3: shift(&click[1])
+        case .l3: if pillVariant { shift(&clickRect[0].origin) } else { shift(&click[0]) }
+        case .r3: if pillVariant { shift(&clickRect[1].origin) } else { shift(&click[1]) }
         case .minus: shift(&pill[0].origin)
         case .plus: shift(&pill[1].origin)
-        case .zl, .l, .zr, .r: shift(&drop[Self.dropIndex(c)])
+        case .zl, .l, .zr, .r: if pillVariant { shift(&shoulder[Self.dropIndex(c)].origin) } else { shift(&drop[Self.dropIndex(c)]) }
         }
     }
     static func near(_ a: Shape, _ b: Shape, _ gap: CGFloat) -> Bool {
@@ -344,11 +377,8 @@ struct PadGeo: Equatable {
     }
 
     /// What the engine draws for this layout: `dm_pad_geo` with the player's options.
-    static func make(_ screen: PadScreen, full: Bool, size: String = "medium", stick: String = "corner", layout: TouchLayout = TouchLayout()) -> PadGeo {
-        var g = placed(screen, full: full, size: size, stick: stick)
-        if screen.customControlsFullBounds && screen.size.width > screen.size.height && !g.region.separated {
-            g.customBounds = CGRect(origin: .zero, size: screen.size)
-        }
+    static func make(_ screen: PadScreen, full: Bool, size: String = "medium", stick: String = "corner", layout: TouchLayout = TouchLayout(), pillVariant: Bool = false) -> PadGeo {
+        var g = placed(screen, full: full, size: size, stick: stick, pillVariant: pillVariant)
         let kind = TouchLayout.Kind.of(full: full, split: g.region.separated)
         if !layout.isEmpty(kind) { g.arrange(layout.moved(kind)) }
         return g
@@ -366,11 +396,11 @@ struct PadGeo: Equatable {
         case .y: faceKey[3]
         case .stick: stick
         case .dpad: dpad
-        case .l3: click[0]
-        case .r3: click[1]
+        case .l3: pillVariant ? CGPoint(x: clickRect[0].midX, y: clickRect[0].midY) : click[0]
+        case .r3: pillVariant ? CGPoint(x: clickRect[1].midX, y: clickRect[1].midY) : click[1]
         case .minus: CGPoint(x: pill[0].midX, y: pill[0].midY)
         case .plus: CGPoint(x: pill[1].midX, y: pill[1].midY)
-        case .zl, .l, .zr, .r: drop[Self.dropIndex(c)]
+        case .zl, .l, .zr, .r: pillVariant ? CGPoint(x: shoulder[Self.dropIndex(c)].midX, y: shoulder[Self.dropIndex(c)].midY) : drop[Self.dropIndex(c)]
         }
     }
     /// The controls drawn in this layout, the diamond as its four keys.
