@@ -60,7 +60,7 @@ import NXModel
 
     /// #427: the default no longer depends on the output folder, and what is saved stays.
     func testShellRootDefaultsToApplicationSupportAndIsKept() throws {
-        let defaults = UserDefaults(suiteName: "nspb-shell-" + UUID().uuidString)!
+        let defaults = TestDefaults.make("nspb-shell")
         let home = temporary.path + "/home"
         XCTAssertEqual(ShellLibrary.resolveRoot(defaults: defaults, parent: "/Volumes/A", home: home),
                        home + "/Library/Application Support/NX2Apple/shell")
@@ -75,7 +75,7 @@ import NXModel
     /// #492: the Settings page reads the path before a game is chosen; the empty parent put the shell at the root of the
     /// read-only system volume, where the write failed after the whole build.
     func testAnEmptyOrRootParentNeverSavesTheShellAtTheVolumeRoot() {
-        let defaults = UserDefaults(suiteName: "nspb-shell-" + UUID().uuidString)!
+        let defaults = TestDefaults.make("nspb-shell")
         let home = "/Users/tester"
         let root = "/Users/tester/Library/Application Support/NX2Apple/shell"
         for parent in ["", "/", "relative/games"] {
@@ -86,7 +86,7 @@ import NXModel
     }
 
     func testASavedRootAtTheVolumeRootIsRepaired() {
-        let defaults = UserDefaults(suiteName: "nspb-shell-" + UUID().uuidString)!
+        let defaults = TestDefaults.make("nspb-shell")
         defaults.set("/NX2Apple-shell", forKey: "shellRoot")
         XCTAssertEqual(ShellLibrary.resolveRoot(defaults: defaults, parent: "/Users/tester/games", home: "/Users/tester"),
                        "/Users/tester/Library/Application Support/NX2Apple/shell")
@@ -94,7 +94,7 @@ import NXModel
     }
 
     func testThePreviewDoesNotSaveARoot() {
-        let defaults = UserDefaults(suiteName: "nspb-shell-" + UUID().uuidString)!
+        let defaults = TestDefaults.make("nspb-shell")
         XCTAssertEqual(ShellLibrary.previewRoot(defaults: defaults, parent: "/Volumes/A", home: "/Users/tester"),
                        "/Users/tester/Library/Application Support/NX2Apple/shell")
         XCTAssertNil(defaults.string(forKey: "shellRoot"))
@@ -301,6 +301,15 @@ import NXModel
         open(STATE + '/calls.txt', 'a').write(' '.join(a) + '\\n')
         def val(flag): return a[a.index(flag) + 1] if flag in a else None
         if a[0] == 'xcodebuild':
+            pbx = val('-project') + '/project.pbxproj'
+            if os.path.exists(pbx):
+                import re
+                pdir = os.path.dirname(val('-project'))
+                for m in re.finditer(r'(?:path|relativePath) = "([^"]+)";', open(pbx).read()):
+                    pkg = m.group(1) if os.path.isabs(m.group(1)) else os.path.normpath(os.path.join(pdir, m.group(1)))
+                    if not os.path.isfile(pkg + '/Package.swift'):
+                        print('xcodebuild: error: Could not resolve package dependencies:', flush=True)
+                        sys.exit(74)
             bundle = [x.split('=', 1)[1] for x in a if x.startswith('PRODUCT_BUNDLE_IDENTIFIER=')][0]
             if os.path.exists(STATE + '/taken') and bundle == 'org.nxnative.shell':
                 print('error: The app identifier "' + bundle + '" cannot be registered to your development team because it is not available. Change your bundle identifier to a unique string to try again.', flush=True)
@@ -382,10 +391,15 @@ import NXModel
           exit 1
         fi
         mkdir -p "$SHELL_DIR/DmShell.xcodeproj"
+        cat > "$SHELL_DIR/DmShell.xcodeproj/project.pbxproj" <<EOF
+        F96F /* frontend-ios */ = {isa = PBXFileReference; name = "frontend-ios"; path = "$DM_SHELL_PACKAGE"; sourceTree = SOURCE_ROOT; };
+        376B /* XCLocalSwiftPackageReference */ = {isa = XCLocalSwiftPackageReference; relativePath = "$DM_SHELL_PACKAGE"; };
+        EOF
         env | sort > "\(state)/shell-env.txt"
         if [ "${DM_ENTITLEMENTS+set}" = set ] && [ -z "$DM_ENTITLEMENTS" ]; then touch "$SHELL_DIR/entitlements-empty"; else rm -f "$SHELL_DIR/entitlements-empty"; fi
         """)
         try write(repo + "/frontend-ios/Package.swift", "// swift-tools-version: 5.9\n")
+        try fm.createDirectory(atPath: repo + "/dm/ios/Shell", withIntermediateDirectories: true)
         return repo
     }
 
@@ -439,7 +453,7 @@ import NXModel
 
     private func run(_ f: Fixture, _ extra: [String] = []) -> (status: Int32, output: String) {
         var output = ""
-        let defaults = UserDefaults(suiteName: "nspb-shell-" + UUID().uuidString)!
+        let defaults = TestDefaults.make("nspb-shell")
         let status = ShellCLI.run(f.args(extra: extra), defaults: defaults) { output += $0 }
         return (status, output)
     }
@@ -596,9 +610,13 @@ import NXModel
 
         try update.write(to: URL(fileURLWithPath: image))
         var plans: [ShellCopyPlan] = []
+        var log = ""
+        i.log = { log += $0 }
         i.decideCopy = { plans.append($0); return .skip }
         XCTAssertTrue(i.installData(titleID: titleID, archive: f.archive).copySkipped)
         XCTAssertEqual(plans.map(\.bytes), [Int64(update.count)])
+        XCTAssertEqual(plans.first?.versionNote, "The game data has changed since the last copy.")
+        XCTAssertTrue(log.contains("The game data has changed since the last copy."), log)
         XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: deviceImage)), first)
         i.decideCopy = { _ in .copy }
         try write(state + "/fail-on", "romfs.img")
@@ -607,7 +625,9 @@ import NXModel
         XCTAssertEqual(i.installData(titleID: titleID, archive: f.archive).copied, 1)
         XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: deviceImage)), update)
         i.decideCopy = { _ in XCTFail("an unchanged copy needs no prompt"); return .skip }
-        XCTAssertEqual(i.installData(titleID: titleID, archive: f.archive).copied, 0)
+        let current = i.installData(titleID: titleID, archive: f.archive)
+        XCTAssertEqual(current.copied, 0)
+        XCTAssertEqual(current.message, "Z already has this version of the game data.")
     }
 
     func testNewGameVersionWithUnchangedIndexAndReinstalledContainerBothNeedTheImage() throws {
@@ -626,6 +646,7 @@ import NXModel
         XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: docs + "/games/\(titleID)/romfs.img")), update)
 
         // A different paired device has its own copy history, even if its directory listing looks identical.
+        i.decideCopy = { plan in XCTAssertNil(plan.versionNote); return .copy }
         i.device = "00008150-BBBB"
         try writeDevices(state + "/devices-default.json", [(i.device, "wired")])
         XCTAssertEqual(i.installData(titleID: titleID, archive: f.archive).copied, 1)
@@ -679,12 +700,12 @@ import NXModel
 
     func testCLIChecksItsArguments() throws {
         var output = ""
-        XCTAssertEqual(ShellCLI.run(["--install-shell", "--framework", "/x"], defaults: UserDefaults(suiteName: "nspb-shell-" + UUID().uuidString)!) { output += $0 }, 1)
+        XCTAssertEqual(ShellCLI.run(["--install-shell", "--framework", "/x"], defaults: TestDefaults.make("nspb-shell")) { output += $0 }, 1)
         XCTAssertTrue(output.hasPrefix("usage: NSPortBuilder --install-shell"))
         let f = try makeFixture()
         output = ""
         XCTAssertEqual(ShellCLI.run(f.args(extra: ["--framework", path("missing.framework")]),
-                                    defaults: UserDefaults(suiteName: "nspb-shell-" + UUID().uuidString)!) { output += $0 }, 1)
+                                    defaults: TestDefaults.make("nspb-shell")) { output += $0 }, 1)
         XCTAssertTrue(output.contains("its framework is not in the"), output)
     }
 
@@ -769,6 +790,7 @@ import NXModel
         let r = install(i, f)
         XCTAssertTrue(r.ok, r.message)
         XCTAssertEqual(plans.count, 1)
+        XCTAssertNil(plans.first?.versionNote)
         XCTAssertEqual(plans.first?.connection, .wired)
         XCTAssertEqual(plans.first?.connectionText, "Keep Z unlocked until the copy finishes.")
         XCTAssertEqual(plans.first?.files, 2)
@@ -832,7 +854,7 @@ import NXModel
         XCTAssertFalse(fm.fileExists(atPath: state + "/shell-env.txt"), "build_shell.sh did not run")
         XCTAssertFalse(calls.contains { $0.hasPrefix("xcodebuild") || $0.hasPrefix("devicectl device") })
         var output = ""
-        XCTAssertEqual(ShellCLI.run(f.args(), defaults: UserDefaults(suiteName: "nspb-shell-" + UUID().uuidString)!) { output += $0 }, 1)
+        XCTAssertEqual(ShellCLI.run(f.args(), defaults: TestDefaults.make("nspb-shell")) { output += $0 }, 1)
         XCTAssertTrue(output.contains("FAIL: ") && output.contains("tap Trust"), output)
     }
 
@@ -918,7 +940,19 @@ import NXModel
         XCTAssertTrue(fm.fileExists(atPath: games + "/romfs.img"))
         XCTAssertEqual(ShellLibrary.load(root: f.root).games.map(\.titleID), [titleID])
 
-        // the re-sign after seven days: same project, same identifier, same app
+        // the re-sign after seven days: same project, same identifier, same app, even if the project was generated from an
+        // unmounted Gatekeeper AppTranslocation path or a moved launcher bundle
+        let pbxPath = f.root + "/project/DmShell.xcodeproj/project.pbxproj"
+        XCTAssertFalse((try String(contentsOfFile: pbxPath, encoding: .utf8)).contains(f.repo))
+        let translocated = "/private/var/folders/xx/T/AppTranslocation/2CFF0344-0DA8/d/NX2Apple.app/Contents/Resources/frontend-ios"
+        try write(pbxPath, """
+        F96F /* frontend-ios */ = {isa = PBXFileReference; name = "frontend-ios"; path = "../../../../../../../\(translocated.dropFirst())"; sourceTree = SOURCE_ROOT; };
+        376B /* XCLocalSwiftPackageReference */ = {isa = XCLocalSwiftPackageReference; relativePath = "\(translocated)"; };
+        """)
+        let pkgLink = f.root + "/project/frontend-ios", shellLink = f.root + "/project/Shell"
+        try? fm.removeItem(atPath: pkgLink); try? fm.removeItem(atPath: shellLink)
+        try fm.createSymbolicLink(atPath: pkgLink, withDestinationPath: translocated)
+        try fm.createSymbolicLink(atPath: shellLink, withDestinationPath: "/private/var/folders/xx/T/AppTranslocation/2CFF0344-0DA8/Shell")
         try write(container + "/org.nxnative.shell/Documents/save/slot1.bin", "my save")
         let before = calls.count
         let resigned = expectation(description: "Re-signed")
@@ -932,6 +966,30 @@ import NXModel
         XCTAssertTrue(log.allSatisfy { !$0.contains("--remove-existing-content") })
         XCTAssertEqual(try String(contentsOfFile: container + "/org.nxnative.shell/Documents/save/slot1.bin"), "my save")
         XCTAssertEqual(model.doneNote, String(format: model.t("dev.resigned"), "iPhone"))
+        XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: pkgLink), f.repo + "/frontend-ios")
+        XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: shellLink), f.repo + "/dm/ios/Shell")
+        let repairedPbx = try String(contentsOfFile: pbxPath, encoding: .utf8)
+        XCTAssertFalse(repairedPbx.contains("AppTranslocation"), repairedPbx)
+        XCTAssertTrue(repairedPbx.contains(#"relativePath = "frontend-ios";"#), repairedPbx)
+
+        // When repo is an NX2Apple checkout (tools/engine.py + .upstream-ref), engine symlinks resolve under <checkout>/engine/dm/ios/
+        let checkout = path("moved-checkout")
+        try write(checkout + "/tools/engine.py", "")
+        try write(checkout + "/.upstream-ref", "deadbeef\n")
+        try write(checkout + "/frontend-ios/Package.swift", "// swift-tools-version: 5.9\n")
+        for item in ["Sources", "Shell", "tools"] {
+            try fm.createDirectory(atPath: checkout + "/engine/dm/ios/" + item, withIntermediateDirectories: true)
+            let link = f.root + "/project/" + item
+            try? fm.removeItem(atPath: link)
+            try fm.createSymbolicLink(atPath: link, withDestinationPath: "/missing/" + item)
+        }
+        try? fm.removeItem(atPath: pkgLink)
+        try fm.createSymbolicLink(atPath: pkgLink, withDestinationPath: "/missing/frontend-ios")
+        ShellInstall.refreshProjectLinks(root: f.root, resources: nil, repo: checkout)
+        XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: pkgLink), checkout + "/frontend-ios")
+        for item in ["Sources", "Shell", "tools"] {
+            XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: f.root + "/project/" + item), checkout + "/engine/dm/ios/" + item)
+        }
     }
 
     @MainActor private func makeModel(_ f: Fixture) throws -> LauncherStores {

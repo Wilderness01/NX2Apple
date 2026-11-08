@@ -1,8 +1,8 @@
 import Foundation
 
-/// The experimental builder (LNPANDY/NX2Apple#749): nxbuild, a build tool in Rust that reproduces the NSP script's stages byte for byte and faster.
-/// With the switch on, the launcher starts `nxb build` itself and the NSP script is not run. There is no fallback to the script: a case `nxb build` cannot do
-/// (exit code 4), a failure or an input it does not take is shown as an error with nxb's own message and its exit code. BUILDING.md has the details.
+/// The nxb builder (LNPANDY/NX2Apple#749): nxb of nxkit, a build tool in Rust that reproduces the NSP script's stages byte for byte and faster.
+/// With the switch on (the default), the launcher starts `nxb build` itself. A case `nxb build` cannot do yet (exit code 4) is built again by the NSP script,
+/// in the same build. Any other failure is shown as an error with nxb's own message and its exit code. BUILDING.md has the details.
 ///
 /// Where `nxb` comes from:
 /// 1. the path the player chose in Settings (the `nxb` binary, or the folder that holds it), for a local build of nxbuild;
@@ -36,8 +36,10 @@ package enum ExperimentalBuilder {
         ["NXB_ENGINE": engine]
     }
 
-    /// The oldest nxbuild that has the whole `nxb build` command line of the NSP script (NSZ, XCI, merged packages, a NUP, a dump folder, DLC, a game with no profile, the iPhone options).
-    package static let minimumVersion = "0.5.1"
+    /// The oldest nxbuild that builds with this app: it has the whole `nxb build` command line of the NSP script, reads the engine from
+    /// `NXB_ENGINE` and takes the pinned engine's `patch_nso.py` (0.5.1 to 0.6.1 stop with "--engine is required" or at the rewrite).
+    /// 0.6.2 stops in the Mac shader step, because it needs the own front end's verdicts and a fresh build has none.
+    package static let minimumVersion = "0.6.3"
 
     /// The command line of `nxb build` from the script's: the same options in the same names, with `build` in place of the script's path (the first element).
     package static func arguments(fromScript args: [String]) -> [String] {
@@ -57,6 +59,9 @@ package enum ExperimentalBuilder {
         }
         return true
     }
+
+    /// Whether the NSP script builds again after `nxb build` ended with `status`: only exit code 4, "not supported yet". Every other code is a real failure.
+    package static func fallsBackToScript(status: Int32) -> Bool { status == 4 }
 
     /// The string key of what nxb's exit code says (`nxb build`'s: 0 done, 1 error, 2 bad arguments, 3 damaged data, 4 not supported yet, 6 missing key, 130 interrupted).
     package static func exitKey(_ status: Int32) -> String {

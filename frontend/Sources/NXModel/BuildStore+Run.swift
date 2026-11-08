@@ -7,6 +7,12 @@ import NXCore
 extension BuildStore {
     package func startBuild() {
         guard !running else { return }
+        selectedTitleID = nil
+        runBuild()
+    }
+
+    func runBuild() {
+        guard !running else { return }
         // The shared app needs a device this Mac knows. Found out here, before an hour of building, not after it.
         if target != BuildTarget.mac, !shellDeviceChecked, !exportsShell {
             guard installsDirectly else { doneNote = t("shell.needsDevice"); done = false; return }
@@ -14,19 +20,23 @@ extension BuildStore {
             return
         }
         shellDeviceChecked = false
-        if target != BuildTarget.mac, !exportsOneGame, askAboutStaleFrameworks() { return }   // StaleFrameworksPrompt.swift (#449)
+        if target != BuildTarget.mac, !exportsOneGame, !scriptFallback, askAboutStaleFrameworks() { return }   // StaleFrameworksPrompt.swift (#449)
         stopping = false
-        running = true; done = false; doneNote = ""; stages = []; log.clear(); staleShadersShown = false
+        running = true; done = false; doneNote = ""; stages = []; staleShadersMessageKey = nil
+        if !scriptFallback { log.clear() }   // the script's run after nxb's exit code 4 goes below nxb's lines
         failure = nil; confirmingOverride = nil
+        let overrideKind = armedOverride   // kept for the script's run after nxb's exit code 4, which is the same build
         let override = takeOverrideFlag()   // for this build only: the next one asks again
         installedOn = ""; installedAppPath = ""; exportedIPAPath = ""; send = .idle
         guard repo.isRepo else {
             fail(repo.path.isEmpty ? t("msg.repoInvalidEmpty") : String(format: t("msg.repoInvalid"), shortPath(repo.path)))
             return
         }
-        // The experimental builder runs `nxb build` and never the script: no nxb, or one too old, stops here (#749). A game nxb does not take ends with its own exit code 4
-        nxbRun = experimentalBuilder
-        if let why = experimentalBuilderProblem() { fail(why); return }
+        // nxb builds by default (#749). A chosen nxb that is missing or too old stops here. A game nxb does not take ends with exit code 4, and the script builds it then
+        nxbRun = usesNxb && !scriptFallback
+        if experimentalBuilder, !usesNxb, !scriptFallback { say(t("msg.builderNotBundled")) }
+        scriptFallback = false
+        if nxbRun, let why = experimentalBuilderProblem() { fail(why); return }
         // Resolve the interpreter here if the dependency check has not landed yet. checkDeps()
         // runs on a background queue and startBuild() can beat it — for a moment deps.pythonPath is
         // empty, and the old fallback was Apple's /usr/bin/python3 (3.9), which the script then
@@ -36,7 +46,7 @@ extension BuildStore {
         if EngineLayout.needsSyncBeforeBuild(repo.path) {
             _ = engine.syncEngine { ok in
                 self.running = false
-                if ok && !EngineLayout.needsSyncBeforeBuild(self.repo.path) { self.startBuild() }
+                if ok && !EngineLayout.needsSyncBeforeBuild(self.repo.path) { self.runBuild() }
                 else { self.fail(String(format: self.t("msg.toolsOld"), "engine/ (python3 tools/engine.py sync, see the log)")) }
             }
             return
@@ -67,7 +77,7 @@ extension BuildStore {
         // exactly as build_ipa_from_nsp.py:445 reads it: the low 12 bits are 0x000 for a base game,
         // 0x800 for its update, and anything else is add-on content below the base.
         var staged = allPaths
-        if folder == nil, let base = TitleID.parse((basePath as NSString).lastPathComponent) {
+        if folder == nil, let base = selectedTitleID.flatMap({ UInt64($0, radix: 16) }) ?? TitleID.parse(basePath) {
             let app = base & ~0xFFF
             for f in unpicked {
                 guard let tid = TitleID.parse(f) else { continue }
@@ -134,6 +144,7 @@ extension BuildStore {
         let engine = EngineLayout.root(repo.path)   // the checkout's engine/ (#214)
         // A game folder's files are not encrypted: the script ignores -k for it, and the launcher does not ask for the keys.
         var args = [engine + "/" + RepoLayout.buildScript, inputDir] + (folder != nil ? [] : ["-k", keysPath]) + ["--progress", "json"]
+        if let selectedTitleID { args += ["--title-id", selectedTitleID] }
         // A compatibility switch the player turned on: written to a small env file the pipeline
         // copies into the app bundle (main.m sets one variable per line at boot). Only for an iPhone or iPad build;
         // a Mac app runs on this Mac's GPU, which always has BC support.
@@ -148,17 +159,22 @@ extension BuildStore {
             }
         }
         if hasWorkDir { args += ["--work-dir", workDir] }
+        // The image of this game the other platform's build left (the iPhone build's games/<id>/romfs.img, the Mac app's): the
+        // script takes it in place of extracting the RomFS again once it checks out as this version's (#708). A game folder is packed, not extracted.
+        // Only for the script: the experimental builder gets these arguments too, and `nxb build` has no such option (0.6.3 and 0.6.4 stop at it).
+        if folder == nil, !nxbRun, RepoLayout.supportsRomfsFrom(repo.path) {
+            for image in RomFSArchive.reusableImages(root: outDir.isEmpty ? baseDir : outDir, key: tidHex) { args += ["--romfs-from", image] }
+        }
         let macApp = target == BuildTarget.mac
+        let macOutput = macApp ? MacAppOutput(workDir: URL(fileURLWithPath: workDir), key: tidHex, titleID: gameTitleID, preferred: macAppPath) : nil
         oneGameIPAPath = ""
         if exportsOneGame {
             // One game's own IPA with its game data inside (BuildStore+OneGame.swift, #540)
             oneGameIPAPath = OneGameIPA.path(folder: outDir.isEmpty ? baseDir : outDir, titleID: tidHex)
             args += OneGameIPA.arguments(ipa: oneGameIPAPath)
-        } else if macApp {
-            // -o names the .app; the RomFS goes inside it, so the archive step is skipped below.
-            args += ["--platform", "mac-app"]
-            macAppPath = (outDir.isEmpty ? baseDir : outDir) + "/" + tidHex + ".app"
-            args += ["-o", macAppPath]
+        } else if let macOutput {
+            macAppPath = ""
+            args += ["--platform", "mac-app", "-o", macOutput.builderURL.path]
         } else {
             // Only the game's framework: the one shared app is made and signed after the script (installShell)
             args += ShellInstall.buildArguments(workDir: workDir, team: exportsShell ? "" : devices.signingTeam)
@@ -187,8 +203,13 @@ extension BuildStore {
         let onExit: @Sendable (Int32) -> Void = { [weak self] status in
             hop {
                 guard let self else { return }
-                self.running = false
                 self.flushLines()
+                if status == 0, !self.stopping, let macOutput {
+                    self.markAllDone()
+                    self.finishMacApp(macOutput)
+                    return
+                }
+                self.running = false
                 if self.stopping {
                     self.stopping = false
                     self.resetProgress()
@@ -200,23 +221,6 @@ extension BuildStore {
                     self.markAllDone()
                     if !self.oneGameIPAPath.isEmpty {
                         self.finishOneGameIPA()
-                    } else if self.target == BuildTarget.mac {
-                        // The .app is self-contained (its RomFS is inside), and the marker file
-                        // beside it (.nx2apple-library, a dot file the Finder hides) tells the
-                        // game's launcher that this folder is a library: its saves and log live
-                        // here, and they follow the folder if it moves. No image copy — the .app
-                        // already carries one, and a second multi-GB file was pure duplication.
-                        let made = !self.macAppPath.isEmpty &&
-                                   FileManager.default.fileExists(atPath: self.macAppPath)
-                        self.done = made
-                        self.doneNote = self.t(made ? "msg.macAppDone" : "msg.macAppMissing")
-                        if made {
-                            try? Data().write(to: URL(fileURLWithPath:
-                                (self.macAppPath as NSString).deletingLastPathComponent +
-                                "/.nx2apple-library"))
-                        }
-                        self.running = false
-                        self.cleanupStaging()
                     } else {
                         // The game's archive, then its framework into the one shared app on the device
                         // The framework the build wrote, and the title ID in its name: the script names it after the game
@@ -231,6 +235,14 @@ extension BuildStore {
                             else { self.installShell(framework: fw, titleID: tid, name: name, archive: $0) }
                         }
                     }
+                } else if self.fallsBackToScript(status: status) {
+                    // nxb does not take this game or step yet (exit code 4): the script builds it, in the same build, with the same choices
+                    self.say("⟳ " + self.t("msg.builderFallback"))
+                    self.cleanupStaging()
+                    self.scriptFallback = true
+                    self.shellDeviceChecked = true   // the device was checked for this build already
+                    self.armedOverride = overrideKind
+                    self.runBuild()
                 } else {
                     if self.nxbRun {
                         // nxb's own exit code and message, as they are: there is no script to run instead (#749)
@@ -264,6 +276,24 @@ extension BuildStore {
         } catch { fail(String(format: t("msg.launchFailed"), error.localizedDescription)) }
     }
 
+    private func finishMacApp(_ output: MacAppOutput) {
+        Task {
+            do {
+                let app = try await Task.detached { try output.finish() }.value
+                macAppPath = app.path
+                say("✓ " + shortPath(app.path))
+                done = true
+                doneNote = t("msg.macAppDone")
+                running = false
+                cleanupStaging()
+            } catch MacAppOutput.FinishError.retainedApp(let app, let cause) {
+                fail(app.path + "\n" + cause.localizedDescription)
+            } catch {
+                fail(t("msg.macAppMissing"))
+            }
+        }
+    }
+
     /// Looks the device up in `devicectl list devices` (in the background), then starts the build, or says how to pair it.
     package func verifyShellDevice() {
         running = true; done = false; doneNote = ""; failure = nil; stages = []
@@ -278,7 +308,7 @@ extension BuildStore {
                     return
                 }
                 self.shellDeviceChecked = true
-                self.startBuild()
+                self.runBuild()
             }
         }
     }

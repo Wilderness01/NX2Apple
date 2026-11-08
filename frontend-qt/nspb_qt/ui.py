@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QStackedWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -137,6 +138,7 @@ class MainWindow(QMainWindow):
             self, title, str(Path.home())
         )
         self.m.ask_file = self._ask_metal_archive
+        self.m.ask_sdk_archive = self._ask_sdk_archive
         self.setWindowTitle(f'NX2Apple v{APP_VERSION}')
         self.setWindowFlags(
             Qt.Window
@@ -357,6 +359,7 @@ class MainWindow(QMainWindow):
         self.search_input.setVisible(page_id == 'library')
         self.new_build_btn.setVisible(page_id != 'builds')
         self.top_bar.recenter_nav()
+        self._refresh_activity_bar()
         if page_id == 'library':
             self._refresh_library()
 
@@ -780,6 +783,12 @@ class MainWindow(QMainWindow):
         self.build_heading = CardPageHeading(self.m.t('build.heading'), self.m.t('build.intro'))
         self.body_col.addWidget(self.build_heading)
 
+        self.running_setup = QToolButton()
+        self.running_setup.setCheckable(True)
+        self.running_setup.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.running_setup.toggled.connect(self._refresh_build_inputs)
+        self.body_col.addWidget(self.running_setup, 0, Qt.AlignLeft)
+
         # Setup Hint Card (shown when repo or required deps are not ready)
         self.setup_hint_card = self._build_setup_hint_card()
         self.body_col.addWidget(self.setup_hint_card)
@@ -1150,26 +1159,30 @@ class MainWindow(QMainWindow):
 
         return grp
 
+    def _shell_ipa_path(self) -> str:
+        """The shared app's only output, whatever mode ran last."""
+        return lib.shell_ipa_path(self.m.shell_cache_path)
+
+    def _one_game_ipa_path(self) -> str:
+        return lib.one_game_ipa_path(self.m.out_dir, self.m.build_key)
+
     def _effective_ipa_path(self) -> str:
-        if self.m.ipa_path and os.path.exists(self.m.ipa_path):
-            return self.m.ipa_path
-        tid = self.m.build_key
-        if tid and self.m.out_dir:
-            cand = os.path.join(self.m.out_dir, f'{tid}.ipa')
-            if os.path.isfile(cand):
-                return cand
+        # The two kinds write different files, so the reveal button answers for the kind that is
+        # selected now: `self.m.ipa_path` alone would name the other mode's IPA after a switch.
         sel = self.m.library.selected
-        if sel and sel.has_ipa:
-            return sel.ipa_path
-        return self.m.ipa_path
+        return lib.reveal_ipa_path(
+            ipa_kind=self.m.ipa_kind,
+            shell_cache=self.m.shell_cache_path,
+            out_dir=self.m.out_dir,
+            build_key=self.m.build_key,
+            last_ipa=self.m.ipa_path,
+            library_ipa=sel.ipa_path if (sel and sel.has_ipa) else '',
+        )
 
     def _effective_archive_path(self) -> str:
-        if self.m.archive_path and os.path.isdir(self.m.archive_path):
-            return self.m.archive_path
-        if self.m.out_dir:
-            cand = os.path.join(self.m.out_dir, 'romfs')
-            if os.path.isdir(cand):
-                return cand
+        eff = self.m.effective_archive_path()
+        if eff and os.path.isdir(eff):
+            return eff
         sel = self.m.library.selected
         if sel and sel.has_archive:
             return sel.archive_path
@@ -1229,8 +1242,7 @@ class MainWindow(QMainWindow):
                 return
             self._drive_folder = d
             self.drive_path_lbl.setText(d)
-        tid = self.m.build_key
-        ok, info = lib.DriveCopy.copy_to_folder(arch_p, self._drive_folder, tid)
+        ok, info = self.m.copy_archive_to_drive(self._drive_folder)
         if ok:
             self.step3_sub.setText(self.m.t('shell.driveDone', info, self.m.t('ios.ui.gameData')))
         else:
@@ -1290,6 +1302,9 @@ class MainWindow(QMainWindow):
         self.failure_next.setObjectName('muted')
         self.failure_next.setWordWrap(True)
         fcol.addWidget(self.failure_next)
+        self.title_buttons = QVBoxLayout()
+        self.title_buttons.setAlignment(Qt.AlignLeft)
+        fcol.addLayout(self.title_buttons)
         frow = QHBoxLayout()
         frow.setSpacing(8)
         self.failure_folder_btn = QPushButton()
@@ -1312,7 +1327,11 @@ class MainWindow(QMainWindow):
     def _build_stages_card(self) -> CardGroup:
         grp = CardGroup(title=self.m.t('prog.title'))
         wrap = QWidget()
-        self.stages_col = QVBoxLayout(wrap)
+        col = QVBoxLayout(wrap)
+        self.preparing = QLabel()
+        col.addWidget(self.preparing)
+        self.stages_col = QVBoxLayout()
+        col.addLayout(self.stages_col)
         self.stages_col.setContentsMargins(18, 12, 18, 12)
         self.stages_col.setSpacing(8)
         grp.add_row(wrap)
@@ -1790,6 +1809,7 @@ class MainWindow(QMainWindow):
         return bar
 
     def _refresh_activity_bar(self) -> None:
+        self.activity_bar.setVisible(not self.m.running or self._current_page != 'builds')
         if self.m.running:
             self.act_dot.set_color(style.AMBER)
             self.act_title.setText(self.m.t('activity.ios' if self.m.target == 'ios' else 'activity.mac'))
@@ -1831,7 +1851,8 @@ class MainWindow(QMainWindow):
         self.new_build_btn.setText('+ ' + t('library.newBuild'))
 
         # Headings & Cards
-        self.build_heading.set_text(t('build.heading'), t('build.intro'))
+        self.running_setup.setText(t('section.setup'))
+        self.preparing.setText(t('library.preparing'))
         self.files_group.set_title(t('section.files'))
         self.files_group.set_footer(t('msg.workdirHint'))
         self.folder_cta_title.setText(t('build.folderCTA') + ' · ' + t('data.note'))
@@ -1898,12 +1919,46 @@ class MainWindow(QMainWindow):
         self.ver_status_lbl.setText(self.m.app_update_status or t('app.upToDate'))
         if self.m.app_update is not None:
             _set_dot(self.ver_dot, style.ORANGE)
-            self.ver_action_btn.setText(t('app.updateBtn', self.m.app_update.tag))
-            self.update_btn.setText(t('app.updateBtn', self.m.app_update.tag))
+            base_label = t('app.updateBtn', self.m.app_update.tag)
+            prog = self.m.app_update_progress
+            if prog is not None:
+                for btn in (self.update_btn, self.ver_action_btn):
+                    if btn.minimumWidth() == 0:
+                        btn.setText(base_label)
+                        btn.setStyleSheet('')
+                        btn.setMinimumWidth(btn.sizeHint().width())
+                clamped = min(max(prog, 0.0), 1.0)
+                pct = int(round(clamped * 100))
+                btn_label = f'{pct}%'
+                stop_a = min(max(clamped, 0.001), 0.998)
+                stop_b = min(stop_a + 0.001, 0.999)
+                grad = (
+                    f'qlineargradient(x1:0, y1:0, x2:1, y2:0, '
+                    f'stop:0 {style.AMBER}, stop:{stop_a:.3f} {style.AMBER}, '
+                    f'stop:{stop_b:.3f} {style.TRACK}, stop:1 {style.TRACK})'
+                )
+                self.update_btn.setStyleSheet(
+                    f'background: {grad}; color: {style.TEXT}; border: 1px solid {style.CARD_EDGE}; '
+                    f'border-radius: 14px; padding: 6px 18px; min-height: 20px; font-size: 13px; font-weight: 700;'
+                )
+                self.ver_action_btn.setStyleSheet(
+                    f'background: {grad}; color: {style.TEXT}; border: 1px solid {style.CARD_EDGE}; '
+                    f'border-radius: 12px; padding: 6px 16px; min-height: 18px; font-size: 12.5px; font-weight: 600;'
+                )
+            else:
+                btn_label = base_label
+                self.update_btn.setStyleSheet('')
+                self.ver_action_btn.setStyleSheet('')
+                self.update_btn.setMinimumWidth(0)
+                self.ver_action_btn.setMinimumWidth(0)
+            self.ver_action_btn.setText(btn_label)
+            self.update_btn.setText(btn_label)
             self.update_btn.setEnabled(not self.m.app_update_busy and not self.m.running)
             self.update_btn.show()
         else:
             _set_dot(self.ver_dot, style.GREEN)
+            self.ver_action_btn.setStyleSheet('')
+            self.ver_action_btn.setMinimumWidth(0)
             self.ver_action_btn.setText(t('repo.update'))
         self.ver_action_btn.setEnabled(not self.m.app_update_busy and not self.m.running)
 
@@ -1927,6 +1982,7 @@ class MainWindow(QMainWindow):
         self.repo_path_label.setText(self.m.repo_path if ok else t('repo.notFound'))
         self.clone_btn.setVisible(not ok)
         self.clone_btn.setEnabled(not busy and not self.m.running)
+        self.repo_btn.setVisible(not self.m.uses_bundled_engine)
         self.repo_btn.setEnabled(not busy and not self.m.running)
         if not ok:
             url = 'https://github.com/LNPANDY/NX2Apple'
@@ -1966,7 +2022,7 @@ class MainWindow(QMainWindow):
         req_missing = sum(1 for d in self.m.deps if not d.ok and d.required)
         opt_missing = sum(1 for d in self.m.deps if not d.ok and not d.required)
         fixable = any(not d.ok and d.install for d in self.m.deps)
-        any_busy = any(d.installing for d in self.m.deps)
+        any_busy = any(d.installing for d in self.m.deps) or bool(getattr(self.m, '_install_all_running', False))
         if req_missing == 0 and opt_missing == 0:
             _set_dot(self.deps_dot, style.GREEN)
             self.deps_summary.setText(t('dep.allReady'))
@@ -1998,16 +2054,18 @@ class MainWindow(QMainWindow):
 
         r = QHBoxLayout()
         r.setSpacing(10)
-        color = style.GREEN if d.ok else (style.NEUTRAL_DOT if not d.required else
-                (style.AMBER if d.state is DepState.OLD else style.RED))
+        color = style.GREEN if d.ok else (style.AMBER if getattr(d, 'installing', False) else
+                (style.NEUTRAL_DOT if not d.required else
+                (style.AMBER if d.state is DepState.OLD else style.RED)))
         r.addWidget(_dot(color))
         col = QVBoxLayout()
         col.setSpacing(2)
         title = QLabel(t(d.title_key))
         title.setStyleSheet('font-weight: 600;')
         detail = self._format_dep_detail(d)
-        sub = QLabel(detail or t(d.hint_key))
-        sub.setObjectName('mono' if d.ok else 'muted')
+        live_detail = getattr(d, 'install_detail', '') if getattr(d, 'installing', False) else ''
+        sub = QLabel(live_detail or detail or t(d.hint_key))
+        sub.setObjectName('mono' if (d.ok or live_detail) else 'muted')
         sub.setWordWrap(True)
         sub.setOpenExternalLinks(True)
         col.addWidget(title)
@@ -2015,7 +2073,8 @@ class MainWindow(QMainWindow):
         r.addLayout(col, 1)
 
         if d.install and (not d.ok or d.id == 'ios_sdk'):
-            b = QPushButton(t('dep.installing') if d.installing else t('dep.install'))
+            live_stage = getattr(d, 'install_stage', '') if getattr(d, 'installing', False) else ''
+            b = QPushButton((live_stage or t('dep.installing')) if d.installing else t('dep.install'))
             b.setEnabled(not d.installing)
             b.clicked.connect(lambda _=False, dep=d: self.m.install_dep(dep))
             r.addWidget(b)
@@ -2025,7 +2084,7 @@ class MainWindow(QMainWindow):
                 QUrl('macappstore://apps.apple.com/app/id497799835')))
             r.addWidget(b)
         if d.pick_key:
-            label_key = 'dep.pick.metal' if d.pick_key == 'metal_dir' else 'dep.pick'
+            label_key = 'dep.pick.metal' if d.pick_key in ('metal_dir', 'ios_sdk') else 'dep.pick'
             pb = QPushButton(t(label_key))
             pb.setEnabled(not d.installing)
             pb.clicked.connect(lambda _=False, dep=d: self.m.pick_dep_folder(dep))
@@ -2162,7 +2221,7 @@ class MainWindow(QMainWindow):
             item = self.stages_col.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
-        self.stages_card.setVisible(bool(self.m.stages))
+        self._refresh_progress_visibility()
         for st in self.m.stages:
             r = QHBoxLayout()
             r.setSpacing(8)
@@ -2186,7 +2245,28 @@ class MainWindow(QMainWindow):
             self.stages_col.addWidget(w)
         self._refresh_activity_bar()
 
+    def _refresh_progress_visibility(self) -> None:
+        self.stages_card.setVisible(self.m.running or bool(self.m.stages))
+        self.preparing.setVisible(self.m.running and not self.m.stages)
+
+    def _refresh_build_inputs(self) -> None:
+        running = self.m.running
+        expanded = not running or self.running_setup.isChecked()
+        self.running_setup.setVisible(running)
+        self.running_setup.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.files_group.setVisible(expanded)
+        self.target_group.setVisible(expanded)
+        self.files_group.setEnabled(not running)
+        self.target_group.setEnabled(not running)
+        self.ipa_kind_seg.setEnabled(not running)
+        # A previous export can still be revealed or copied to a drive.
+        self.install_group.setVisible(expanded or os.path.isfile(self._effective_ipa_path())
+                                      or os.path.isdir(self._effective_archive_path()))
+        setup_needed = not self.m.repo_ok or (self.m.deps_checked and not self.m.all_deps_ok)
+        self.setup_hint_card.setVisible(expanded and setup_needed)
+
     def _refresh_running(self) -> None:
+        self._show_failure()
         t = self.m.t
         if self.m.running:
             self.build_btn.setText(t('build.cancel'))
@@ -2211,13 +2291,15 @@ class MainWindow(QMainWindow):
             elif self.m.can_build and not self.m.ipa_path and not self.m.mac_app_path and self.m.failure is None and not self._failed:
                 self.footer.setText('')
 
-        # SetupHintCard visibility on Builds page
-        setup_needed = not self.m.repo_ok or (self.m.deps_checked and not self.m.all_deps_ok)
-        self.setup_hint_card.setVisible(setup_needed)
-        if setup_needed:
-            self.setup_hint_title.setText(t('library.setupHint'))
-            self.setup_hint_sub.setText(t('status.chooseRepo') if not self.m.repo_ok else t('status.installFirst'))
-            self.setup_goto_btn.setText(t('nav.settings'))
+        if not self.m.running:
+            self.running_setup.setChecked(False)
+        self._refresh_build_inputs()
+        self._refresh_progress_visibility()
+        note = ('activity.ios' if self.m.target == 'ios' else 'activity.mac') if self.m.running else 'build.intro'
+        self.build_heading.set_text(t('build.heading'), t(note))
+        self.setup_hint_title.setText(t('library.setupHint'))
+        self.setup_hint_sub.setText(t('status.chooseRepo') if not self.m.repo_ok else t('status.installFirst'))
+        self.setup_goto_btn.setText(t('nav.settings'))
 
         self.build_btn.style().unpolish(self.build_btn)
         self.build_btn.style().polish(self.build_btn)
@@ -2268,11 +2350,26 @@ class MainWindow(QMainWindow):
             return
         self.failure_title.setText(t('fail.section'))
         self.failure_what.setText(self.m.failure_what(f))
-        self.failure_next.setText(t(f.next_key))
+        titles = self.m.selectable_titles
+        if f.title_ids and not titles:   # the selected inputs have changed
+            self.failure_box.hide()
+            return
+        self.failure_next.setText(t('fail.severalGames.choose' if titles else f.next_key))
+        current = [self.title_buttons.itemAt(i).widget().property('titleID') for i in range(self.title_buttons.count())]
+        if tuple(current) != titles:
+            while self.title_buttons.count():
+                button = self.title_buttons.takeAt(0).widget()
+                button.hide()
+                button.deleteLater()
+            for title in titles:
+                button = QPushButton(title)
+                button.setProperty('titleID', title)
+                button.clicked.connect(lambda checked=False, tid=title: self._build_clicked(title_id=tid))
+                self.title_buttons.addWidget(button)
         folder = self.m.failure_folder(f)
         self.failure_folder_btn.setText(t('fail.showFolder'))
         self.failure_folder_btn.setVisible(
-            f.kind in (bf.NO_TITLE_ID, bf.SEVERAL_GAMES, bf.DISK_FULL, bf.CLOUD_FOLDER) and bool(folder))
+            not titles and f.kind in (bf.NO_TITLE_ID, bf.SEVERAL_GAMES, bf.DISK_FULL, bf.CLOUD_FOLDER) and bool(folder))
         fix_key = {
             bf.KEYS: 'fail.keys.button',
             bf.CLOUD_FOLDER: 'fail.cloudFolder.button',
@@ -2353,7 +2450,15 @@ class MainWindow(QMainWindow):
     def _ask_metal_archive(self, title: str) -> str:
         picked, _ = QFileDialog.getOpenFileName(
             self, title, str(Path.home() / 'Downloads'),
-            'Metal Developer Tools (*.zip *.exe *.msi);;All files (*)')
+            'Metal Developer Tools (metal.exe metallib.exe *.zip *.exe *.msi);;All files (*)')
+        if picked:
+            return picked
+        return QFileDialog.getExistingDirectory(self, title, str(Path.home()))
+
+    def _ask_sdk_archive(self, title: str) -> str:
+        picked, _ = QFileDialog.getOpenFileName(
+            self, title, str(Path.home() / 'Downloads'),
+            'iPhoneOS SDK (*.zip *.xip SDKSettings.json SDKSettings.plist);;All files (*)')
         if picked:
             return picked
         return QFileDialog.getExistingDirectory(self, title, str(Path.home()))
@@ -2435,9 +2540,10 @@ class MainWindow(QMainWindow):
         self.m.out_dir = ''
         self._refresh_inputs()
 
-    def _build_clicked(self) -> None:
+    def _build_clicked(self, *, title_id: str | None = None) -> None:
         if self.m.running:
-            self.m.cancel_build()
+            if title_id is None:
+                self.m.cancel_build()
             return
         self._failed = False
         self._stale_shaders_shown = False
@@ -2445,7 +2551,7 @@ class MainWindow(QMainWindow):
         self.reveal_arc_btn.hide()
         self.reveal_app_btn.hide()
         self.footer.setText('')
-        self.m.start_build()
+        self.m.start_build(title_id=title_id)
 
     # ================================================================ Full-Window Drag & Drop
 
