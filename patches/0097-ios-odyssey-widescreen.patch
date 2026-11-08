@@ -1,0 +1,159 @@
+From 678d64aa10f53fe6be01d4581b207ebdde31a6ab Mon Sep 17 00:00:00 2001
+From: Wilderness01 <140787484+Wilderness01@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 18:01:57 +0800
+Subject: [PATCH] iPhone widescreen: Odyssey renders wider (1560x720) on 19.5:9
+
+Upstream-Status: fork-only
+Reason: Odyssey renders its own 16:9 picture; the host's DM_SCREEN_ASPECT alone cannot widen it. This adds a wider branch to the host (ratio to 2.2, height fixed) and a FRAME_STEP stub that makes the game's handheld display width follow the host's layout width, so the iPhone 15 Pro Max renders 1560x720 with more scene at the sides instead of black bars or cropping.
+Issue: Wilderness01/NX2Apple#1
+---
+ dm/games/0100000000010000/game.tsv   |  3 +++
+ dm/games/0100000000010000/patches.py | 38 ++++++++++++++++++++++++++
+ dm/host/loader.c                     | 40 ++++++++++++++++++++++++----
+ dm/ios/Sources/front_ios.m           |  6 ++---
+ 4 files changed, 79 insertions(+), 8 deletions(-)
+ create mode 100644 dm/games/0100000000010000/patches.py
+
+diff --git a/dm/games/0100000000010000/game.tsv b/dm/games/0100000000010000/game.tsv
+index 842746a..e5d12ff 100644
+--- a/dm/games/0100000000010000/game.tsv
++++ b/dm/games/0100000000010000/game.tsv
+@@ -10,6 +10,9 @@ name	Super Mario Odyssey
+ ipa	SuperMarioOdyssey.ipa
+ app_category	public.app-category.action-games
+ pad_layout	full
++# Screen shape (patches.py): DM_SCREEN_ASPECT renders a screen wider than 16:9 in its own shape, the iPhone 15 Pro Max's 19.5:9 as
++# 1560x720 with a 1560-wide layout space, the HUD at the screen's edges and 16:9's height in view (more at the sides); the iOS launcher offers it
++screen_aspect	on
+ 
+ # ---- Versions ----
+ build	v393216	1.4.1	main=b424be150a8e7d78701cbe7a439d9ebf	subsdk0=93ff8252d975adf07230cb86c83301c5	sdk=fcf93a41b08c5193a1410d262602dc62
+diff --git a/dm/games/0100000000010000/patches.py b/dm/games/0100000000010000/patches.py
+new file mode 100644
+index 0000000..9f0c2e2
+--- /dev/null
++++ b/dm/games/0100000000010000/patches.py
+@@ -0,0 +1,38 @@
++# Super Mario Odyssey (0100000000010000): the rewriter's patches of this game's own builds. dm/tools/patch_nso.py loads every profile's patches.py and applies those of a module's NSO build ID;
++# CUTS, OBS and FRAME_STEP as described there ("Registered patches"). Patches of Nintendo SDK module builds are in dm/tools/sdk_patches.py
++import struct
++from nso_asm import ADRP, B
++
++# Screen shape, wider than 16:9 (the iPhone 15 Pro Max's 19.5:9): the game renders its own shape instead of a stretched or cut 16:9 one.
++# The game's display size is constants, not read from the host: the display mode switch main+0x4e27b0 sets the display rectangle for docked (1600x900)
++# and handheld (1280x720, the iPhone's mode), and an initial display setting main+0x4bf34c passes both sizes to main+0x924ad0. Each width becomes the
++# host's layout width (state +0x44 u32, loader.c from DM_SCREEN_ASPECT; 0 = the game's own) while the height stays 720. The widths stay, so the 3D
++# views (1280 wide handheld) grow in width too, and sead::PerspectiveProjection's aspect (+0xb0) follows the wider rectangle (its set(rect) computes
++# aspect from the rectangle; the fovy stays, so the horizontal field of view widens by about 22% and the vertical one does not change). No fovy,
++# aspect, culling or viewport stub is needed for the wider screen: the projection, the culling tests and the viewport all read the display size or
++# the projection's stored fields. x16 is free at both sites: the mode switch's registers are the display object and the size being set; the initial
++# setting's are the sizes and the arguments of the call that follows
++def frame_step(ctx):
++    here, emit, fs_site, fs_put, FS_STATE_OFF = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state
++
++    def wider(site, orig, apply, why):
++        fs_site(site, orig)
++        start = here(); emit(struct.unpack('<I', bytes.fromhex(orig))[0])   # the original instruction
++        emit(ADRP(16, here(), FS_STATE_OFF))
++        for w in (0xb9404610, 0x34000050, apply):   # ldr w16,[x16,#0x44]; cbz w16,+8 (0: the game's width); the host's layout width
++            emit(w)
++        emit(B(here(), site + 4))
++        fs_put(site, [B(site, start)], why)
++    wider(0x4e27d8, '03a08052', 0x2a1003e3, 'handheld display width 1280 -> the host\'s layout width (state +0x44; 0 = the game\'s own)')
++    wider(0x4bf354, '06a08052', 0x2a1003e6, 'initial handheld width 1280 -> the host\'s layout width (state +0x44; 0 = the game\'s own)')
++
++
++# How general this patch is and could be (dm/tools/docs_patches.py "Binding", listed in docs/agents/game-patches.md)
++BINDING = [
++    {'what': "handheld display width 1280 -> the host's layout width (wider screen, 1560x720 on a 19.5:9 iPhone)",
++     'now': 'build', 'goal': 'unreviewed', 'purpose': 'rendering',
++     'why': "the stubs patch fixed offsets in this build's main (the display-mode switch and the initial display setting); the switch function has not been fingerprinted for other builds",
++     'checked': 'the 1.4.1 main (build b424be150a8e7d78701cbe7a439d9ebf): both sites verified byte-for-byte against the binary, the stubs verified instruction-for-instruction with capstone, 2026-11-08'},
++]
++
++FRAME_STEP = {'b424be150a8e7d78701cbe7a439d9ebf': frame_step}
+diff --git a/dm/host/loader.c b/dm/host/loader.c
+index 8e623ec..c43270c 100644
+--- a/dm/host/loader.c
++++ b/dm/host/loader.c
+@@ -311,14 +311,17 @@ void dm_fps_state_apply(void) {
+     const char *rs = getenv("DM_RENDER_SCALE"); float sc = 1.0f;
+     if (rs) { char *end; sc = strtof(rs, &end); if (end == rs || *end || !(sc >= 0.5f && sc <= 1.0f)) { LOG("[RED] DM_RENDER_SCALE=%s: must be 0.5 to 1.0; keeping the game's size", rs); sc = 1.0f; } else LOG("%s: 3D views rendered at %.2f of the game's size (DM_RENDER_SCALE)", g_fps_mod, sc); }
+     memcpy(dm_fps_state + 0x10, &sc, sizeof sc);
+-    // Screen shape: DM_SCREEN_ASPECT, the screen's width / height between 1.3 and 1.77, makes the builds with screen-shape stubs
+-    // (Breath of the Wild 1.9.0's patches.py) render that shape: the output keeps its width (1920) and takes the height that gives the ratio, a multiple of 48 so the
+-    // 2/3-size layout space (1280 wide) stays whole: 1.43 → 1920x1344 and 1280x896. State +0x48 u32 output height, +0x4c u32 layout height, +0x50 its float; 0 = 16:9
++    // Screen shape: DM_SCREEN_ASPECT, the screen's width / height between 1.3 and 2.2, makes the builds with screen-shape stubs
++    // (Breath of the Wild 1.9.0's patches.py, Super Mario Odyssey's) render that shape. A taller screen (1.3 to 1.77): the output keeps its width (1920)
++    // and takes the height that gives the ratio, a multiple of 48 so the 2/3-size layout space (1280 wide) stays whole: 1.43 → 1920x1344 and 1280x896.
++    // State +0x48 u32 output height, +0x4c u32 layout height, +0x50 its float; 0 = 16:9. A wider screen (1.78 to 2.2): the output keeps its height (1080)
++    // and takes the width that gives the ratio, the layout its width the same way: 2.167 → 2340x1080 and 1560x720. State +0x40 u32 output width,
++    // +0x44 u32 layout width; 0 = 16:9
+     const char *as = getenv("DM_SCREEN_ASPECT");
+     if (as && *as && strcmp(as, "0") && strcmp(as, "auto")) {   // 0: 16:9; auto: the iOS front end resolves it to the screen's shape (a Mac window has none)
+         char *end; float a = strtof(as, &end);
+-        if (end == as || *end || !(a >= 1.3f && a < 1.77f)) LOG("[RED] DM_SCREEN_ASPECT=%s: a width / height from 1.3 to 1.77; keeping 16:9", as);
+-        else {
++        if (end == as || *end || !(a >= 1.3f && a <= 2.2f)) LOG("[RED] DM_SCREEN_ASPECT=%s: a width / height from 1.3 to 2.2 (1.3 to 1.77 taller, 1.78 to 2.2 wider); keeping 16:9", as);
++        else if (a < 1.77f) {   // taller than 16:9: the existing body below, unchanged
+             uint32_t oh = (uint32_t)(1920.0f / a / 48.0f + 0.5f) * 48, lh = oh * 2 / 3; float lf = (float)lh;
+             memcpy(dm_fps_state + 0x48, &oh, 4); memcpy(dm_fps_state + 0x4c, &lh, 4); memcpy(dm_fps_state + 0x50, &lf, 4);
+             extern void mtl_present_screen(uint32_t w, uint32_t h); mtl_present_screen(1920, oh);   // the picture's shape for a texture that follows it (nvn_mtl.m present_shape)
+@@ -346,6 +349,33 @@ void dm_fps_state_apply(void) {
+             LOG("%s: screen shape: HUD moves out by %.0f (edge %.0f, listed widgets %.0f), panes %.0fx%.0f or larger stretched %.3f", g_fps_mod, anc[0], anc[2], anc[3], anc[4], anc[5], anc[1]);
+             LOG("%s: screen shape %.3f: output 1920x%u, layout 1280x%u (DM_SCREEN_ASPECT; only builds with screen-shape stubs follow it)", g_fps_mod, a, oh, lh);
+         }
++        else if (a > 1.78f) {   // wider than 16:9: the output keeps its height (1080) and takes the width that gives the ratio, the layout its width
++            // the same way: 2.167 -> 2340x1080 and 1560x720. State +0x40 u32 output width, +0x44 u32 layout width; the ratio (+0x58), k (+0x5c) and the
++            // tolerance (+0x60) as for the taller screen; the HUD camera's 16:9 projection (+0x74 / +0x78 / +0x7c) as for the taller screen. The HUD at
++            // the wider edges takes its own block (+0xa0..+0xb4, mirroring +0x80..+0x98): the shift (half the layout width over 640), the stretch
++            // (layout width / 1280), the edge rule's distance, the listed corner widgets' distance, a full-screen pane's width and height in the
++            // 1280x720 space, and the widest pane still stretched. DM_SCREEN_HUD overrides the last five for trials, as for the taller screen
++            uint32_t ow = (uint32_t)(1080.0f * a + 0.5f), lw = (uint32_t)(720.0f * a + 0.5f);
++            memcpy(dm_fps_state + 0x40, &ow, 4); memcpy(dm_fps_state + 0x44, &lw, 4);
++            extern void mtl_present_screen(uint32_t w, uint32_t h); mtl_present_screen(ow, 1080);   // the picture's shape for a texture that follows it (nvn_mtl.m present_shape)
++            const char *ms = getenv("DM_SCREEN_ASPECT_SITES"); uint32_t mask = ms ? (uint32_t)strtoul(ms, NULL, 0) : 0xffffffffu;   // the stubs of the game's own conversions, one bit each (+0x54)
++            memcpy(dm_fps_state + 0x54, &mask, 4);
++            if (ms) LOG("%s: screen shape: conversion sites %#x (DM_SCREEN_ASPECT_SITES)", g_fps_mod, mask);
++            // The field of view: a wider view keeps the vertical angle and shows more at the sides (the stubs of Super Mario Odyssey's patches.py read the
++            // layout width, not this); k = (16/9) / ratio is below 1 here, the view is wider than 16:9, not taller
++            float r = (float)ow / 1080.0f, k = (16.0f / 9.0f) / r, tol = 0.01f;
++            const char *fo = getenv("DM_SCREEN_FOV"); if (fo && !strcmp(fo, "off")) tol = -1.0f;   // trials: the scene keeps the game's vertical angle (no view matches); the HUD camera still widens
++            memcpy(dm_fps_state + 0x58, &r, 4); memcpy(dm_fps_state + 0x5c, &k, 4); memcpy(dm_fps_state + 0x60, &tol, 4);
++            float wide = 16.0f / 9.0f, wtol = 0.001f, far = 10000.0f;   // the HUD camera's projection: 16:9, near 1, far 10000 (+0x74 / +0x78 / +0x7c)
++            memcpy(dm_fps_state + 0x74, &wide, 4); memcpy(dm_fps_state + 0x78, &wtol, 4); memcpy(dm_fps_state + 0x7c, &far, 4);
++            float anc[7] = {(float)lw / 2 - 640.0f, (float)lw / 1280.0f, 280.0f, 100.0f, 1270.0f, 710.0f, 1300.0f};
++            const char *hv = getenv("DM_SCREEN_HUD");
++            if (hv && sscanf(hv, "%f,%f,%f,%f,%f", &anc[2], &anc[3], &anc[4], &anc[5], &anc[6]) < 4) LOG("[RED] DM_SCREEN_HUD=%s: <edge>,<listed>,<full width>,<full height>[,<widest>]; keeping the rest", hv);
++            memcpy(dm_fps_state + 0xa0, anc, sizeof anc);
++            LOG("%s: screen shape: HUD moves out by %.0f (edge %.0f, listed widgets %.0f), panes %.0fx%.0f or larger stretched %.3f", g_fps_mod, anc[0], anc[2], anc[3], anc[4], anc[5], anc[1]);
++            LOG("%s: screen shape %.3f: output %ux1080, layout %ux720 (DM_SCREEN_ASPECT; only builds with screen-shape stubs follow it)", g_fps_mod, a, ow, lw);
++        }
++        // else a is 16:9 (1.77 to 1.78): the game's own shape, nothing to write
+     }
+     char cap[32]; snprintf(cap, sizeof cap, ", capped at %d fps", t);
+     LOG("%s: frame step %s%s (%s)", g_fps_mod, !t ? "as the game sets it" : "in whole vsyncs decided by the host", t ? cap : "", e ? "DM_FPS_TARGET" : "game profile fps_target");
+diff --git a/dm/ios/Sources/front_ios.m b/dm/ios/Sources/front_ios.m
+index 3400f69..4225b98 100644
+--- a/dm/ios/Sources/front_ios.m
++++ b/dm/ios/Sources/front_ios.m
+@@ -165,13 +165,13 @@ static void launcher_done(void) { [g_root startGame]; }
+     front_hud_env();   // before the process's first Metal device, which reads MTL_HUD_ENABLED (an env file's DM_METAL_HUD sets it in main.m already; GitHub issue #840)
+     const char *dev = front_ios_device_check();   // that first device: a GPU without BC textures is refused here, not at launch, so the launcher's HUD switch counts
+     if (dev) { [self showHint:[NSString stringWithFormat:@"This device is not supported.\n%s", dev]]; return; }   // the host does not start
+-    {   // Picture shape "auto" (the launcher's Match screen): the app window's own shape when it is taller than 16:9 (an iPad's 4:3, an unfolded iPhone Duo's 1.43:1; loader.c
+-        // takes 1.3 to 1.77), else 16:9. The window's, not the screen's: on an iPad under Stage Manager or Split View the app does not fill the screen. Resolved here, before the
++    {   // Picture shape "auto" (the launcher's Match screen): the app window's own shape when it is taller than 16:9 (an iPad's 4:3, an unfolded iPhone Duo's 1.43:1) or wider (an iPhone's 19.5:9; loader.c
++        // takes 1.3 to 1.77, 1.78 to 2.2 for the wider shape), else 16:9. The window's, not the screen's: on an iPad under Stage Manager or Split View the app does not fill the screen. Resolved here, before the
+         // host writes the state page (main.c dm_fps_state_apply)
+         const char *a = getenv("DM_SCREEN_ASPECT");
+         if (a && !strcmp(a, "auto")) {
+             CGSize sz = self.view.window ? self.view.window.bounds.size : UIScreen.mainScreen.bounds.size; double r = MAX(sz.width, sz.height) / MAX(MIN(sz.width, sz.height), 1);
+-            char v[16]; if (r >= 1.3 && r < 1.77) snprintf(v, sizeof v, "%.3f", r); else strcpy(v, "0");
++            char v[16]; if ((r >= 1.3 && r < 1.77) || (r > 1.78 && r <= 2.2)) snprintf(v, sizeof v, "%.3f", r); else strcpy(v, "0");
+             setenv("DM_SCREEN_ASPECT", v, 1); LOG("front end: picture shape auto: window %.0fx%.0f points (%.3f:1) → DM_SCREEN_ASPECT=%s", sz.width, sz.height, r, v);
+         }
+     }
+-- 
+2.43.0
+
