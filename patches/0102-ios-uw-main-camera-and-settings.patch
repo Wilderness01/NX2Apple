@@ -1,0 +1,608 @@
+From f6b096ccfe918f4c8b0ae35444d52c4e94402339 Mon Sep 17 00:00:00 2001
+From: Wilderness01 <140787484+Wilderness01@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 12:08:55 +0000
+Subject: [PATCH] Ultrawide: hook every calcMatrix vtable and follow the
+ picture-shape setting
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+V1.3.1 fills the screen but Mario is still ~22% fat: the vtable hook is installed and the trampoline runs, but it only ever saw a 4:3 projection — the main camera's projection does not go through CAM[1]'s vtable — and the direct-write fallback reads [CAM[0]], which holds the vtable address itself, not a projection object. The picture-shape setting is also ignored: UW only accepts aspects wider than 1.7866, so Duo (1.43), iPad (1.333) and 16:9 (0) all fall back to the display's 2.167, and Odyssey has no screen_aspect switch so the setting does not even appear for it.
+
+Scan the module on the first present for every vtable whose calcMatrix slot holds sead::PerspectiveProjection::calcMatrix (main+0x9683c0) and hook each one, so the main camera is covered whichever vtable it uses; log every calcMatrix call by aspect (16:9 / 4:3 / other) with a 600-present summary, so the next log settles whether the main camera enters the hook; and make direct-write use the most recent trampoline-seen 16:9 projection object instead of the broken CAM[0] model (CAM[0]/CAM[2] are still parsed, but no longer pick the object). UW now follows DM_SCREEN_ASPECT: an explicit number is the target, wide or tall, 0 turns UW off without falling back to the display, and only auto/unset falls back to the display pixels; the present shape gains a taller branch (1920x(1920/a), a multiple of 48, as in loader.c). The settings add 1.333=iPad (4:3) to DM_SCREEN_ASPECT and screen_aspect on to Odyssey's profile, so the setting appears for the game.
+
+Upstream-Status: fork-only
+Reason: The UW camera widening in 0098/0099/0101 never widened the main camera: the hook only covered CAM[1]'s vtable, which a 4:3 projection uses, while the main camera uses another vtable; the direct-write fallback read the vtable as an object; and UW ignored the picture-shape setting's explicit values. This patch hooks every calcMatrix vtable found by a first-frame scan, makes direct-write use a real trampoline-seen projection object, and makes UW follow DM_SCREEN_ASPECT (including the taller direction) with the iPad option added. No game patches are needed; the same DM_UW_* env as 0098 is required.
+Issue: Wilderness01/NX2Apple#1
+---
+ dm/games/0100000000010000/game.tsv |   4 +
+ dm/games/settings.tsv              |   2 +-
+ dm/host/uw.c                       | 326 ++++++++++++++++++++++-------
+ dm/host/uw.h                       |  37 ++--
+ docs/settings.md                   |   4 +-
+ 5 files changed, 277 insertions(+), 96 deletions(-)
+
+diff --git a/dm/games/0100000000010000/game.tsv b/dm/games/0100000000010000/game.tsv
+index 842746a..cdb292c 100644
+--- a/dm/games/0100000000010000/game.tsv
++++ b/dm/games/0100000000010000/game.tsv
+@@ -11,6 +11,10 @@ ipa	SuperMarioOdyssey.ipa
+ app_category	public.app-category.action-games
+ pad_layout	full
+ 
++# Screen shape (UW, 0102): offer DM_SCREEN_ASPECT in the launcher (Match screen / iPhone Duo 1.43 / iPad 4:3 / 16:9); uw.c follows the
++# chosen ratio — wider (2.167) or taller (1.43, 1.333) — by widening the camera aspect, so the picture fills the screen with correct proportions.
++screen_aspect	on
++
+ # ---- Versions ----
+ build	v393216	1.4.1	main=b424be150a8e7d78701cbe7a439d9ebf	subsdk0=93ff8252d975adf07230cb86c83301c5	sdk=fcf93a41b08c5193a1410d262602dc62
+ package	v393216
+diff --git a/dm/games/settings.tsv b/dm/games/settings.tsv
+index 75f5e62..f4d45a2 100644
+--- a/dm/games/settings.tsv
++++ b/dm/games/settings.tsv
+@@ -29,7 +29,7 @@ DM_RUMBLE	toggle	-	1	always	Controls	Game rumble		level=basic
+ DM_RUMBLE_GAIN	range	0:3:0.1	1.0	always	Controls	Rumble strength		needs=DM_RUMBLE=1
+ DM_RUMBLE_MIN	range	0:0.9:0.05	0	always	Controls	Rumble cutoff
+ DM_PAD_PRESS_TO_JOIN	toggle	-	0	always	Controls	Press a button to join
+-DM_SCREEN_ASPECT	choice	auto=Match screen?platform:ios,1.43=iPhone Duo screen (1.43:1),0=16:9 (Switch)	auto|0	DM_GAME_SCREEN_ASPECT!=0	Game	Picture shape	Renders about a quarter more pixels: a little slower and warmer.
++DM_SCREEN_ASPECT	choice	auto=Match screen?platform:ios,1.43=iPhone Duo screen (1.43:1),1.333=iPad (4:3),0=16:9 (Switch)	auto|0	DM_GAME_SCREEN_ASPECT!=0	Game	Picture shape	Renders about a quarter more pixels: a little slower and warmer.
+ DM_PRESENT_SNAP	toggle	-	DM_GAME_PRESENT_SNAP	gfxapi:nvn	Performance	Frame buffering	Up to one frame more display latency.
+ DM_PSO_MTL4	toggle	-	DM_GAME_PSO_MTL4|1	gfxapi:nvn	Performance	Metal 4 pipelines	Keeps a pipeline archive; uses more memory.
+ DM_PSO_PREBUILD	toggle	-	1	gfxapi:nvn	Performance	Pipeline prebuild	The first start waits a few minutes for it, once.	needs=DM_PSO_MTL4=1
+diff --git a/dm/host/uw.c b/dm/host/uw.c
+index acea75b..d255b2f 100644
+--- a/dm/host/uw.c
++++ b/dm/host/uw.c
+@@ -18,12 +18,28 @@
+ #define UW_ASPECT_16_9   1.7777777777777777   // double @0xb6c70
+ #define UW_ASPECT_MIN     0.5
+ #define UW_ASPECT_MAX     8.0
+-#define UW_ENABLE_MIN     1.7866666666666664 // double @0xb9d50 (update threshold)
++#define UW_ENABLE_MIN     1.7866666666666664 // double @0xb9d50 (update threshold in the 3.0 binary; retained for reference — the
++                                             // enable / shape boundaries now follow loader.c's 1.77 / 1.78, see UW_TALL_MAX / UW_WIDE_MIN)
+ #define UW_TOL            1e-4f              // float @0xb8714
+ #define UW_CHECK_169      0.001f             // float @0xb9e64 (trampoline tolerance)
+ #define UW_NEG_169        (-1.77777779f)     // float @0xb9e60
+ #define UW_RESTORE_169    0x3fe38e39u        // float bits of 1.7777778f
+ #define UW_VTSLOT_MAX     63
++#define UW_CALC_MATRIX_OFF 0x9683c0          // NSO offset of sead::PerspectiveProjection::calcMatrix (DmIOS fileoff 0xa5c3c0; it reads
++                                             // [x0+0xb0] (aspect) and multiplies it into the matrix, uw-main-camera-investigation.md §1.2).
++                                             // Odyssey 1.4.1 only: the same offset the vtable hook's orig resolves to on device (log-7).
++#define UW_ASPECT_LO      1.3                // loader.c / front_ios.m accept 1.3-2.2 for DM_SCREEN_ASPECT
++#define UW_ASPECT_HI      2.2
++#define UW_TALL_MAX       1.77               // below this: taller than 16:9 (loader.c dm_fps_state_apply)
++#define UW_WIDE_MIN       1.78               // above this: wider than 16:9 (loader.c); 1.77-1.78 is 16:9
++#define UW_SCAN_MAX       8                  // most additional calcMatrix vtables the first-frame scan hooks
++#define UW_VT_MAX         (UW_SCAN_MAX + 1)  // most hooked calcMatrix slots (1 primary + 8 scanned)
++
++// Enabled when the target is a real shape change: inside the loader's 1.3-2.2 range and outside its 1.77-1.78 dead zone around 16:9
++// (loader.c dm_fps_state_apply). Used by the init resolution and the per-frame canvas update, so the two agree.
++static int uw_aspect_enabled(double r) {
++    return r >= UW_ASPECT_LO && r <= UW_ASPECT_HI && (r < UW_TALL_MAX || r > UW_WIDE_MIN);
++}
+ 
+ // --- config page (DmIOS 0x1014c7000+0x170; baked-in defaults from the file) ---
+ static struct {
+@@ -66,6 +82,12 @@ static struct {
+     void *orig_fn;              // +0x270
+     uint32_t tramp_n;           // +0x278
+     uint8_t hook_tried;         // uw_install_hook was attempted (deferred to the first present, 0099)
++    uint32_t n_169;             // calcMatrix calls with aspect ~16:9 (0102 A1)
++    uint32_t n_43;              // calcMatrix calls with aspect ~4:3 (0102 A1)
++    uint32_t n_other;           // calcMatrix calls with any other aspect (0102 A1)
++    uint32_t frame_n;           // presents seen (0102 A1: summary every 600)
++    uintptr_t last_proj;        // most recent trampoline-seen projection object with aspect ~16:9 (0102 A3)
++    double sa_aspect;           // DM_SCREEN_ASPECT target (0102 B1): -1 = auto/unset, 0 = explicit 16:9 (off), >0 = explicit target
+ } g_st;
+ 
+ // --- MOD table (DmIOS 0x10236a900 header + 0x10236a970 entries, stride 0xf8) ---
+@@ -87,6 +109,24 @@ static int g_ui_mode = 6;       // +0x53c
+ static int g_safe;              // DM_UW_SAFE flag (0x1014c3000+0x28c)
+ static bool g_hook_ok;
+ 
++// --- hooked calcMatrix slots (0102 A2/A3) ---
++// Every vtable slot the hook replaced (the primary's, then the scan's). Direct-write (A3) checks a projection object's vtable against
++// this set: one of its first 64 slots must be a hooked calcMatrix slot, so a stale or wrong object is never written to.
++static uintptr_t g_hooked_slots[UW_VT_MAX];
++static int g_hooked_slots_n;
++static void uw_record_hook_slot(uintptr_t slot) {
++    for (int i = 0; i < g_hooked_slots_n; i++) if (g_hooked_slots[i] == slot) return;
++    if (g_hooked_slots_n < UW_VT_MAX) g_hooked_slots[g_hooked_slots_n++] = slot;
++}
++static int uw_vt_has_hooked_slot(uintptr_t vt) {
++    if (!vt || (vt & 7)) return 0;
++    for (int i = 0; i < g_hooked_slots_n; i++) {
++        uintptr_t q = g_hooked_slots[i];
++        if (q >= vt && q < vt + 64 * 8 && (q - vt) % 8 == 0) return 1;
++    }
++    return 0;
++}
++
+ // --- helpers ---
+ static void uw_flush(void *addr, size_t len) {
+     // DmIOS dispatches through a host callback table (0x5b46c); the engine
+@@ -165,6 +205,26 @@ static void uw_trampoline(void *x0, uint64_t x1, uint64_t x2, uint64_t x3, uint6
+     // the widened value is non-zero (s0 side effect); otherwise d0 passes through.
+     double d0o = d0;
+     if (g_st.enabled && g_st.aspect != 0.0f) d0o = (double)g_st.aspect;
++    // A1 (0102): count every call by the aspect it reads, and remember the most recent 16:9 projection object for direct-write (A3).
++    // The old code only logged the first call, which happened to be a 4:3 projection — the main camera's calls were invisible, so V1.3.1
++    // could not tell whether the main camera ever entered the hook. The first call of each class is logged once; the totals are
++    // summarised every 600 presents in uw_frame_hook. (The counters are written on the render thread and read on the present thread:
++    // 32-bit aligned accesses are single-copy on ARM64, and a stale count only shifts the summary by one window.)
++    if (fabsf(cur + UW_NEG_169) <= UW_CHECK_169) {
++        g_st.n_169++;
++        g_st.last_proj = (uintptr_t)x0;   // 64-bit aligned store, single-copy on ARM64; a stale value means direct-write uses the
++                                          // previous frame's object, which is the same camera
++        if (g_st.n_169 == 1)
++            UW_LOG("calcMatrix first 16:9 this=%p aspect %g -> %g", x0, (double)cur, (double)g_st.aspect);
++    } else if (fabsf(cur - 1.33333333f) <= UW_CHECK_169) {
++        g_st.n_43++;
++        if (g_st.n_43 == 1)
++            UW_LOG("calcMatrix first 4:3 this=%p aspect %g -> %g", x0, (double)cur, (double)g_st.aspect);
++    } else {
++        g_st.n_other++;
++        if (g_st.n_other == 1)
++            UW_LOG("calcMatrix first other this=%p aspect %g -> %g", x0, (double)cur, (double)g_st.aspect);
++    }
+     if (g_st.enabled && g_st.aspect != 0.0f &&
+         (g_st.force || fabsf(cur + UW_NEG_169) <= UW_CHECK_169)) {
+         *field = g_st.aspect;                              // temporary swap
+@@ -173,8 +233,7 @@ static void uw_trampoline(void *x0, uint64_t x1, uint64_t x2, uint64_t x3, uint6
+     } else {
+         orig(x0, x1, x2, x3, x4, x5, x6, x7, d0o, d1, d2, d3, d4, d5, d6, d7);
+     }
+-    if (g_st.tramp_n++ == 0)
+-        UW_LOG("calcMatrix this=%p aspect %g -> %g", x0, (double)cur, (double)g_st.aspect);
++    g_st.tramp_n++;   // the hook has run: direct-write (0101) used this as its "hook owns the aspect" signal; A3 no longer gates on it
+ }
+ 
+ // --- vtable hook install (DmIOS 0x832a4) ---
+@@ -190,6 +249,40 @@ static int uw_slot_valid(uintptr_t orig) {
+     return orig >= g_st.mod_base && orig < g_st.mod_base + g_st.mod_size;
+ }
+ 
++// Write a function pointer into a vtable slot (0102: shared by the primary hook and the .rodata scan). The original queries the current
++// protection through a Mach wrapper and restores it afterwards; the engine uses plain mprotect (probe.c:418). The vtable lives in the
++// game's rodata/data, which the loader leaves PROT_READ|PROT_WRITE (loader.c maps the whole image RW and only the text goes RX) — NOT RX.
++// Restoring to PROT_READ|PROT_EXEC failed on device ([RED] hook: mprotect restore failed, V1.3.0): iOS will not add PROT_EXEC to a data
++// page. Query the real protection and restore exactly that; fall back to RW (the loader's data protection) when the query fails. A slot
++// on an executable page is never written: that is game code, not a vtable, and writing a pointer into it would corrupt it.
++static int uw_write_slot(void **slot, void *value) {
++    long ps = sysconf(_SC_PAGESIZE);
++    if (ps <= 0) ps = 0x4000;
++    uintptr_t page = (uintptr_t)slot & ~((uintptr_t)ps - 1);
++    vm_address_t ra = (vm_address_t)page; vm_size_t rs = 0;
++    vm_region_basic_info_data_64_t vi; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj = MACH_PORT_NULL;
++    int restore_prot = PROT_READ | PROT_WRITE;
++    if (vm_region_64(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&vi, &cnt, &obj) == KERN_SUCCESS) {
++        if (vi.protection & VM_PROT_EXECUTE) {
++            UW_LOG("[RED] hook: slot %p is on an executable page (game code, not a vtable), not writing", (void *)slot);
++            return -1;
++        }
++        restore_prot = 0;
++        if (vi.protection & VM_PROT_READ) restore_prot |= PROT_READ;
++        if (vi.protection & VM_PROT_WRITE) restore_prot |= PROT_WRITE;
++        if (vi.protection & VM_PROT_EXECUTE) restore_prot |= PROT_EXEC;
++    }
++    if (mprotect((void *)page, (size_t)ps, PROT_READ | PROT_WRITE) != 0) {
++        UW_LOG("[RED] hook: mprotect RW failed (%p), vtable hook unavailable", (void *)page);
++        return -1;
++    }
++    *slot = value;
++    sys_icache_invalidate(slot, sizeof *slot);
++    if (mprotect((void *)page, (size_t)ps, restore_prot) != 0)
++        UW_LOG("[RED] hook: mprotect restore failed (wanted %#x)", restore_prot);
++    return 0;
++}
++
+ static int uw_install_hook(void) {
+     if (g_cfg.vtslot < 0) return -1;
+     if (!g_st.mod_base || !g_cfg.cam[1]) return -1;
+@@ -229,49 +322,78 @@ static int uw_install_hook(void) {
+         }
+     }
+     g_st.orig_fn = orig;
+-    long ps = sysconf(_SC_PAGESIZE);
+-    if (ps <= 0) ps = 0x4000;
+-    uintptr_t page = (uintptr_t)slot & ~((uintptr_t)ps - 1);
+-    // The original queries the current protection through a Mach wrapper and restores it afterwards; the engine uses plain mprotect
+-    // (probe.c:418). The vtable lives in the game's rodata/data, which the loader leaves PROT_READ|PROT_WRITE (loader.c maps the whole
+-    // image RW and only the text goes RX) — NOT RX. Restoring to PROT_READ|PROT_EXEC failed on device ([RED] hook: mprotect restore
+-    // failed, V1.3.0): iOS will not add PROT_EXEC to a data page. Query the real protection and restore exactly that; fall back to RW
+-    // (the loader's data protection) when the query fails.
+-    vm_address_t ra = (vm_address_t)page; vm_size_t rs = 0;
+-    vm_region_basic_info_data_64_t vi; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj = MACH_PORT_NULL;
+-    int restore_prot = PROT_READ | PROT_WRITE;
+-    if (vm_region_64(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&vi, &cnt, &obj) == KERN_SUCCESS) {
+-        restore_prot = 0;
+-        if (vi.protection & VM_PROT_READ) restore_prot |= PROT_READ;
+-        if (vi.protection & VM_PROT_WRITE) restore_prot |= PROT_WRITE;
+-        if (vi.protection & VM_PROT_EXECUTE) restore_prot |= PROT_EXEC;
+-    }
+-    if (mprotect((void *)page, (size_t)ps, PROT_READ | PROT_WRITE) != 0) {
+-        UW_LOG("[RED] hook: mprotect RW failed (%p), vtable hook unavailable", (void *)page);
+-        return -1;
+-    }
+-    *slot = (void *)uw_trampoline;
+-    sys_icache_invalidate(slot, sizeof *slot);
+-    if (mprotect((void *)page, (size_t)ps, restore_prot) != 0)
+-        UW_LOG("[RED] hook: mprotect restore failed (wanted %#x)", restore_prot);
++    if (uw_write_slot(slot, (void *)uw_trampoline) != 0) return -1;
++    uw_record_hook_slot((uintptr_t)slot);
+     g_st.hooked = 1;
+     UW_LOG("hooked vtable slot %d (%s+%#x), orig %p", g_cfg.vtslot, g_cfg.mod, g_cfg.cam[1], orig);
+     return 0;
+ }
+ 
++// --- first-frame scan: hook every vtable that calls calcMatrix (0102 A2) ---
++// The main camera's projection may use a different vtable than CAM[1]'s (log-7: the trampoline only ever saw a 4:3 projection, and the
++// main camera stayed 16:9). calcMatrix lives at mod_base + UW_CALC_MATRIX_OFF; any vtable whose calcMatrix slot holds that address is a
++// projection vtable, whatever its address. Scan the module for that pointer value; a hit only counts when it sits in a run of
++// pointer-sized entries (at least two of its four neighbours are valid in-module pointers), so a stray literal in .text cannot hook a
++// wrong slot, and uw_write_slot refuses executable pages in any case. The primary vtable is already hooked by then, so its slot holds the
++// trampoline and is naturally skipped; if the primary hook failed, the scan hooks it too (and sets orig_fn, which the trampoline needs).
++static int uw_is_vtable_entry(uintptr_t v) {
++    return v && !(v & 7) && v >= g_st.mod_base && v < g_st.mod_base + g_st.mod_size;
++}
++
++static int uw_scan_hook_calcmatrix(void) {
++    if (!g_st.mod_base || !g_st.mod_size) return 0;
++    uintptr_t calc = g_st.mod_base + UW_CALC_MATRIX_OFF;
++    uintptr_t lo = g_st.mod_base, hi = g_st.mod_base + g_st.mod_size;
++    int found = 0, hooked = 0;
++    for (uintptr_t p = lo; p + 8 <= hi; p += 8) {
++        if (*(uintptr_t *)p != calc) continue;
++        found++;
++        // Neighbour check: at least two of the four adjacent slots must be valid in-module pointers (a vtable is a run of them).
++        int good = 0;
++        if (p - lo >= 8 && uw_is_vtable_entry(*(uintptr_t *)(p - 8))) good++;
++        if (p - lo >= 16 && uw_is_vtable_entry(*(uintptr_t *)(p - 16))) good++;
++        if (p + 16 <= hi && uw_is_vtable_entry(*(uintptr_t *)(p + 8))) good++;
++        if (p + 24 <= hi && uw_is_vtable_entry(*(uintptr_t *)(p + 16))) good++;
++        if (good < 2) {
++            UW_LOG("calcMatrix scan: slot %p ignored (only %d/4 pointer neighbours)", (void *)p, good);
++            continue;
++        }
++        // Walk back over valid pointers to the table's start, for the slot index in the log. Tables can sit contiguously, so the
++        // start (and the index) is approximate when the run is longer than 64 slots; the slot address itself is what gets hooked.
++        uintptr_t start = p;
++        int back = 0;
++        while (start > lo && back < 64 && uw_is_vtable_entry(*(uintptr_t *)(start - 8))) { start -= 8; back++; }
++        if (hooked >= UW_SCAN_MAX) {
++            UW_LOG("calcMatrix scan: slot %p (table %p, slot %llu) skipped, scan cap %d reached",
++                   (void *)p, (void *)start, (unsigned long long)((p - start) / 8), UW_SCAN_MAX);
++            continue;
++        }
++        if (*(uintptr_t *)p != calc) continue;   // re-read: it must still hold calcMatrix
++        if (uw_write_slot((void **)p, (void *)uw_trampoline) != 0) {
++            UW_LOG("[RED] calcMatrix scan: hook failed at slot %p", (void *)p);
++            continue;
++        }
++        uw_record_hook_slot(p);
++        hooked++;
++        UW_LOG("calcMatrix vtable: hooked slot %llu at %p (table %p, calcMatrix %#llx)",
++               (unsigned long long)((p - start) / 8), (void *)p, (void *)start, (unsigned long long)calc);
++    }
++    if (hooked > 0) {
++        g_st.hooked = 1;
++        if (!g_st.orig_fn) g_st.orig_fn = (void *)calc;   // the primary hook did not install, so nothing set it yet
++    }
++    UW_LOG("calcMatrix vtables: %d slots hold calcMatrix, %d hooked (primary %s)",
++           found, hooked, g_st.hooked ? "installed" : "not installed");
++    return hooked;
++}
++
+ // --- direct-write (DmIOS 0x83714 wrapper + 0x83880) ---
+ static void uw_direct_write(void) {
+     if (!g_st.inited) return;
+-    // The hook owns the aspect only once it has actually run (tramp_n > 0). V1.3.0 installed the hook on garbage, so the trampoline never
+-    // ran (tramp_n stayed 0) while this early return still suppressed direct-write — the camera never widened. Direct-write is the primary
+-    // path until the hook proves itself; both write the same widened aspect, so running both is idempotent. (tramp_n is read from the
+-    // present thread while the trampoline increments it on the render thread: a 32-bit aligned read is single-copy on ARM64, and a stale
+-    // 0 only means direct-write runs one frame longer.)
+-    if (g_st.hooked && g_st.tramp_n > 0) {
+-        atomic_store_explicit(&g_st.active,
+-            (uint32_t)(g_st.enabled && g_st.aspect != 0.0f), memory_order_release);
+-        return;
+-    }
++    // Active: the widened aspect is in effect when UW is enabled and either the hook has run (the trampoline widens during calcMatrix)
++    // or direct-write has widened the object (its aspect reads the target).
++    atomic_store_explicit(&g_st.active,
++        (uint32_t)(g_st.enabled && g_st.aspect != 0.0f && (g_st.tramp_n > 0 || g_st.written)), memory_order_release);
+     if (g_st.scan) {      // DM_UW_SCAN: one-shot diagnostic scan (log only)
+         g_st.scan = 0;
+         uintptr_t lo = g_st.scan_lo, hi = g_st.scan_hi;
+@@ -283,37 +405,38 @@ static void uw_direct_write(void) {
+             }
+         }
+     }
+-    uintptr_t obj;
++    // The object: DM_UW_PROJ wins (an explicit offset); otherwise the most recent trampoline-seen 16:9 projection object (A3). CAM[0]
++    // is no longer used: [CAM[0]] holds the vtable address itself, not a projection object (log-7), so the old [base + CAM[0]] + 56 model
++    // read inside the vtable and never reached a real object. CAM[0]/CAM[2] are still parsed (and logged by uw_init) for compatibility,
++    // but they no longer pick the object. Until the trampoline has seen a 16:9 projection there is no object to write, and the hook
++    // widens it meanwhile — direct-write waits instead of writing to a bogus address.
++    uintptr_t obj = 0;
+     if (g_st.proj) {
+         obj = g_st.mod_base + g_st.proj;
++    } else if (g_st.last_proj) {
++        obj = g_st.last_proj;
+     } else {
+-        obj = *(uintptr_t *)(g_st.mod_base + g_cfg.cam[0]);   // [base + CAM[0]]
+-    }
+-    g_st.call_n++;
+-    if (!obj) {
+-        g_st.bad_n++;
+-        atomic_store_explicit(&g_st.active, 0, memory_order_release);
+         return;
+     }
+-    obj += g_cfg.cam[2];                                       // +56
++    g_st.call_n++;
++    // The object must be a projection object on a hooked vtable: its vtable must hold one of the hooked calcMatrix slots. A stale object
++    // (freed and reused) fails this and is skipped, plainly logged once — the old [RED] (vtab != CAM[1]) fired because the "object" was
++    // the vtable itself, which cannot happen through last_proj.
+     uintptr_t vtab = *(uintptr_t *)obj;
+-    if (g_st.call_n <= 3)
+-        UW_LOG("direct: obj %p vtab %#llx aspect %g (want %#llx)",
+-               (void *)obj, (unsigned long long)vtab,
+-               (double)*(float *)((char *)obj + g_cfg.cam[3]),
+-               (unsigned long long)(g_st.mod_base + g_cfg.cam[1]));
+-    if (vtab != g_st.mod_base + g_cfg.cam[1]) {                // not the target object
++    if (!uw_vt_has_hooked_slot(vtab)) {
+         g_st.bad_n++;
+         if (g_st.bad_n == 1)
+-            UW_LOG("[RED] direct: object %p vtab %#llx != %#llx, skipping",
+-                   (void *)obj, (unsigned long long)vtab,
+-                   (unsigned long long)(g_st.mod_base + g_cfg.cam[1]));
+-        atomic_store_explicit(&g_st.active, 0, memory_order_release);
++            UW_LOG("direct: object %p vtab %#llx has no hooked calcMatrix slot, skipping (stale object?)",
++                   (void *)obj, (unsigned long long)vtab);
+         return;
+     }
+     float *field = (float *)((char *)obj + g_cfg.cam[3]);
++    if (g_st.call_n <= 3)
++        UW_LOG("direct: obj %p vtab %#llx aspect %g (hooked slots %d)",
++               (void *)obj, (unsigned long long)vtab,
++               (double)*(float *)((char *)obj + g_cfg.cam[3]),
++               g_hooked_slots_n);
+     if (!g_st.enabled || g_st.aspect == 0.0f) {               // restore path
+-        atomic_store_explicit(&g_st.active, 0, memory_order_release);
+         if (g_st.written) {
+             uw_flush(field, 4);
+             *(uint32_t *)field = UW_RESTORE_169;               // 1.7777778f
+@@ -350,15 +473,29 @@ static void uw_direct_write(void) {
+ // atomic stores (nvn_mtl.m), so they are safe to call from init or the present thread.
+ extern void mtl_present_screen(uint32_t w, uint32_t h);
+ extern void mtl_present_layer(uint32_t w, uint32_t h);
+-static uint32_t g_shape_w;   // the output width the present shape is set to (0 = unset)
++static uint32_t g_shape_w, g_shape_h;   // the output shape the present is set to (0,0 = unset)
+ static void uw_set_present_shape(double aspect) {
+-    if (!(aspect > UW_ENABLE_MIN && aspect <= UW_ASPECT_MAX)) return;
+-    uint32_t ow = (uint32_t)(1080.0 * aspect + 0.5);
+-    if (ow <= 1920 || ow == g_shape_w) return;
+-    mtl_present_screen(ow, 1080);
+-    mtl_present_layer(ow, 1080);
+-    g_shape_w = ow;
+-    UW_LOG("screen shape %.3f: output %ux1080 (present shape)", aspect, ow);
++    // Both branches follow loader.c dm_fps_state_apply exactly (same boundaries, same formulas): wider than 16:9 keeps the height (1080)
++    // and widens the output; taller than 16:9 keeps the width (1920) and raises the output, a multiple of 48 so the 2/3-size layout space
++    // stays whole. 16:9 (1.77-1.78) is the game's own shape and sets nothing.
++    if (!(aspect >= UW_ASPECT_LO && aspect <= UW_ASPECT_HI)) return;
++    uint32_t w, h;
++    if (aspect > UW_WIDE_MIN) {   // wider: 2.167 -> 2340x1080
++        w = (uint32_t)(1080.0 * aspect + 0.5);
++        h = 1080;
++        if (w <= 1920) return;
++    } else if (aspect < UW_TALL_MAX) {   // taller: 1.43 -> 1920x1344, 1.333 -> 1920x1440
++        w = 1920;
++        h = (uint32_t)(1920.0 / aspect / 48.0 + 0.5) * 48;
++        if (h <= 1080) return;
++    } else {
++        return;
++    }
++    if (w == g_shape_w && h == g_shape_h) return;
++    mtl_present_screen(w, h);
++    mtl_present_layer(w, h);
++    g_shape_w = w; g_shape_h = h;
++    UW_LOG("screen shape %.3f: output %ux%u (present shape)", aspect, w, h);
+ }
+ 
+ // --- update from canvas size (DmIOS 0x835d0) ---
+@@ -366,7 +503,13 @@ static void uw_update_from_size(double w, double h) {
+     if (h <= 0.0) return;
+     if (!g_st.inited) return;
+     double aspect = w / h;
+-    int enabled = (aspect > UW_ENABLE_MIN && aspect <= UW_ASPECT_MAX) ? 1 : 0;
++    // An explicit DM_SCREEN_ASPECT choice (B1) is fixed at init: the canvas must not override it. A 16:9 canvas while the user picked Duo
++    // would otherwise switch the target to the display's 2.167. Only re-assert the present shape for the fixed target.
++    if (g_st.sa_aspect >= 0.0) {
++        if (g_st.enabled) uw_set_present_shape(g_st.aspect);
++        return;
++    }
++    int enabled = uw_aspect_enabled(aspect) ? 1 : 0;
+     if (enabled != g_st.enabled ||
+         (enabled && fabsf((float)aspect - g_st.aspect) > UW_TOL)) {
+         float old = g_st.aspect;
+@@ -374,7 +517,7 @@ static void uw_update_from_size(double w, double h) {
+         if (enabled) g_st.aspect = (float)aspect;
+         uw_apply_aspect(g_st.aspect);
+         // Present shape from the canvas aspect (0099): the fallback when uw_init could not resolve it (no display yet, no DM_SCREEN_ASPECT) —
+-        // the first present with a wide canvas sets the shape, and the MetalFX scaler remakes for it after its 30-present throttle.
++        // the first present with a wide/tall canvas sets the shape, and the MetalFX scaler remakes for it after its 30-present throttle.
+         if (enabled) uw_set_present_shape(aspect);
+         UW_LOG("canvas %.0fx%.0f aspect %.4f -> %s (was %.4f)",
+                w, h, aspect, enabled ? "on" : "off", (double)old);
+@@ -388,13 +531,20 @@ void uw_frame_hook(double w, double h) {
+     // holds the true function pointer. Direct-write covers the frames before the hook lands.
+     if (g_st.inited && !g_st.hook_tried) {
+         g_st.hook_tried = 1;
+-        if (uw_install_hook() == 0) {
++        int primary = uw_install_hook();
++        int scanned = uw_scan_hook_calcmatrix();   // A2 (0102): hook every other vtable that calls calcMatrix
++        if (primary == 0 || scanned > 0) {
+             g_hook_ok = true;
+         } else {
+             UW_LOG("[RED] UW: vtable hook not installed, direct-write only");
+             g_hook_ok = false;
+         }
+     }
++    // A1 (0102): every 600 presents (~10 s at 60 fps), summarise the calcMatrix calls by aspect, so the log shows whether the main camera
++    // (16:9) ever enters the hook. Logged even when all counts are zero: silence would be ambiguous with a dead hook.
++    if (g_st.inited && ++g_st.frame_n % 600 == 0)
++        UW_LOG("calcMatrix calls after %u presents: 16:9=%u 4:3=%u other=%u",
++               g_st.frame_n, g_st.n_169, g_st.n_43, g_st.n_other);
+     uw_update_from_size(w, h);
+     uw_direct_write();
+ }
+@@ -500,35 +650,53 @@ int uw_init(void) {
+             }
+         }
+     }
++    g_st.sa_aspect = -1.0;   // auto/unset until DM_SCREEN_ASPECT says otherwise (B1)
++    const char *aspect_src = auto_mode ? "auto" : (d8 > 0 ? "explicit" : "off");
+     if (auto_mode) {
+-        // Resolve "auto" at init so the present shape is right from the first frame: the launcher's picture shape (front_ios.m resolves
+-        // DM_SCREEN_ASPECT=auto to the window's ratio) first — it follows the app window, not the display — then the display itself
++        // Resolve "auto" at init so the present shape is right from the first frame. DM_SCREEN_ASPECT is the launcher's picture shape:
++        // an explicit number is the target, whatever its direction — wider (2.167) or taller (1.43, 1.333); 0 is an explicit 16:9 and
++        // turns UW off without falling back to the display (the old code ignored both and always fell back to the display's 2.167, so
++        // Duo / 16:9 / iPad never took effect). Only "auto", an unset value, or an out-of-range number falls back to the display pixels
+         // (front_display_pixels, front.h: the screen in pixels, landscape; 0 when not known). Either may be unavailable this early (the
+         // launcher sets its values when the game starts), in which case d8 stays -1 and the first present resolves it from the canvas.
+-        // A "16:9" or taller screen aspect is not wide and leaves d8 at -1.
+         double r = 0.0;
+         const char *sa = getenv("DM_SCREEN_ASPECT");
+         if (sa && *sa && strcmp(sa, "auto")) {
+             char *end = NULL;
+             double v = strtod(sa, &end);
+-            if (end != sa && *end == 0) r = v;
++            if (end != sa && *end == 0) {
++                if (v == 0.0) {
++                    g_st.sa_aspect = 0.0;   // explicit 16:9: UW off, no fallback
++                    aspect_src = "off";
++                    UW_LOG("picture shape: DM_SCREEN_ASPECT=0 (16:9), UW off");
++                } else if (v >= UW_ASPECT_LO && v <= UW_ASPECT_HI) {
++                    g_st.sa_aspect = v;     // explicit target, wide or tall
++                    aspect_src = "explicit";
++                    r = v;
++                    UW_LOG("picture shape: DM_SCREEN_ASPECT=%s -> %.4f", sa, r);
++                }
++                // else: out of range, ignore it and fall back to the display below
++            }
+         }
+-        if (!(r > UW_ENABLE_MIN && r <= UW_ASPECT_MAX)) {
++        if (g_st.sa_aspect < 0.0) {   // no explicit choice: fall back to the display pixels
+             int dw = 0, dh = 0;
+             r = (front_display_pixels(&dw, &dh) && dh > 0) ? (double)dw / dh : 0.0;
+         }
+-        if (r > UW_ENABLE_MIN && r <= UW_ASPECT_MAX) d8 = r;
++        // Enable only for a real shape change (in range and off 16:9); an explicit ~16:9 (1.77-1.78) or 0 leaves UW off.
++        if (uw_aspect_enabled(r)) d8 = r;
+     }
+     g_st.negative = (d8 < 0) ? 1 : 0;
+     g_st.aspect = (float)d8;
+     g_st.enabled = (d8 > 0) ? 1 : 0;
+     g_st.inited = 1;
+     uw_apply_aspect(g_st.aspect > 0 ? g_st.aspect : 0.0f);
+-    UW_LOG("aspect %.4f %s (MOD %s, NOPATCH %d)", d8,
+-           auto_mode ? "auto" : (d8 > 0 ? "explicit" : "off"),
+-           g_cfg.mod, g_st.nopatch);
+-    if (g_st.enabled)
+-        UW_LOG("widening %.1f%% (%.4f / 16:9)", (d8 / UW_ASPECT_16_9 - 1.0) * 100.0, d8);
++    UW_LOG("aspect %.4f %s (MOD %s, NOPATCH %d)", d8, aspect_src, g_cfg.mod, g_st.nopatch);
++    if (g_st.enabled) {
++        if (d8 > UW_ASPECT_16_9)
++            UW_LOG("widening %.1f%% (%.4f / 16:9)", (d8 / UW_ASPECT_16_9 - 1.0) * 100.0, d8);
++        else
++            UW_LOG("taller %.1f%% (16:9 / %.4f)", (UW_ASPECT_16_9 / d8 - 1.0) * 100.0, d8);
++    }
+     // Present shape from the resolved aspect (0099): the picture is shown in this shape (nvn_mtl.m present_shape), and the MetalFX target
+     // follows it — without this the shape stays the default 1920x1080 and the picture is letterboxed even when the camera is widened.
+     if (g_st.enabled) uw_set_present_shape(d8);
+diff --git a/dm/host/uw.h b/dm/host/uw.h
+index 0a13e6a..4bfd2a5 100644
+--- a/dm/host/uw.h
++++ b/dm/host/uw.h
+@@ -1,9 +1,15 @@
+-// uw.h — Ultrawide (UW): camera-aspect widening for 19.5:9 iPhones.
+-// The game keeps rendering 1600x900; the camera aspect is temporarily widened
+-// to the screen aspect (2.167) while the projection matrix is built, and the
+-// present layer stretches the 1600x900 output to fill the screen. The widen
+-// factor (1.219) cancels the stretch factor (1.219), so the picture is wider
+-// with correct proportions. Rewritten from the 3.0 IPA's DmIOS binary
++// uw.h — Ultrawide (UW): camera-aspect widening for 19.5:9 iPhones, and taller
++// rendering for iPad (4:3) and iPhone Duo (1.43:1). The game keeps rendering
++// 1600x900; the camera aspect is temporarily widened to the target aspect
++// while the projection matrix is built, and the present layer stretches the
++// 1600x900 output to fill the screen. The widen factor cancels the stretch
++// factor, so the picture is wider (or taller) with correct proportions.
++// The target follows the launcher's picture shape (DM_SCREEN_ASPECT: auto /
++// 1.43 / 1.333 / 0), resolved in uw_init; 0 (16:9) turns UW off. The hook is
++// installed on every vtable that calls the projection builder calcMatrix
++// (the main camera may use a different vtable than the one DM_UW_CAM names),
++// and direct-write falls back to the most recent projection object the
++// trampoline saw. Rewritten from the 3.0 IPA's DmIOS binary
+ // (see uw-implementation.md); no S2Arm source was available.
+ #ifndef DM_HOST_UW_H
+ #define DM_HOST_UW_H
+@@ -26,22 +32,25 @@ extern "C" {
+ void uw_mod_register(const char *name, uintptr_t main_base, uint64_t size,
+                      uint64_t aspect_off, uint64_t aspect_size);
+ 
+-// Parse DM_UW_* env, resolve the MOD entry, compute the widened aspect and
+-// install the vtable hook. Call once at game start (loader.c, next to
+-// install_fps_state). Returns 0 on success, non-zero when UW is not active
+-// (no MOD entry, DM_ASPECT off/16:9, or the hook could not install —
+-// direct-write still runs in that case, see uw_hook_ok).
++// Parse DM_UW_* env, resolve the MOD entry, compute the target aspect from
++// DM_ASPECT (auto: the launcher's DM_SCREEN_ASPECT, then the display pixels;
++// an explicit DM_SCREEN_ASPECT number is the target, wide or tall, and 0
++// turns UW off) and install the vtable hook. Call once at game start
++// (loader.c, next to install_fps_state). Returns 0 on success, non-zero when
++// UW is not active (no MOD entry, DM_ASPECT off/16:9, or the hook could not
++// install — direct-write still runs in that case, see uw_hook_ok).
+ int uw_init(void);
+ 
+ // Per-frame hook: call every present with the canvas (drawable) size in pixels.
+-// Updates the widened aspect from the size and runs the direct-write pass.
++// Updates the target aspect from the size (auto mode only; an explicit
++// DM_SCREEN_ASPECT choice is fixed at init) and runs the direct-write pass.
+ void uw_frame_hook(double w, double h);
+ 
+-// Effective aspect for UI/layout code: the widened aspect when UW is active,
++// Effective aspect for UI/layout code: the target aspect when UW is active,
+ // otherwise the input unchanged.
+ float uw_effective_aspect(float in);
+ 
+-// Whether the vtable hook installed (false -> direct-write only).
++// Whether a vtable hook installed (false -> direct-write only).
+ bool uw_hook_ok(void);
+ 
+ // DM_UW_SQUEEZE=1 (UI squeeze). Default off.
+diff --git a/docs/settings.md b/docs/settings.md
+index f19ca21..47f4d9e 100644
+--- a/docs/settings.md
++++ b/docs/settings.md
+@@ -81,7 +81,7 @@ iPhone and iPad. **Fit**, the default, shows the game's picture (16:9, or the ta
+ 
+ ### Picture shape
+ 
+-Games whose profile supports it (Breath of the Wild, Animal Crossing: New Horizons). **iPhone Duo screen (1.43:1)** renders a taller picture of the Duo's own shape: the sides of 16:9 with more above and below, and the HUD at the screen's edges. **16:9** is the Switch's picture. The taller picture has about a quarter more pixels, so it runs a little slower and warmer.
++Games whose profile supports it (Breath of the Wild, Animal Crossing: New Horizons). **iPhone Duo screen (1.43:1)** renders a taller picture of the Duo's own shape: the sides of 16:9 with more above and below, and the HUD at the screen's edges. **iPad (4:3)** renders a taller picture of the iPad's own shape: the sides of 16:9 with more above and below, and the HUD at the screen's edges. **16:9** is the Switch's picture. The taller picture has about a quarter more pixels, so it runs a little slower and warmer.
+ 
+ ### Frame-rate counter
+ 
+@@ -262,7 +262,7 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under
+ | Display mode (Mac) | `DM_FULLSCREEN` | `1` fullscreen, `0` a window |
+ | Cloud saves folder (Mac) | `DM_SAVE_SYNC` | a folder; `icloud`: iCloud Drive › nxnative Saves; `0`: off |
+ | Picture (iPhone and iPad) | `DM_PICTURE_FIT` | `fit` 16:9 with black bars, `fill` covers the screen, cropped |
+-| Picture shape | `DM_SCREEN_ASPECT` | `auto` the app window's own shape where it is taller than 16:9 (iPad 4:3, iPhone Duo 1.43:1), else 16:9 (iOS only); `1.43` the iPhone Duo's shape, `0` 16:9 |
++| Picture shape | `DM_SCREEN_ASPECT` | `auto` the app window's own shape where it is taller than 16:9 (iPad 4:3, iPhone Duo 1.43:1), else 16:9 (iOS only); `1.43` the iPhone Duo's shape, `1.333` the iPad's shape, `0` 16:9 |
+ | Frame-rate counter | `DM_SHOW_FPS` | `1`, `0` |
+ | Touch feedback | `DM_TOUCH_HAPTICS` | `1`, `0` |
+ | Game rumble | `DM_RUMBLE` | `1`, `0` |
+-- 
+2.43.0
+
