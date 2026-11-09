@@ -1,0 +1,216 @@
+From d6629f679c9fa0a177fe49ce2545ab482c30516a Mon Sep 17 00:00:00 2001
+From: Wilderness01 <140787484+Wilderness01@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 06:54:30 +0000
+Subject: [PATCH] Ultrawide: run UW without a frame step state page
+
+Odyssey has no FRAME_STEP patch, so fps_state_off is 0 and the UW
+init (inside the fps_state_off block) never ran: no [uw] line in the
+log, the camera never widened, the picture stayed 16:9. Move the
+register + init out of that gate (main module only) and resolve
+DM_ASPECT=auto at init (DM_SCREEN_ASPECT, then the display pixels),
+so the present shape is 2340x1080 from the first frame. Also hook the
+present frame on the Metal 4 path (present_encode_m4, the on-device
+path; the legacy present_encode hook never ran), and install the vtable
+hook on the first present instead of at load time: the loader's
+relocate() rebases the game's vtables and would overwrite a
+load-time trampoline with the original pointer.
+
+Upstream-Status: fork-only
+Reason: The 0098 UW patch never ran on device: its uw_init call sat inside install_key_page's fps_state_off block, but Odyssey has no FRAME_STEP patch so fps_state_off is 0; and its per-frame hook was only in the legacy present_encode, while the device presents through present_encode_m4 (Metal 4). This patch moves uw_init out of the fps_state_off gate (main module only), resolves DM_ASPECT=auto at init (DM_SCREEN_ASPECT, then the display pixels) and sets the present shape to 2340x1080, hooks every present on the Metal 4 path, and defers the vtable-hook install to the first present because the loader's relocate() would overwrite a load-time trampoline when it rebases the game's vtables. No game patches are needed; the same DM_UW_* env as 0098 is required.
+Issue: Wilderness01/NX2Apple#1
+---
+ dm/gfx/nvn/nvn_mtl.m |  3 ++
+ dm/host/loader.c     | 12 ++++---
+ dm/host/uw.c         | 79 ++++++++++++++++++++++++++++++++++++++------
+ 3 files changed, 79 insertions(+), 15 deletions(-)
+
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+index 43d785a..25e6ca2 100644
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -14489,6 +14489,9 @@ static int up_mfx_encode(NvShader *cs) {
+ // The present pass: src's valid rectangle drawn into dst (the drawable, or a screenshot's texture) as present_encode draws it, through MetalFX first where fx_encode takes it
+ // (fx: the scaler state to use, nil = bilinear). uvb: the pass's crop constants (one buffer per present allocator, written by the CPU)
+ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4], id<MTLBuffer> uvb, fx_state *fx) {
++    // Ultrawide (UW): every present, with the drawable (canvas) size in pixels — the Metal 4 path (present_now), not just the legacy
++    // present_encode below (0099: the legacy hook never ran on device, so DM_ASPECT=auto never resolved and direct-write never ran).
++    uw_frame_hook((double)dst.width, (double)dst.height);
+     NSUInteger r[4]; if (!present_crop_rect(src, crop, r)) return 0;
+     present_pipeline(dst.pixelFormat);
+     double dw = dst.width, dh = dst.height;
+diff --git a/dm/host/loader.c b/dm/host/loader.c
+index 6165dd8..d773c56 100644
+--- a/dm/host/loader.c
++++ b/dm/host/loader.c
+@@ -389,11 +389,13 @@ static void install_key_page(module_t *m) {
+     for (unsigned i = 0; i < KEY_N; i++) page[m->key_idx[i]] = (uint64_t)key_value(i) * 8;
+     for (int k = 0; k < KEY_N; k++) if (!page[m->key_idx[k]]) die("%s: key page entry %d is 0 (host key not created) -- the game would read TSD slot 0", m->name, k);
+     if (mprotect(m->base + m->key_page_off, m->key_page_size, PROT_READ)) die("%s key page mprotect", m->name);
+-    if (m->fps_state_off) {
+-        install_fps_state(m);
+-        // Ultrawide (UW): the main module only (the frame step state page belongs to it). Register its main-code base (framework image base +
+-        // __dmmainx0's 0x300000 offset) and parse DM_UW_* env. uw_init is idempotent; a non-zero return means UW is not active and the game
+-        // runs as before. The env (Documents/env.txt, dm/env.txt) is already set: the iOS app reads it before host loading starts.
++    if (m->fps_state_off) install_fps_state(m);
++    // Ultrawide (UW): the main module only, and NOT gated on the frame step state page (0099): Odyssey has no FRAME_STEP patch, so
++    // fps_state_off is 0 and the 0098 call inside the fps_state_off block never ran — no [uw] line in the log, the camera never widened.
++    // Register its main-code base (framework image base + __dmmainx0's 0x300000 offset) and parse DM_UW_* env. uw_init is idempotent; a
++    // non-zero return means UW is not active and the game runs as before. The env (Documents/env.txt, dm/env.txt) is already set: the iOS
++    // app reads it before host loading starts (main.m reads the env files before dm_host_preload_start).
++    if (!strcmp(m->name, "main")) {
+         uw_mod_register("main", (uintptr_t)m->base + 0x300000, 0, 0, 0);
+         uw_init();
+     }
+diff --git a/dm/host/uw.c b/dm/host/uw.c
+index e9370ca..4d9ed2d 100644
+--- a/dm/host/uw.c
++++ b/dm/host/uw.c
+@@ -2,6 +2,7 @@
+ // disassembly evidence (DmIOS file offsets) behind every constant and branch.
+ #include "uw.h"
+ #include "dm.h"
++#include "front.h"   // front_display_pixels: the display in pixels, for DM_ASPECT=auto (0099)
+ #include <math.h>
+ #include <stdatomic.h>
+ #include <stdlib.h>
+@@ -62,6 +63,7 @@ static struct {
+     uint32_t write_n;           // +0x268
+     void *orig_fn;              // +0x270
+     uint32_t tramp_n;           // +0x278
++    uint8_t hook_tried;         // uw_install_hook was attempted (deferred to the first present, 0099)
+ } g_st;
+ 
+ // --- MOD table (DmIOS 0x10236a900 header + 0x10236a970 entries, stride 0xf8) ---
+@@ -282,6 +284,23 @@ static void uw_direct_write(void) {
+         UW_LOG("direct: aspect %g -> %g (obj %p)", (double)cur, (double)g_st.aspect, (void *)obj);
+ }
+ 
++// --- present shape (nvn_mtl.m present_shape, 0099) ---
++// The picture's shape for the present layer: the game's 1600x900 texture is stretched to it, and the front end lays it out. Without this the
++// shape stays the default 1920x1080 and the picture is letterboxed, even when the camera is widened. mtl_present_screen/layer are plain
++// atomic stores (nvn_mtl.m), so they are safe to call from init or the present thread.
++extern void mtl_present_screen(uint32_t w, uint32_t h);
++extern void mtl_present_layer(uint32_t w, uint32_t h);
++static uint32_t g_shape_w;   // the output width the present shape is set to (0 = unset)
++static void uw_set_present_shape(double aspect) {
++    if (!(aspect > UW_ENABLE_MIN && aspect <= UW_ASPECT_MAX)) return;
++    uint32_t ow = (uint32_t)(1080.0 * aspect + 0.5);
++    if (ow <= 1920 || ow == g_shape_w) return;
++    mtl_present_screen(ow, 1080);
++    mtl_present_layer(ow, 1080);
++    g_shape_w = ow;
++    UW_LOG("screen shape %.3f: output %ux1080 (present shape)", aspect, ow);
++}
++
+ // --- update from canvas size (DmIOS 0x835d0) ---
+ static void uw_update_from_size(double w, double h) {
+     if (h <= 0.0) return;
+@@ -294,12 +313,28 @@ static void uw_update_from_size(double w, double h) {
+         g_st.enabled = enabled;
+         if (enabled) g_st.aspect = (float)aspect;
+         uw_apply_aspect(g_st.aspect);
++        // Present shape from the canvas aspect (0099): the fallback when uw_init could not resolve it (no display yet, no DM_SCREEN_ASPECT) —
++        // the first present with a wide canvas sets the shape, and the MetalFX scaler remakes for it after its 30-present throttle.
++        if (enabled) uw_set_present_shape(aspect);
+         UW_LOG("canvas %.0fx%.0f aspect %.4f -> %s (was %.4f)",
+                w, h, aspect, enabled ? "on" : "off", (double)old);
+     }
+ }
+ 
+ void uw_frame_hook(double w, double h) {
++    // Vtable hook, deferred to the first present (0099): uw_init runs during module loading, before the loader's relocate() (loader.c), which
++    // rebases the game's vtables (DT_RELR / R_AARCH64_RELATIVE) and would overwrite the trampoline with the original pointer — the hook
++    // would be silently lost while g_st.hooked still said installed. By the first present the game is relocated and running, so the slot
++    // holds the true function pointer. Direct-write covers the frames before the hook lands.
++    if (g_st.inited && !g_st.hook_tried) {
++        g_st.hook_tried = 1;
++        if (uw_install_hook() == 0) {
++            g_hook_ok = true;
++        } else {
++            UW_LOG("[RED] UW: vtable hook not installed, direct-write only");
++            g_hook_ok = false;
++        }
++    }
+     uw_update_from_size(w, h);
+     uw_direct_write();
+ }
+@@ -316,6 +351,7 @@ int uw_ui_mode(void) { return g_ui_mode; }
+ 
+ // --- env parsing + init (DmIOS 0x82b2c) ---
+ int uw_init(void) {
++    if (g_st.inited) return 0;   // idempotent (0099: install_key_page runs once per module, but a second call must not re-register)
+     const char *e;
+     // DM_UW_CAM: up to 5 hex values, comma/space/tab separated.
+     if ((e = getenv("DM_UW_CAM")) && *e) {
+@@ -370,11 +406,15 @@ int uw_init(void) {
+     g_st.scan_hi = mod->f48 >= 1 ? mod->f60 : mod->f50;
+     // DM_ASPECT.
+     double d8 = -1.0;
++    int auto_mode = 0;   // "auto": resolved at init (below) and per-frame from the canvas
+     if ((e = getenv("DM_ASPECT")) && *e) {
+         if (!strcmp(e, "0")) {
+             d8 = 0.0;
+-        } else if (!strcmp(e, "off") || !strcmp(e, "auto")) {
+-            d8 = -1.0;   // off: stays -1; auto: resolved per-frame from the canvas
++        } else if (!strcmp(e, "off")) {
++            d8 = -1.0;   // off: stays -1, UW disabled
++        } else if (!strcmp(e, "auto")) {
++            auto_mode = 1;
++            d8 = -1.0;
+         } else if (!strcmp(e, "16:9")) {
+             d8 = UW_ASPECT_16_9;
+         } else {
+@@ -394,23 +434,42 @@ int uw_init(void) {
+             }
+         }
+     }
++    if (auto_mode) {
++        // Resolve "auto" at init so the present shape is right from the first frame: the launcher's picture shape (front_ios.m resolves
++        // DM_SCREEN_ASPECT=auto to the window's ratio) first — it follows the app window, not the display — then the display itself
++        // (front_display_pixels, front.h: the screen in pixels, landscape; 0 when not known). Either may be unavailable this early (the
++        // launcher sets its values when the game starts), in which case d8 stays -1 and the first present resolves it from the canvas.
++        // A "16:9" or taller screen aspect is not wide and leaves d8 at -1.
++        double r = 0.0;
++        const char *sa = getenv("DM_SCREEN_ASPECT");
++        if (sa && *sa && strcmp(sa, "auto")) {
++            char *end = NULL;
++            double v = strtod(sa, &end);
++            if (end != sa && *end == 0) r = v;
++        }
++        if (!(r > UW_ENABLE_MIN && r <= UW_ASPECT_MAX)) {
++            int dw = 0, dh = 0;
++            r = (front_display_pixels(&dw, &dh) && dh > 0) ? (double)dw / dh : 0.0;
++        }
++        if (r > UW_ENABLE_MIN && r <= UW_ASPECT_MAX) d8 = r;
++    }
+     g_st.negative = (d8 < 0) ? 1 : 0;
+     g_st.aspect = (float)d8;
+     g_st.enabled = (d8 > 0) ? 1 : 0;
+     g_st.inited = 1;
+     uw_apply_aspect(g_st.aspect > 0 ? g_st.aspect : 0.0f);
+     UW_LOG("aspect %.4f %s (MOD %s, NOPATCH %d)", d8,
+-           g_st.negative ? "auto" : (d8 > 0 ? "explicit" : "off"),
++           auto_mode ? "auto" : (d8 > 0 ? "explicit" : "off"),
+            g_cfg.mod, g_st.nopatch);
+     if (g_st.enabled)
+         UW_LOG("widening %.1f%% (%.4f / 16:9)", (d8 / UW_ASPECT_16_9 - 1.0) * 100.0, d8);
+-    // vtable hook.
+-    if (uw_install_hook() == 0) {
+-        g_hook_ok = true;
+-    } else {
+-        UW_LOG("[RED] UW: vtable hook not installed, direct-write only");
+-        g_hook_ok = false;
+-    }
++    // Present shape from the resolved aspect (0099): the picture is shown in this shape (nvn_mtl.m present_shape), and the MetalFX target
++    // follows it — without this the shape stays the default 1920x1080 and the picture is letterboxed even when the camera is widened.
++    if (g_st.enabled) uw_set_present_shape(d8);
++    // The vtable hook is NOT installed here (0099): uw_init runs during module loading, before the loader's relocate() (loader.c), which
++    // rebases the game's vtables (DT_RELR / R_AARCH64_RELATIVE) and would overwrite the trampoline with the original pointer — the hook
++    // would be silently lost while g_st.hooked still said installed. It is installed on the first present instead (uw_frame_hook), once
++    // the game is relocated and running; direct-write covers the frames before it lands.
+     // CAM check (log only, not a gate — DmIOS 0x8344c).
+     if (g_cfg.cam[0] != 0x01e39d10 || g_cfg.cam[1] != 0x01d05380)
+         UW_LOG("CAM %#x,%#x (not the baked-in %#x,%#x)", g_cfg.cam[0], g_cfg.cam[1], 0x01e39d10, 0x01d05380);
+-- 
+2.43.0
+
