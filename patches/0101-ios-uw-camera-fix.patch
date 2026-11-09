@@ -1,0 +1,227 @@
+From 8d7b839b164a079e4b940a997a91dcb63285371a Mon Sep 17 00:00:00 2001
+From: Wilderness01 <140787484+Wilderness01@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 08:41:33 +0000
+Subject: [PATCH] Ultrawide: fix the camera widening (correct module base,
+ validate the hook)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+V1.3.0 fills the screen but Mario is ~22% fat: the present shape and
+scaler are right, but the camera aspect never widens. The vtable hook
+installed on the wrong address — loader.c registered the main module at
+m->base + 0x300000, but m->base is already the NSO image base, so the
+computed vtable landed 0x300000 past the module end in subsdk0 code and
+the slot held two AArch64 instructions as the 'original' function
+pointer. The trampoline never ran, and the bogus hook still suppressed
+direct-write, so no write path ever widened the aspect. The MOD entry
+also reported size 0 ('MOD entry too small (0)'), disabling the third
+write path, and the hook's mprotect restore to PROT_READ|PROT_EXEC
+failed because the vtable page is game data, not executable code.
+
+Register m->base alone (CAM offsets are NSO offsets from it) and the
+real module size; validate a hook slot before installing (8-byte
+aligned, inside the module) and fall back to the alternate CAM reading
+(CAM - 0xF4000) when the primary fails validation, logging which one
+was used; let direct-write run until the hook has actually fired
+(tramp_n > 0) instead of suppressing it on install; restore the vtable
+page to its queried protection instead of PROT_READ|PROT_EXEC; and stop
+reporting the third path as an error when it is simply not configured
+for this game (aspect size 0).
+
+Upstream-Status: fork-only
+Reason: The UW camera widening in 0098/0099 never took effect on device: the module base was wrong by +0x300000, so the vtable hook read instructions instead of a function pointer and its trampoline never ran, while the installed hook still suppressed the direct-write fallback; the MOD size was 0 and the mprotect restore target was wrong. This patch corrects the base and size, validates the hook slot with a fallback CAM reading, makes direct-write the primary path until the hook proves itself, and restores the page's real protection. No game patches are needed; the same DM_UW_* env as 0098 is required.
+Issue: Wilderness01/NX2Apple#1
+---
+ dm/host/loader.c | 15 ++++++---
+ dm/host/uw.c     | 84 ++++++++++++++++++++++++++++++++++++++++++------
+ dm/host/uw.h     |  5 ++-
+ 3 files changed, 90 insertions(+), 14 deletions(-)
+
+diff --git a/dm/host/loader.c b/dm/host/loader.c
+index d773c56..762d47b 100644
+--- a/dm/host/loader.c
++++ b/dm/host/loader.c
+@@ -392,11 +392,18 @@ static void install_key_page(module_t *m) {
+     if (m->fps_state_off) install_fps_state(m);
+     // Ultrawide (UW): the main module only, and NOT gated on the frame step state page (0099): Odyssey has no FRAME_STEP patch, so
+     // fps_state_off is 0 and the 0098 call inside the fps_state_off block never ran — no [uw] line in the log, the camera never widened.
+-    // Register its main-code base (framework image base + __dmmainx0's 0x300000 offset) and parse DM_UW_* env. uw_init is idempotent; a
+-    // non-zero return means UW is not active and the game runs as before. The env (Documents/env.txt, dm/env.txt) is already set: the iOS
+-    // app reads it before host loading starts (main.m reads the env files before dm_host_preload_start).
++    // Register its image base and size and parse DM_UW_* env. uw_init is idempotent; a non-zero return means UW is not active and the
++    // game runs as before. The env (Documents/env.txt, dm/env.txt) is already set: the iOS app reads it before host loading starts
++    // (main.m reads the env files before dm_host_preload_start).
++    // 0101: the base is m->base alone. dm.h defines base as the start address of the image, so CAM offsets are NSO offsets from it; the
++    // old +0x300000 was __dmmainx0's file offset inside the DmGame framework binary — a file-layout number, not a runtime offset. Adding
++    // it pushed the computed vtable 0x300000 past the module end (main ends at base+0x14d4000; the hook landed in subsdk0 code and read
++    // two AArch64 instructions as the "original" function pointer, so the trampoline never ran and Mario stayed ~22% fat, V1.3.0).
++    // The size is the real module size (m->size): the 0 that was passed made the MOD entry report "too small (0)" and left the hook's
++    // slot validation without a range to check against. aspect_off/aspect_size stay 0/0: the display-aspect float for the third write
++    // path (aspect-apply) is unknown for Odyssey, so that path stays inert by design (uw-implementation.md §1.3); A+B are unaffected.
+     if (!strcmp(m->name, "main")) {
+-        uw_mod_register("main", (uintptr_t)m->base + 0x300000, 0, 0, 0);
++        uw_mod_register("main", (uintptr_t)m->base, (uint64_t)m->size, 0, 0);
+         uw_init();
+     }
+ }
+diff --git a/dm/host/uw.c b/dm/host/uw.c
+index 4d9ed2d..acea75b 100644
+--- a/dm/host/uw.c
++++ b/dm/host/uw.c
+@@ -4,6 +4,7 @@
+ #include "dm.h"
+ #include "front.h"   // front_display_pixels: the display in pixels, for DM_ASPECT=auto (0099)
+ #include <math.h>
++#include <mach/mach.h>   // vm_region_64: query a page's real protection before restoring it (0101)
+ #include <stdatomic.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -46,6 +47,7 @@ static struct {
+     uintptr_t aspect_page;      // +0x210
+     uint64_t aspect_len;        // +0x218
+     uintptr_t mod_base;         // +0x220
++    uint64_t mod_size;            // the module's mapped size (0101: validates hook slots)
+     uint64_t scan_hi;           // +0x228
+     uint64_t scan_lo;           // +0x230
+     int32_t negative;           // +0x238
+@@ -176,29 +178,82 @@ static void uw_trampoline(void *x0, uint64_t x1, uint64_t x2, uint64_t x3, uint6
+ }
+ 
+ // --- vtable hook install (DmIOS 0x832a4) ---
++// A slot value is only a function pointer when it is 8-byte aligned and inside the module's mapped image. V1.3.0 installed the hook on
++// whatever the slot held (two AArch64 instructions, orig 0x91004108f9401908) because mod_base was wrong (+0x300000) and nothing
++// validated orig: the trampoline never ran (tramp_n stayed 0) and the bogus hook still suppressed direct-write. Validate first; if the
++// primary CAM fails, try the alternate reading (both CAM values minus 0xF4000, the __dmmainx0 file offset in the 3.0 IPA's DmIOS binary)
++// and adopt whichever validates, so the log says which reading the device used. The slot itself must lie inside the module too, so a
++// wrong CAM cannot fault by dereferencing an unmapped address.
++static int uw_slot_valid(uintptr_t orig) {
++    if (!orig || (orig & 7)) return 0;
++    if (!g_st.mod_base || !g_st.mod_size) return 0;   // no range to check against: do not install unvalidated
++    return orig >= g_st.mod_base && orig < g_st.mod_base + g_st.mod_size;
++}
++
+ static int uw_install_hook(void) {
+     if (g_cfg.vtslot < 0) return -1;
+     if (!g_st.mod_base || !g_cfg.cam[1]) return -1;
+     uintptr_t vt = g_st.mod_base + g_cfg.cam[1];
+-    void **slot = (void **)(vt + (uintptr_t)g_cfg.vtslot * 8);
++    uintptr_t slot_addr = vt + (uintptr_t)g_cfg.vtslot * 8;
++    if (!g_st.mod_size) {
++        UW_LOG("[RED] hook: MOD size unknown for %s, cannot validate slot %d; hook not installed", g_cfg.mod, g_cfg.vtslot);
++        return -1;
++    }
++    if (slot_addr < g_st.mod_base || slot_addr + 8 > g_st.mod_base + g_st.mod_size) {
++        UW_LOG("[RED] hook: slot %d address %#llx is outside %s (%#llx+%#llx), hook not installed",
++               g_cfg.vtslot, (unsigned long long)slot_addr, g_cfg.mod,
++               (unsigned long long)g_st.mod_base, (unsigned long long)g_st.mod_size);
++        return -1;
++    }
++    void **slot = (void **)slot_addr;
+     void *orig = *slot;
+     if ((uintptr_t)orig <= 0xfff) { UW_LOG("[RED] hook: slot %d empty (%p)", g_cfg.vtslot, orig); return -1; }
+     if (orig == (void *)uw_trampoline) { g_st.hooked = 1; return 0; }  // idempotent
++    if (!uw_slot_valid((uintptr_t)orig)) {
++        // Not a function pointer in this module: the CAM reading is wrong for this build. Try the alternate reading before giving up.
++        uint32_t alt0 = g_cfg.cam[0] - 0xF4000, alt1 = g_cfg.cam[1] - 0xF4000;
++        uintptr_t avt = g_st.mod_base + alt1;
++        uintptr_t aslot_addr = avt + (uintptr_t)g_cfg.vtslot * 8;
++        void *aorig = NULL;
++        if (aslot_addr >= g_st.mod_base && aslot_addr + 8 <= g_st.mod_base + g_st.mod_size)
++            aorig = *(void **)aslot_addr;
++        if (aorig && aorig != (void *)uw_trampoline && uw_slot_valid((uintptr_t)aorig)) {
++            UW_LOG("hook: primary CAM %#x,%#x gave %p (not a function pointer); using alternate CAM %#x,%#x",
++                   g_cfg.cam[0], g_cfg.cam[1], orig, alt0, alt1);
++            g_cfg.cam[0] = alt0; g_cfg.cam[1] = alt1;   // direct-write uses the same reading
++            slot = (void **)aslot_addr; orig = aorig;
++        } else {
++            UW_LOG("[RED] hook: slot %d holds %p (not a function pointer in %s+%#llx), alternate also invalid (%p); hook not installed",
++                   g_cfg.vtslot, orig, g_cfg.mod, (unsigned long long)g_st.mod_size, aorig);
++            return -1;
++        }
++    }
+     g_st.orig_fn = orig;
+     long ps = sysconf(_SC_PAGESIZE);
+     if (ps <= 0) ps = 0x4000;
+     uintptr_t page = (uintptr_t)slot & ~((uintptr_t)ps - 1);
+-    // The original queries the current protection through a Mach wrapper and
+-    // restores it afterwards; the engine uses plain mprotect (probe.c:418).
+-    // The vtable page is RX; restore to PROT_READ|PROT_EXEC.
++    // The original queries the current protection through a Mach wrapper and restores it afterwards; the engine uses plain mprotect
++    // (probe.c:418). The vtable lives in the game's rodata/data, which the loader leaves PROT_READ|PROT_WRITE (loader.c maps the whole
++    // image RW and only the text goes RX) — NOT RX. Restoring to PROT_READ|PROT_EXEC failed on device ([RED] hook: mprotect restore
++    // failed, V1.3.0): iOS will not add PROT_EXEC to a data page. Query the real protection and restore exactly that; fall back to RW
++    // (the loader's data protection) when the query fails.
++    vm_address_t ra = (vm_address_t)page; vm_size_t rs = 0;
++    vm_region_basic_info_data_64_t vi; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj = MACH_PORT_NULL;
++    int restore_prot = PROT_READ | PROT_WRITE;
++    if (vm_region_64(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&vi, &cnt, &obj) == KERN_SUCCESS) {
++        restore_prot = 0;
++        if (vi.protection & VM_PROT_READ) restore_prot |= PROT_READ;
++        if (vi.protection & VM_PROT_WRITE) restore_prot |= PROT_WRITE;
++        if (vi.protection & VM_PROT_EXECUTE) restore_prot |= PROT_EXEC;
++    }
+     if (mprotect((void *)page, (size_t)ps, PROT_READ | PROT_WRITE) != 0) {
+         UW_LOG("[RED] hook: mprotect RW failed (%p), vtable hook unavailable", (void *)page);
+         return -1;
+     }
+     *slot = (void *)uw_trampoline;
+     sys_icache_invalidate(slot, sizeof *slot);
+-    if (mprotect((void *)page, (size_t)ps, PROT_READ | PROT_EXEC) != 0)
+-        UW_LOG("[RED] hook: mprotect restore failed");
++    if (mprotect((void *)page, (size_t)ps, restore_prot) != 0)
++        UW_LOG("[RED] hook: mprotect restore failed (wanted %#x)", restore_prot);
+     g_st.hooked = 1;
+     UW_LOG("hooked vtable slot %d (%s+%#x), orig %p", g_cfg.vtslot, g_cfg.mod, g_cfg.cam[1], orig);
+     return 0;
+@@ -207,7 +262,12 @@ static int uw_install_hook(void) {
+ // --- direct-write (DmIOS 0x83714 wrapper + 0x83880) ---
+ static void uw_direct_write(void) {
+     if (!g_st.inited) return;
+-    if (g_st.hooked) {   // hook active: trampoline owns the aspect
++    // The hook owns the aspect only once it has actually run (tramp_n > 0). V1.3.0 installed the hook on garbage, so the trampoline never
++    // ran (tramp_n stayed 0) while this early return still suppressed direct-write — the camera never widened. Direct-write is the primary
++    // path until the hook proves itself; both write the same widened aspect, so running both is idempotent. (tramp_n is read from the
++    // present thread while the trampoline increments it on the render thread: a 32-bit aligned read is single-copy on ARM64, and a stale
++    // 0 only means direct-write runs one frame longer.)
++    if (g_st.hooked && g_st.tramp_n > 0) {
+         atomic_store_explicit(&g_st.active,
+             (uint32_t)(g_st.enabled && g_st.aspect != 0.0f), memory_order_release);
+         return;
+@@ -388,9 +448,15 @@ int uw_init(void) {
+     const uw_mod_t *mod = uw_mod_find(g_cfg.mod);
+     if (!mod) { UW_LOG("[RED] UW: no MOD entry for '%s'", g_cfg.mod); return 10; }
+     g_st.mod_base = mod->base;
++    g_st.mod_size = mod->size;   // 0101: the hook validates its slot against this range
+     if (g_st.nopatch) {
+-        if (mod->aspect_size < 0x104) {
+-            UW_LOG("[RED] UW: MOD entry too small (%llu), aspect-apply disabled",
++        if (mod->aspect_size == 0) {
++            // Third path not configured for this game (Odyssey: the display-aspect float's address is unknown, uw-implementation.md §1.3)
++            // — inert by design, not an error; A (vtable hook) + B (direct-write) carry the widening. Only a non-zero size below the
++            // threshold is a misconfiguration.
++            UW_LOG("aspect-apply not configured (MOD aspect size 0), third path inert");
++        } else if (mod->aspect_size < 0x104) {
++            UW_LOG("[RED] UW: MOD aspect size too small (%llu), aspect-apply disabled",
+                    (unsigned long long)mod->aspect_size);
+         } else {
+             g_st.aspect_addr = mod->base + mod->aspect_off + 0x100;
+diff --git a/dm/host/uw.h b/dm/host/uw.h
+index 077f055..0a13e6a 100644
+--- a/dm/host/uw.h
++++ b/dm/host/uw.h
+@@ -16,7 +16,10 @@ extern "C" {
+ 
+ // Register a game module for the MOD table. Call at module load, before uw_init.
+ //   name: module name for DM_UW_MOD matching ("main" for Odyssey).
+-//   main_base: the module's main-code base (framework image base + 0x300000).
++//   main_base: the module's image base (m->base; the NSO image start, so CAM
++//     offsets are NSO offsets from it). 0101: the old +0x300000 was
++//     __dmmainx0's file offset inside the DmGame framework binary, not a
++//     runtime offset — adding it pushed the vtable past the module end.
+ //   size: module size (address-range lookup; 0 = unknown, lookup by name only).
+ //   aspect_off/aspect_size: offset/size of the game's display-aspect float used
+ //     by the third write path; pass 0/0 when unknown (that path stays inert).
+-- 
+2.43.0
+
