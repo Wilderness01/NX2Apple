@@ -1,0 +1,649 @@
+From a6562f10d063a9097d4ad6d6696e87e7a4a8efdb Mon Sep 17 00:00:00 2001
+From: Wilderness01 <140787484+Wilderness01@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 00:54:05 +0000
+Subject: [PATCH] Ultrawide: Odyssey renders 19.5:9 via camera-aspect widening
+ (UW)
+
+Upstream-Status: fork-only
+Reason: The 0097 render-wider approach (game display width 1280->1560 handheld, 1600->1950 docked) has two defects: handheld stretches ~22% wider because the camera aspect does not follow the display rectangle, and docked shows a black screen because the swap-chain texture stays 1600x900 while the crop is 1950x900. UW (ultrawide, rewritten from the 3.0 IPA DmIOS binary; no S2Arm source was available) avoids both: the game keeps rendering 1600x900, the camera aspect is temporarily widened to the screen aspect (2.167) while the projection matrix is built (vtable hook, slot 13, with a direct-write fallback when iOS refuses the vtable mprotect), and the present layer stretches the 1600x900 output to fill 2340x1080, so the widen factor (1.219) cancels the stretch factor (1.219) and the picture is wider with correct proportions. New host files dm/host/uw.h + dm/host/uw.c, loader.c registers the main module and calls uw_init, the 0097 wider branch in loader.c and the auto branch in front_ios.m are kept for the present shape, and nvn_mtl.m calls uw_frame_hook every present. Requires game env DM_ASPECT=auto, DM_UW_NOPATCH=1, DM_UW_CAM=0x136f550,0x13540e8, DM_UW_VTSLOT=13, DM_UW_UI=6 (set in the app Documents/env.txt or baked in via --env-file).
+Issue: Wilderness01/NX2Apple#1
+---
+ dm/gfx/nvn/nvn_mtl.m       |   5 +
+ dm/host/Makefile           |   2 +-
+ dm/host/loader.c           |  51 ++++-
+ dm/host/uw.c               | 418 +++++++++++++++++++++++++++++++++++++
+ dm/host/uw.h               |  53 +++++
+ dm/ios/Sources/front_ios.m |   6 +-
+ 6 files changed, 525 insertions(+), 10 deletions(-)
+ create mode 100644 dm/host/uw.c
+ create mode 100644 dm/host/uw.h
+
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+index 4fcc8c2..43d785a 100644
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -62,6 +62,7 @@ static inline uint64_t tex_slot_h(const uint64_t *tex, const uint64_t *img, unsi
+ static uint64_t c2_handle(int stage, unsigned b);   // the handle c2 holds at byte b (defined with the draw state, TEXA / SAMPA)
+ #include "nvn_hmap.h"
+ #include "../../host/dm.h"
++#include "../../host/uw.h"   // Ultrawide (UW): per-frame hook in present_encode below
+ #import <CommonCrypto/CommonDigest.h>
+ #include <stdarg.h>
+ #include <mach-o/dyld.h>
+@@ -14234,6 +14235,10 @@ static int present_crop_rect(id<MTLTexture> src, const int crop[4], NSUInteger r
+     r[0] = crop[0]; r[1] = crop[1]; r[2] = crop[2]; r[3] = crop[3]; return 1;
+ }
+ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4]) {
++    // Ultrawide (UW): every present, with the drawable (canvas) size in pixels. Updates the widened aspect from the size and runs the
++    // direct-write pass; a no-op when UW is not active. The 1600x900 texture is stretched to the 2340x1080 present shape (loader.c), which
++    // the canvas fills, so the picture is wider with correct proportions.
++    uw_frame_hook((double)dst.width, (double)dst.height);
+     NSUInteger r[4]; if (!present_crop_rect(src, crop, r)) return 0;
+     NSUInteger cx = r[0], cy = r[1], cw = r[2], ch = r[3];
+     static uint64_t last_crop[8]; uint64_t meta[8] = {src.width, src.height, cx, cy, cw, ch, dst.width, dst.height};
+diff --git a/dm/host/Makefile b/dm/host/Makefile
+index b97e46f..928ad55 100644
+--- a/dm/host/Makefile
++++ b/dm/host/Makefile
+@@ -20,7 +20,7 @@ GAME_H = gen/$(GAME)/game_profile.h
+ include ../mac/min_os.mk
+ CFLAGS=-O1 -g -Wall -Wno-unused-function -mmacosx-version-min=$(MACOS_MIN)
+ # Service-layer takeover hle_*.c files are included by wildcard: adding a file does not touch this line (avoids merge conflicts)
+-SRC=main.c loader.c hle.c crash.c probe.c thread.c save_sync.c memstat.m haptics_apple.m $(sort $(wildcard hle_*.c)) front_mac.m controllers_mac.m web_apple.m entry.S
++SRC=main.c loader.c uw.c hle.c crash.c probe.c thread.c save_sync.c memstat.m haptics_apple.m $(sort $(wildcard hle_*.c)) front_mac.m controllers_mac.m web_apple.m entry.S
+ # NVN null device + nn::vi + the Vulkan layer (dm/gfx/)
+ # Sources under dm/gfx, dm/gfx/nvn, dm/gfx/tex, dm/gfx/vk and dm/gfx/gl are included by wildcard (tests/ and metal/ do not go into the host): adding a file does not touch this line
+ GFX=$(sort $(wildcard ../gfx/*.c ../gfx/nvn/*.c ../gfx/nvn/*.m ../gfx/nvn/*.S ../gfx/tex/*.c ../gfx/tex/*.m ../gfx/vk/*.m ../gfx/gl/*.m))
+diff --git a/dm/host/loader.c b/dm/host/loader.c
+index 8e623ec..6165dd8 100644
+--- a/dm/host/loader.c
++++ b/dm/host/loader.c
+@@ -1,6 +1,7 @@
+ // Multi-module loading (playing the role of Horizon's rtld): mapping, claiming thread slots, gate registration, cross-module relocation, take-over by name, segment permissions.
+ // The code area (original text and patch area) is set to read-only+execute as soon as it is copied in, and from then on the loader only writes data: on iOS these two blocks must be embedded as is as signed code segments.
+ #include "dm.h"
++#include "uw.h"
+ #include <TargetConditionals.h>
+ #include <fcntl.h>
+ #include <errno.h>
+@@ -311,14 +312,17 @@ void dm_fps_state_apply(void) {
+     const char *rs = getenv("DM_RENDER_SCALE"); float sc = 1.0f;
+     if (rs) { char *end; sc = strtof(rs, &end); if (end == rs || *end || !(sc >= 0.5f && sc <= 1.0f)) { LOG("[RED] DM_RENDER_SCALE=%s: must be 0.5 to 1.0; keeping the game's size", rs); sc = 1.0f; } else LOG("%s: 3D views rendered at %.2f of the game's size (DM_RENDER_SCALE)", g_fps_mod, sc); }
+     memcpy(dm_fps_state + 0x10, &sc, sizeof sc);
+-    // Screen shape: DM_SCREEN_ASPECT, the screen's width / height between 1.3 and 1.77, makes the builds with screen-shape stubs
+-    // (Breath of the Wild 1.9.0's patches.py) render that shape: the output keeps its width (1920) and takes the height that gives the ratio, a multiple of 48 so the
+-    // 2/3-size layout space (1280 wide) stays whole: 1.43 → 1920x1344 and 1280x896. State +0x48 u32 output height, +0x4c u32 layout height, +0x50 its float; 0 = 16:9
++    // Screen shape: DM_SCREEN_ASPECT, the screen's width / height between 1.3 and 2.2, makes the builds with screen-shape stubs
++    // (Breath of the Wild 1.9.0's patches.py, Super Mario Odyssey's) render that shape. A taller screen (1.3 to 1.77): the output keeps its width (1920)
++    // and takes the height that gives the ratio, a multiple of 48 so the 2/3-size layout space (1280 wide) stays whole: 1.43 → 1920x1344 and 1280x896.
++    // State +0x48 u32 output height, +0x4c u32 layout height, +0x50 its float; 0 = 16:9. A wider screen (1.78 to 2.2): the output keeps its height (1080)
++    // and takes the width that gives the ratio, the layout its width the same way: 2.167 → 2340x1080 and 1560x720. State +0x40 u32 output width,
++    // +0x44 u32 layout width; 0 = 16:9
+     const char *as = getenv("DM_SCREEN_ASPECT");
+     if (as && *as && strcmp(as, "0") && strcmp(as, "auto")) {   // 0: 16:9; auto: the iOS front end resolves it to the screen's shape (a Mac window has none)
+         char *end; float a = strtof(as, &end);
+-        if (end == as || *end || !(a >= 1.3f && a < 1.77f)) LOG("[RED] DM_SCREEN_ASPECT=%s: a width / height from 1.3 to 1.77; keeping 16:9", as);
+-        else {
++        if (end == as || *end || !(a >= 1.3f && a <= 2.2f)) LOG("[RED] DM_SCREEN_ASPECT=%s: a width / height from 1.3 to 2.2 (1.3 to 1.77 taller, 1.78 to 2.2 wider); keeping 16:9", as);
++        else if (a < 1.77f) {   // taller than 16:9: the existing body below, unchanged
+             uint32_t oh = (uint32_t)(1920.0f / a / 48.0f + 0.5f) * 48, lh = oh * 2 / 3; float lf = (float)lh;
+             memcpy(dm_fps_state + 0x48, &oh, 4); memcpy(dm_fps_state + 0x4c, &lh, 4); memcpy(dm_fps_state + 0x50, &lf, 4);
+             extern void mtl_present_screen(uint32_t w, uint32_t h); mtl_present_screen(1920, oh);   // the picture's shape for a texture that follows it (nvn_mtl.m present_shape)
+@@ -346,6 +350,34 @@ void dm_fps_state_apply(void) {
+             LOG("%s: screen shape: HUD moves out by %.0f (edge %.0f, listed widgets %.0f), panes %.0fx%.0f or larger stretched %.3f", g_fps_mod, anc[0], anc[2], anc[3], anc[4], anc[5], anc[1]);
+             LOG("%s: screen shape %.3f: output 1920x%u, layout 1280x%u (DM_SCREEN_ASPECT; only builds with screen-shape stubs follow it)", g_fps_mod, a, oh, lh);
+         }
++        else if (a > 1.78f) {   // wider than 16:9: the output keeps its height (1080) and takes the width that gives the ratio, the layout its width
++            // the same way: 2.167 -> 2340x1080 and 1560x720. State +0x40 u32 output width, +0x44 u32 layout width; the ratio (+0x58), k (+0x5c) and the
++            // tolerance (+0x60) as for the taller screen; the HUD camera's 16:9 projection (+0x74 / +0x78 / +0x7c) as for the taller screen. The HUD at
++            // the wider edges takes its own block (+0xa0..+0xb4, mirroring +0x80..+0x98): the shift (half the layout width over 640), the stretch
++            // (layout width / 1280), the edge rule's distance, the listed corner widgets' distance, a full-screen pane's width and height in the
++            // 1280x720 space, and the widest pane still stretched. DM_SCREEN_HUD overrides the last five for trials, as for the taller screen
++            uint32_t ow = (uint32_t)(1080.0f * a + 0.5f), lw = (uint32_t)(720.0f * a + 0.5f);
++            memcpy(dm_fps_state + 0x40, &ow, 4); memcpy(dm_fps_state + 0x44, &lw, 4);
++            extern void mtl_present_screen(uint32_t w, uint32_t h); mtl_present_screen(ow, 1080);   // the picture's shape for a texture that follows it (nvn_mtl.m present_shape)
++            extern void mtl_present_layer(uint32_t w, uint32_t h); mtl_present_layer(ow, 1080);   // the present's fallback (nvn_mtl.m present_shape): the game's window texture is 1600x900 (UW: the game keeps rendering 1600x900), so the texture's 16:9 does not match the screen's 2.167 and the shape falls back to the layer's; make the layer the wider output so the fallback is the wider shape, not 16:9
++            const char *ms = getenv("DM_SCREEN_ASPECT_SITES"); uint32_t mask = ms ? (uint32_t)strtoul(ms, NULL, 0) : 0xffffffffu;   // the stubs of the game's own conversions, one bit each (+0x54)
++            memcpy(dm_fps_state + 0x54, &mask, 4);
++            if (ms) LOG("%s: screen shape: conversion sites %#x (DM_SCREEN_ASPECT_SITES)", g_fps_mod, mask);
++            // The field of view: a wider view keeps the vertical angle and shows more at the sides (UW's camera widening, dm/host/uw.c, does
++            // the widening; this only records the ratio); k = (16/9) / ratio is below 1 here, the view is wider than 16:9, not taller
++            float r = (float)ow / 1080.0f, k = (16.0f / 9.0f) / r, tol = 0.01f;
++            const char *fo = getenv("DM_SCREEN_FOV"); if (fo && !strcmp(fo, "off")) tol = -1.0f;   // trials: the scene keeps the game's vertical angle (no view matches); the HUD camera still widens
++            memcpy(dm_fps_state + 0x58, &r, 4); memcpy(dm_fps_state + 0x5c, &k, 4); memcpy(dm_fps_state + 0x60, &tol, 4);
++            float wide = 16.0f / 9.0f, wtol = 0.001f, far = 10000.0f;   // the HUD camera's projection: 16:9, near 1, far 10000 (+0x74 / +0x78 / +0x7c)
++            memcpy(dm_fps_state + 0x74, &wide, 4); memcpy(dm_fps_state + 0x78, &wtol, 4); memcpy(dm_fps_state + 0x7c, &far, 4);
++            float anc[7] = {(float)lw / 2 - 640.0f, (float)lw / 1280.0f, 280.0f, 100.0f, 1270.0f, 710.0f, 1300.0f};
++            const char *hv = getenv("DM_SCREEN_HUD");
++            if (hv && sscanf(hv, "%f,%f,%f,%f,%f", &anc[2], &anc[3], &anc[4], &anc[5], &anc[6]) < 4) LOG("[RED] DM_SCREEN_HUD=%s: <edge>,<listed>,<full width>,<full height>[,<widest>]; keeping the rest", hv);
++            memcpy(dm_fps_state + 0xa0, anc, sizeof anc);
++            LOG("%s: screen shape: HUD moves out by %.0f (edge %.0f, listed widgets %.0f), panes %.0fx%.0f or larger stretched %.3f", g_fps_mod, anc[0], anc[2], anc[3], anc[4], anc[5], anc[1]);
++            LOG("%s: screen shape %.3f: output %ux1080, layout %ux720 (DM_SCREEN_ASPECT; only builds with screen-shape stubs follow it)", g_fps_mod, a, ow, lw);
++        }
++        // else a is 16:9 (1.77 to 1.78): the game's own shape, nothing to write
+     }
+     char cap[32]; snprintf(cap, sizeof cap, ", capped at %d fps", t);
+     LOG("%s: frame step %s%s (%s)", g_fps_mod, !t ? "as the game sets it" : "in whole vsyncs decided by the host", t ? cap : "", e ? "DM_FPS_TARGET" : "game profile fps_target");
+@@ -357,7 +389,14 @@ static void install_key_page(module_t *m) {
+     for (unsigned i = 0; i < KEY_N; i++) page[m->key_idx[i]] = (uint64_t)key_value(i) * 8;
+     for (int k = 0; k < KEY_N; k++) if (!page[m->key_idx[k]]) die("%s: key page entry %d is 0 (host key not created) -- the game would read TSD slot 0", m->name, k);
+     if (mprotect(m->base + m->key_page_off, m->key_page_size, PROT_READ)) die("%s key page mprotect", m->name);
+-    if (m->fps_state_off) install_fps_state(m);
++    if (m->fps_state_off) {
++        install_fps_state(m);
++        // Ultrawide (UW): the main module only (the frame step state page belongs to it). Register its main-code base (framework image base +
++        // __dmmainx0's 0x300000 offset) and parse DM_UW_* env. uw_init is idempotent; a non-zero return means UW is not active and the game
++        // runs as before. The env (Documents/env.txt, dm/env.txt) is already set: the iOS app reads it before host loading starts.
++        uw_mod_register("main", (uintptr_t)m->base + 0x300000, 0, 0, 0);
++        uw_init();
++    }
+ }
+ 
+ static void register_gates(module_t *m, const char *dir) {
+diff --git a/dm/host/uw.c b/dm/host/uw.c
+new file mode 100644
+index 0000000..e9370ca
+--- /dev/null
++++ b/dm/host/uw.c
+@@ -0,0 +1,418 @@
++// uw.c — Ultrawide (UW) for NX2Apple. See uw-implementation.md for the
++// disassembly evidence (DmIOS file offsets) behind every constant and branch.
++#include "uw.h"
++#include "dm.h"
++#include <math.h>
++#include <stdatomic.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <unistd.h>
++#include <libkern/OSCacheControl.h>
++
++#define UW_LOG(...) LOG("[uw] " __VA_ARGS__)
++
++// --- constants (DmIOS file offsets in comments) ---
++#define UW_ASPECT_16_9   1.7777777777777777   // double @0xb6c70
++#define UW_ASPECT_MIN     0.5
++#define UW_ASPECT_MAX     8.0
++#define UW_ENABLE_MIN     1.7866666666666664 // double @0xb9d50 (update threshold)
++#define UW_TOL            1e-4f              // float @0xb8714
++#define UW_CHECK_169      0.001f             // float @0xb9e64 (trampoline tolerance)
++#define UW_NEG_169        (-1.77777779f)     // float @0xb9e60
++#define UW_RESTORE_169    0x3fe38e39u        // float bits of 1.7777778f
++#define UW_VTSLOT_MAX     63
++
++// --- config page (DmIOS 0x1014c7000+0x170; baked-in defaults from the file) ---
++static struct {
++    const char *mod;            // +0x170, default "main"
++    uint32_t patch0, patch1;    // +0x178/+0x17c
++    int32_t vtslot;             // +0x180, -1 = unset
++    uint32_t cam[5];            // +0x184..+0x194
++    float last_aspect;          // +0x198
++} g_cfg = {
++    .mod = "main",
++    .patch0 = 0x010edb04, .patch1 = 0xbd410101,
++    .vtslot = -1,
++    .cam = { 0x01e39d10, 0x01d05380, 0x38, 0xb0, 8 },
++    .last_aspect = -1.0f,
++};
++
++// --- state page (DmIOS 0x102291000) ---
++static struct {
++    uint8_t nopatch;            // +0x200
++    uintptr_t aspect_addr;      // +0x208 (0 = third path inert)
++    uintptr_t aspect_page;      // +0x210
++    uint64_t aspect_len;        // +0x218
++    uintptr_t mod_base;         // +0x220
++    uint64_t scan_hi;           // +0x228
++    uint64_t scan_lo;           // +0x230
++    int32_t negative;           // +0x238
++    float aspect;               // +0x23c (widened aspect)
++    int32_t enabled;            // +0x240
++    uint8_t inited;             // +0x244
++    uint8_t hooked;             // +0x248
++    _Atomic uint32_t active;    // +0x24c
++    uint8_t scan;               // +0x250
++    uint32_t proj;              // +0x254
++    uint32_t call_n;            // +0x258
++    uint32_t bad_n;             // +0x25c
++    uint8_t written;            // +0x260
++    uint8_t force;              // +0x264
++    uint32_t write_n;           // +0x268
++    void *orig_fn;              // +0x270
++    uint32_t tramp_n;           // +0x278
++} g_st;
++
++// --- MOD table (DmIOS 0x10236a900 header + 0x10236a970 entries, stride 0xf8) ---
++#define UW_MOD_MAX 8
++typedef struct {
++    const char *name;           // +0x00
++    uintptr_t base;             // +0x10
++    uint64_t size;              // +0x18
++    uint64_t f28;               // +0x28 (opaque; feeds scan_lo)
++    uint64_t aspect_off;        // +0x38
++    uint64_t aspect_size;       // +0x40
++    uint64_t f48, f50, f60;     // +0x48/+0x50/+0x60 (opaque; feed scan_hi)
++} uw_mod_t;
++static uw_mod_t g_mods[UW_MOD_MAX];
++static int g_mods_n;
++static int g_log_level;         // DM_UW_LOG, parsed once
++static uint8_t g_squeeze = 1;   // +0x538: 1 = off (default), 0 = on
++static int g_ui_mode = 6;       // +0x53c
++static int g_safe;              // DM_UW_SAFE flag (0x1014c3000+0x28c)
++static bool g_hook_ok;
++
++// --- helpers ---
++static void uw_flush(void *addr, size_t len) {
++    // DmIOS dispatches through a host callback table (0x5b46c); the engine
++    // equivalent is sys_icache_invalidate (hle_cheats.c:608, probe.c:173).
++    sys_icache_invalidate(addr, len);
++}
++
++static int uw_parse_one(char **cursor, uint32_t *out) {
++    // DmIOS 0x83c2c: skip ','/' '/tab, then strtoul(..., 16). 1 = parsed.
++    char *s = *cursor;
++    for (;;) {
++        unsigned char c = (unsigned char)*s;
++        if (c == ',' || c == ' ' || c == '\t') { s++; continue; }
++        break;
++    }
++    if (!*s) return 0;
++    char *end = NULL;
++    unsigned long v = strtoul(s, &end, 16);
++    if (end == s) return 0;
++    *out = (uint32_t)v;
++    *cursor = end;
++    return 1;
++}
++
++static int uw_env_flag(const char *name) {
++    // "non-empty and first char != '0'" — the pattern every DM_UW_* flag uses.
++    const char *e = getenv(name);
++    return e && *e && *e != '0';
++}
++
++static const uw_mod_t *uw_mod_find(const char *name) {
++    for (int i = 0; i < g_mods_n; i++)
++        if (name && g_mods[i].name && !strcmp(g_mods[i].name, name)) return &g_mods[i];
++    return NULL;
++}
++
++void uw_mod_register(const char *name, uintptr_t main_base, uint64_t size,
++                     uint64_t aspect_off, uint64_t aspect_size) {
++    if (g_mods_n >= UW_MOD_MAX) { UW_LOG("[RED] MOD table full, %s not registered", name); return; }
++    uw_mod_t *m = &g_mods[g_mods_n++];
++    memset(m, 0, sizeof *m);
++    m->name = name; m->base = main_base; m->size = size;
++    m->aspect_off = aspect_off; m->aspect_size = aspect_size;
++}
++
++// --- aspect-apply: third write path (DmIOS 0x834e4) ---
++static void uw_apply_aspect(float aspect) {
++    if (!g_st.aspect_addr) return;
++    if (g_st.aspect_page &&
++        mprotect((void *)g_st.aspect_page, (size_t)g_st.aspect_len, PROT_READ | PROT_WRITE) == 0) {
++        uw_flush((void *)g_st.aspect_addr, 4);
++        *(float *)g_st.aspect_addr = aspect;
++        if (mprotect((void *)g_st.aspect_page, (size_t)g_st.aspect_len, PROT_READ) != 0)
++            UW_LOG("[RED] aspect-apply: mprotect restore failed");
++    } else {
++        uint32_t bits; memcpy(&bits, &aspect, sizeof bits);   // float bits, no type punning (strict aliasing)
++        UW_LOG("[RED] aspect-apply: mprotect failed, aspect %#x not written", bits);
++    }
++}
++
++// --- trampoline: vtable slot hook (DmIOS 0x83cc4) ---
++// Generic 16-argument signature so every argument register is forwarded
++// (x0-x7, d0-d7 per AAPCS64). The hooked slot is the projection object's
++// calcMatrix-style vtable entry; it takes no float argument in d0-d2 (the
++// original asm clobbers them as scratch), so forwarding is safe.
++typedef void (*uw_calc_fn)(void *, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
++                           double, double, double, double, double, double, double, double);
++static void uw_trampoline(void *x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4,
++                          uint64_t x5, uint64_t x6, uint64_t x7,
++                          double d0, double d1, double d2, double d3,
++                          double d4, double d5, double d6, double d7) {
++    float *field = (float *)((char *)x0 + g_cfg.cam[3]);   // CAM[3] = 176
++    float cur = *field;
++    uw_calc_fn orig = (uw_calc_fn)g_st.orig_fn;
++    // The original asm passes d0 = widened aspect whenever UW is enabled and
++    // the widened value is non-zero (s0 side effect); otherwise d0 passes through.
++    double d0o = d0;
++    if (g_st.enabled && g_st.aspect != 0.0f) d0o = (double)g_st.aspect;
++    if (g_st.enabled && g_st.aspect != 0.0f &&
++        (g_st.force || fabsf(cur + UW_NEG_169) <= UW_CHECK_169)) {
++        *field = g_st.aspect;                              // temporary swap
++        orig(x0, x1, x2, x3, x4, x5, x6, x7, d0o, d1, d2, d3, d4, d5, d6, d7);
++        *field = cur;                                      // restore
++    } else {
++        orig(x0, x1, x2, x3, x4, x5, x6, x7, d0o, d1, d2, d3, d4, d5, d6, d7);
++    }
++    if (g_st.tramp_n++ == 0)
++        UW_LOG("calcMatrix this=%p aspect %g -> %g", x0, (double)cur, (double)g_st.aspect);
++}
++
++// --- vtable hook install (DmIOS 0x832a4) ---
++static int uw_install_hook(void) {
++    if (g_cfg.vtslot < 0) return -1;
++    if (!g_st.mod_base || !g_cfg.cam[1]) return -1;
++    uintptr_t vt = g_st.mod_base + g_cfg.cam[1];
++    void **slot = (void **)(vt + (uintptr_t)g_cfg.vtslot * 8);
++    void *orig = *slot;
++    if ((uintptr_t)orig <= 0xfff) { UW_LOG("[RED] hook: slot %d empty (%p)", g_cfg.vtslot, orig); return -1; }
++    if (orig == (void *)uw_trampoline) { g_st.hooked = 1; return 0; }  // idempotent
++    g_st.orig_fn = orig;
++    long ps = sysconf(_SC_PAGESIZE);
++    if (ps <= 0) ps = 0x4000;
++    uintptr_t page = (uintptr_t)slot & ~((uintptr_t)ps - 1);
++    // The original queries the current protection through a Mach wrapper and
++    // restores it afterwards; the engine uses plain mprotect (probe.c:418).
++    // The vtable page is RX; restore to PROT_READ|PROT_EXEC.
++    if (mprotect((void *)page, (size_t)ps, PROT_READ | PROT_WRITE) != 0) {
++        UW_LOG("[RED] hook: mprotect RW failed (%p), vtable hook unavailable", (void *)page);
++        return -1;
++    }
++    *slot = (void *)uw_trampoline;
++    sys_icache_invalidate(slot, sizeof *slot);
++    if (mprotect((void *)page, (size_t)ps, PROT_READ | PROT_EXEC) != 0)
++        UW_LOG("[RED] hook: mprotect restore failed");
++    g_st.hooked = 1;
++    UW_LOG("hooked vtable slot %d (%s+%#x), orig %p", g_cfg.vtslot, g_cfg.mod, g_cfg.cam[1], orig);
++    return 0;
++}
++
++// --- direct-write (DmIOS 0x83714 wrapper + 0x83880) ---
++static void uw_direct_write(void) {
++    if (!g_st.inited) return;
++    if (g_st.hooked) {   // hook active: trampoline owns the aspect
++        atomic_store_explicit(&g_st.active,
++            (uint32_t)(g_st.enabled && g_st.aspect != 0.0f), memory_order_release);
++        return;
++    }
++    if (g_st.scan) {      // DM_UW_SCAN: one-shot diagnostic scan (log only)
++        g_st.scan = 0;
++        uintptr_t lo = g_st.scan_lo, hi = g_st.scan_hi;
++        uintptr_t want = g_st.mod_base + g_cfg.cam[1];
++        for (uintptr_t p = lo; p + 8 <= hi; p += 8) {
++            if (*(uintptr_t *)p == want) {
++                float a = *(float *)((char *)p + g_cfg.cam[3]);
++                UW_LOG("scan: slot %p aspect %g (vtable %#x)", (void *)p, (double)a, g_cfg.cam[1]);
++            }
++        }
++    }
++    uintptr_t obj;
++    if (g_st.proj) {
++        obj = g_st.mod_base + g_st.proj;
++    } else {
++        obj = *(uintptr_t *)(g_st.mod_base + g_cfg.cam[0]);   // [base + CAM[0]]
++    }
++    g_st.call_n++;
++    if (!obj) {
++        g_st.bad_n++;
++        atomic_store_explicit(&g_st.active, 0, memory_order_release);
++        return;
++    }
++    obj += g_cfg.cam[2];                                       // +56
++    uintptr_t vtab = *(uintptr_t *)obj;
++    if (g_st.call_n <= 3)
++        UW_LOG("direct: obj %p vtab %#llx aspect %g (want %#llx)",
++               (void *)obj, (unsigned long long)vtab,
++               (double)*(float *)((char *)obj + g_cfg.cam[3]),
++               (unsigned long long)(g_st.mod_base + g_cfg.cam[1]));
++    if (vtab != g_st.mod_base + g_cfg.cam[1]) {                // not the target object
++        g_st.bad_n++;
++        if (g_st.bad_n == 1)
++            UW_LOG("[RED] direct: object %p vtab %#llx != %#llx, skipping",
++                   (void *)obj, (unsigned long long)vtab,
++                   (unsigned long long)(g_st.mod_base + g_cfg.cam[1]));
++        atomic_store_explicit(&g_st.active, 0, memory_order_release);
++        return;
++    }
++    float *field = (float *)((char *)obj + g_cfg.cam[3]);
++    if (!g_st.enabled || g_st.aspect == 0.0f) {               // restore path
++        atomic_store_explicit(&g_st.active, 0, memory_order_release);
++        if (g_st.written) {
++            uw_flush(field, 4);
++            *(uint32_t *)field = UW_RESTORE_169;               // 1.7777778f
++            *(uint8_t *)((char *)obj + g_cfg.cam[4]) = 1;
++            g_st.written = 0;
++            UW_LOG("direct: restored aspect to 16:9");
++        }
++        return;
++    }
++    float cur = *field;
++    if (fabsf(cur - g_st.aspect) <= UW_TOL) {                  // already wide
++        atomic_store_explicit(&g_st.active, 1, memory_order_release);
++        return;
++    }
++    if (!g_st.force && fabsf(cur + UW_NEG_169) > UW_TOL) {     // not 16:9
++        if (cur != g_cfg.last_aspect) {
++            g_cfg.last_aspect = cur;
++            UW_LOG("direct: aspect %g is not 16:9, skipping", (double)cur);
++        }
++        return;
++    }
++    uw_flush(field, 4);
++    *field = g_st.aspect;
++    *(uint8_t *)((char *)obj + g_cfg.cam[4]) = 1;
++    g_st.written = 1;
++    atomic_store_explicit(&g_st.active, 1, memory_order_release);
++    if (g_st.write_n++ == 0)
++        UW_LOG("direct: aspect %g -> %g (obj %p)", (double)cur, (double)g_st.aspect, (void *)obj);
++}
++
++// --- update from canvas size (DmIOS 0x835d0) ---
++static void uw_update_from_size(double w, double h) {
++    if (h <= 0.0) return;
++    if (!g_st.inited) return;
++    double aspect = w / h;
++    int enabled = (aspect > UW_ENABLE_MIN && aspect <= UW_ASPECT_MAX) ? 1 : 0;
++    if (enabled != g_st.enabled ||
++        (enabled && fabsf((float)aspect - g_st.aspect) > UW_TOL)) {
++        float old = g_st.aspect;
++        g_st.enabled = enabled;
++        if (enabled) g_st.aspect = (float)aspect;
++        uw_apply_aspect(g_st.aspect);
++        UW_LOG("canvas %.0fx%.0f aspect %.4f -> %s (was %.4f)",
++               w, h, aspect, enabled ? "on" : "off", (double)old);
++    }
++}
++
++void uw_frame_hook(double w, double h) {
++    uw_update_from_size(w, h);
++    uw_direct_write();
++}
++
++float uw_effective_aspect(float in) {
++    if (!g_st.inited) return in;
++    if (atomic_load_explicit(&g_st.active, memory_order_acquire)) return g_st.aspect;
++    return in;
++}
++
++bool uw_hook_ok(void) { return g_hook_ok; }
++bool uw_squeeze_enabled(void) { return g_squeeze == 0; }
++int uw_ui_mode(void) { return g_ui_mode; }
++
++// --- env parsing + init (DmIOS 0x82b2c) ---
++int uw_init(void) {
++    const char *e;
++    // DM_UW_CAM: up to 5 hex values, comma/space/tab separated.
++    if ((e = getenv("DM_UW_CAM")) && *e) {
++        char *cur = (char *)e;
++        int n = 0;
++        while (n < 5 && uw_parse_one(&cur, &g_cfg.cam[n])) n++;
++        if (n < 2) UW_LOG("[RED] DM_UW_CAM needs at least 2 values, got %d", n);
++    }
++    if ((e = getenv("DM_UW_MOD")) && *e) g_cfg.mod = e;
++    if (uw_env_flag("DM_UW_NOPATCH")) g_st.nopatch = 1;
++    if ((e = getenv("DM_UW_PROJ")) && *e) {
++        char *cur = (char *)e;
++        uw_parse_one(&cur, &g_st.proj);
++    }
++    if (uw_env_flag("DM_UW_SCAN")) g_st.scan = 1;
++    if (uw_env_flag("DM_UW_FORCE")) g_st.force = 1;
++    if ((e = getenv("DM_UW_VTSLOT")) && *e) {
++        char *end = NULL;
++        long v = strtol(e, &end, 0);
++        if (end != e && v <= UW_VTSLOT_MAX) g_cfg.vtslot = (int32_t)v;
++    }
++    if ((e = getenv("DM_UW_PATCH")) && *e) {
++        char *cur = (char *)e;
++        int n = 0;
++        while (n < 2 && uw_parse_one(&cur, &g_cfg.patch0 + n)) n++;
++        g_st.nopatch = 0;   // PATCH clears NOPATCH (DmIOS 0x82e18)
++    }
++    // DM_UW_LOG (parsed once per frame in the original, 0x4cf88; here at init —
++    // the level only gates diagnostics and the engine LOG macro has no levels).
++    if ((e = getenv("DM_UW_LOG")) && *e) g_log_level = atoi(e);
++    // DM_UW_SAFE (parsed in a matrix helper in the original, 0x8aec; default off).
++    if (uw_env_flag("DM_UW_SAFE")) g_safe = 1;
++    // MOD lookup.
++    const uw_mod_t *mod = uw_mod_find(g_cfg.mod);
++    if (!mod) { UW_LOG("[RED] UW: no MOD entry for '%s'", g_cfg.mod); return 10; }
++    g_st.mod_base = mod->base;
++    if (g_st.nopatch) {
++        if (mod->aspect_size < 0x104) {
++            UW_LOG("[RED] UW: MOD entry too small (%llu), aspect-apply disabled",
++                   (unsigned long long)mod->aspect_size);
++        } else {
++            g_st.aspect_addr = mod->base + mod->aspect_off + 0x100;
++            g_st.aspect_page = g_st.aspect_addr & ~0x3fffUL;
++            g_st.aspect_len = mod->aspect_size;
++        }
++    } else {
++        // NOPATCH=0: validate [base + PATCH[0]] == PATCH[1].
++        if (*(uint32_t *)(mod->base + g_cfg.patch0) != g_cfg.patch1)
++            UW_LOG("[RED] UW: PATCH check failed at %#x", g_cfg.patch0);
++    }
++    g_st.scan_lo = mod->f28;
++    g_st.scan_hi = mod->f48 >= 1 ? mod->f60 : mod->f50;
++    // DM_ASPECT.
++    double d8 = -1.0;
++    if ((e = getenv("DM_ASPECT")) && *e) {
++        if (!strcmp(e, "0")) {
++            d8 = 0.0;
++        } else if (!strcmp(e, "off") || !strcmp(e, "auto")) {
++            d8 = -1.0;   // off: stays -1; auto: resolved per-frame from the canvas
++        } else if (!strcmp(e, "16:9")) {
++            d8 = UW_ASPECT_16_9;
++        } else {
++            // sscanf with a trailing %c: "16:9" -> 2, "16:9x" -> 3 (invalid).
++            double w = 0, h = 0, single = 0;
++            char tail = 0;
++            int n1 = sscanf(e, "%lf:%lf%c", &w, &h, &tail);
++            int n2 = (n1 != 2) ? sscanf(e, "%lfx%lf%c", &w, &h, &tail) : 0;
++            if (n1 == 2 || n2 == 2) {
++                d8 = w / h;
++            } else if (sscanf(e, "%lf%c", &single, &tail) == 1) {
++                d8 = single;
++            }
++            if (d8 < UW_ASPECT_MIN || d8 > UW_ASPECT_MAX) {
++                UW_LOG("[RED] DM_ASPECT %s: <w>:<h> or a value %.1f-%.1f", e, UW_ASPECT_MIN, UW_ASPECT_MAX);
++                d8 = -1.0;
++            }
++        }
++    }
++    g_st.negative = (d8 < 0) ? 1 : 0;
++    g_st.aspect = (float)d8;
++    g_st.enabled = (d8 > 0) ? 1 : 0;
++    g_st.inited = 1;
++    uw_apply_aspect(g_st.aspect > 0 ? g_st.aspect : 0.0f);
++    UW_LOG("aspect %.4f %s (MOD %s, NOPATCH %d)", d8,
++           g_st.negative ? "auto" : (d8 > 0 ? "explicit" : "off"),
++           g_cfg.mod, g_st.nopatch);
++    if (g_st.enabled)
++        UW_LOG("widening %.1f%% (%.4f / 16:9)", (d8 / UW_ASPECT_16_9 - 1.0) * 100.0, d8);
++    // vtable hook.
++    if (uw_install_hook() == 0) {
++        g_hook_ok = true;
++    } else {
++        UW_LOG("[RED] UW: vtable hook not installed, direct-write only");
++        g_hook_ok = false;
++    }
++    // CAM check (log only, not a gate — DmIOS 0x8344c).
++    if (g_cfg.cam[0] != 0x01e39d10 || g_cfg.cam[1] != 0x01d05380)
++        UW_LOG("CAM %#x,%#x (not the baked-in %#x,%#x)", g_cfg.cam[0], g_cfg.cam[1], 0x01e39d10, 0x01d05380);
++    return 0;
++}
+diff --git a/dm/host/uw.h b/dm/host/uw.h
+new file mode 100644
+index 0000000..077f055
+--- /dev/null
++++ b/dm/host/uw.h
+@@ -0,0 +1,53 @@
++// uw.h — Ultrawide (UW): camera-aspect widening for 19.5:9 iPhones.
++// The game keeps rendering 1600x900; the camera aspect is temporarily widened
++// to the screen aspect (2.167) while the projection matrix is built, and the
++// present layer stretches the 1600x900 output to fill the screen. The widen
++// factor (1.219) cancels the stretch factor (1.219), so the picture is wider
++// with correct proportions. Rewritten from the 3.0 IPA's DmIOS binary
++// (see uw-implementation.md); no S2Arm source was available.
++#ifndef DM_HOST_UW_H
++#define DM_HOST_UW_H
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Register a game module for the MOD table. Call at module load, before uw_init.
++//   name: module name for DM_UW_MOD matching ("main" for Odyssey).
++//   main_base: the module's main-code base (framework image base + 0x300000).
++//   size: module size (address-range lookup; 0 = unknown, lookup by name only).
++//   aspect_off/aspect_size: offset/size of the game's display-aspect float used
++//     by the third write path; pass 0/0 when unknown (that path stays inert).
++void uw_mod_register(const char *name, uintptr_t main_base, uint64_t size,
++                     uint64_t aspect_off, uint64_t aspect_size);
++
++// Parse DM_UW_* env, resolve the MOD entry, compute the widened aspect and
++// install the vtable hook. Call once at game start (loader.c, next to
++// install_fps_state). Returns 0 on success, non-zero when UW is not active
++// (no MOD entry, DM_ASPECT off/16:9, or the hook could not install —
++// direct-write still runs in that case, see uw_hook_ok).
++int uw_init(void);
++
++// Per-frame hook: call every present with the canvas (drawable) size in pixels.
++// Updates the widened aspect from the size and runs the direct-write pass.
++void uw_frame_hook(double w, double h);
++
++// Effective aspect for UI/layout code: the widened aspect when UW is active,
++// otherwise the input unchanged.
++float uw_effective_aspect(float in);
++
++// Whether the vtable hook installed (false -> direct-write only).
++bool uw_hook_ok(void);
++
++// DM_UW_SQUEEZE=1 (UI squeeze). Default off.
++bool uw_squeeze_enabled(void);
++
++// DM_UW_UI mode (default 6).
++int uw_ui_mode(void);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/dm/ios/Sources/front_ios.m b/dm/ios/Sources/front_ios.m
+index 3400f69..4225b98 100644
+--- a/dm/ios/Sources/front_ios.m
++++ b/dm/ios/Sources/front_ios.m
+@@ -165,13 +165,13 @@ static void launcher_done(void) { [g_root startGame]; }
+     front_hud_env();   // before the process's first Metal device, which reads MTL_HUD_ENABLED (an env file's DM_METAL_HUD sets it in main.m already; GitHub issue #840)
+     const char *dev = front_ios_device_check();   // that first device: a GPU without BC textures is refused here, not at launch, so the launcher's HUD switch counts
+     if (dev) { [self showHint:[NSString stringWithFormat:@"This device is not supported.\n%s", dev]]; return; }   // the host does not start
+-    {   // Picture shape "auto" (the launcher's Match screen): the app window's own shape when it is taller than 16:9 (an iPad's 4:3, an unfolded iPhone Duo's 1.43:1; loader.c
+-        // takes 1.3 to 1.77), else 16:9. The window's, not the screen's: on an iPad under Stage Manager or Split View the app does not fill the screen. Resolved here, before the
++    {   // Picture shape "auto" (the launcher's Match screen): the app window's own shape when it is taller than 16:9 (an iPad's 4:3, an unfolded iPhone Duo's 1.43:1) or wider (an iPhone's 19.5:9; loader.c
++        // takes 1.3 to 1.77, 1.78 to 2.2 for the wider shape), else 16:9. The window's, not the screen's: on an iPad under Stage Manager or Split View the app does not fill the screen. Resolved here, before the
+         // host writes the state page (main.c dm_fps_state_apply)
+         const char *a = getenv("DM_SCREEN_ASPECT");
+         if (a && !strcmp(a, "auto")) {
+             CGSize sz = self.view.window ? self.view.window.bounds.size : UIScreen.mainScreen.bounds.size; double r = MAX(sz.width, sz.height) / MAX(MIN(sz.width, sz.height), 1);
+-            char v[16]; if (r >= 1.3 && r < 1.77) snprintf(v, sizeof v, "%.3f", r); else strcpy(v, "0");
++            char v[16]; if ((r >= 1.3 && r < 1.77) || (r > 1.78 && r <= 2.2)) snprintf(v, sizeof v, "%.3f", r); else strcpy(v, "0");
+             setenv("DM_SCREEN_ASPECT", v, 1); LOG("front end: picture shape auto: window %.0fx%.0f points (%.3f:1) → DM_SCREEN_ASPECT=%s", sz.width, sz.height, r, v);
+         }
+     }
+-- 
+2.43.0
+
