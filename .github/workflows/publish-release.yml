@@ -1,0 +1,60 @@
+# 手动把某次构建的 IPA 发到 GitHub Releases（下载快），并删掉之前所有 release，只留最新一个。
+# 放到 Wilderness01/NX2Apple 的 .github/workflows/publish-release.yml
+# 手动触发：输入构建 run ID 和 tag；不需要 prod.keys，artifact 已经在仓库里。
+# 做法：用 GITHUB_TOKEN 从指定 run 下载 artifact（GitHub 内部网络，快），
+# 先删掉所有已有 release（连 tag 一起清），再创建新 release 并上传 IPA。
+name: Publish release (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "构建 run ID（Artifacts 所在的 run，例如 42588685896）"
+        required: true
+        default: "42588685896"
+      tag:
+        description: "Release tag（如 v1.3.1）"
+        required: true
+        default: "v1.3.1"
+      asset_name:
+        description: "Artifact 名（也是 release 标题；IPA 文件名是它加 .ipa）"
+        required: true
+        default: "SuperMarioOdyssey-V1.3.1"
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # gh 命令要靠 .git 判断是哪个仓库，没有 checkout 会报 "not a git repository"
+      - name: Check out repo (so gh knows the repository)
+        uses: actions/checkout@v4
+
+      - name: Download IPA artifact from the build run
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.asset_name }}
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: out
+
+      - name: Delete previous releases and publish new release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ls -lh out/
+          test -f "out/${{ inputs.asset_name }}.ipa"
+          # 删掉之前所有 release（只留最新这一个），连 tag 一起清掉
+          for tag in $(gh release list --limit 100 --json tagName -q '.[].tagName'); do
+            echo "Deleting previous release: $tag"
+            gh release delete "$tag" --yes --cleanup-tag
+          done
+          # 创建新 release 并上传 IPA
+          gh release create "${{ inputs.tag }}" "out/${{ inputs.asset_name }}.ipa" \
+            --title "${{ inputs.asset_name }}" \
+            --notes "Super Mario Odyssey shell app for iPhone (UW widescreen fix, full shader prebuild). Cover-install over the same bundle ID; romfs and saves are preserved."
