@@ -1,0 +1,161 @@
+From bdc41ee69079154df673a1eaaa5dbf4ad4e41997 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Mon, 9 Nov 2026 23:39:18 +0800
+Subject: [PATCH] Ultrawide: persist the main camera aspect field so the shadow
+ map covers the wide view
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Direct-write skipped the main camera in every session: it validated the
+object by reading [obj] as a vtable pointer and requiring a hooked
+calcMatrix slot in it, but sead projection objects do not store their
+vtable at [obj] (the main camera's [obj] is a heap address). Only the
+rarely-called 4:3 object passed, so the main camera's aspect FIELD stayed
+1.77778 while its matrix was widened to 2.16912 — and the shadow system
+derives its ortho range from the field, so the shadow map only covered
+16:9 and the fullscreen edges flickered (shadow-flicker-investigation.md).
+Trust last_proj instead (the trampoline only sets it for a projection it
+saw at ~16:9 through the hooked calcMatrix), validate the aspect field
+itself (sane finite float in [0.5, 8.0]), write, and read back to verify;
+rewrite every frame (idempotent) if the game resets it. The trampoline
+now counts already-widened calls as 'wide' so a falling 16:9 count is not
+misread as a regression.
+
+Upstream-Status: fork-only
+Reason: The 0102 direct-write never widened the main camera's aspect field: its vtable check read [obj] as a vtable pointer, but the main camera's [obj] is a heap address, so it skipped the main camera in every session (log-10/11) and only widened a rarely-called 4:3 projection. The shadow system derives its ortho range from the aspect field, so the shadow map only covered 16:9 and the fullscreen edges flickered. This patch trusts last_proj (trampoline-validated), validates the aspect field itself, writes and verifies the widened value persistently, and counts already-widened calls separately. No game patches are needed; the same DM_UW_* env as 0098 is required.
+Issue: Wilderness01/NX2Apple#1
+---
+ dm/host/uw.c | 69 ++++++++++++++++++++++++++++++++--------------------
+ 1 file changed, 43 insertions(+), 26 deletions(-)
+
+diff --git a/dm/host/uw.c b/dm/host/uw.c
+index d255b2f..8e02b68 100644
+--- a/dm/host/uw.c
++++ b/dm/host/uw.c
+@@ -85,6 +85,9 @@ static struct {
+     uint32_t n_169;             // calcMatrix calls with aspect ~16:9 (0102 A1)
+     uint32_t n_43;              // calcMatrix calls with aspect ~4:3 (0102 A1)
+     uint32_t n_other;           // calcMatrix calls with any other aspect (0102 A1)
++    uint32_t n_wide;            // calcMatrix calls whose aspect is already the widened target (0103: direct-write made the field
++                                // persistent, so the main camera now reads 2.16912 instead of 16:9; counted separately from "other"
++                                // so a falling n_169 is not misread as a regression)
+     uint32_t frame_n;           // presents seen (0102 A1: summary every 600)
+     uintptr_t last_proj;        // most recent trampoline-seen projection object with aspect ~16:9 (0102 A3)
+     double sa_aspect;           // DM_SCREEN_ASPECT target (0102 B1): -1 = auto/unset, 0 = explicit 16:9 (off), >0 = explicit target
+@@ -109,23 +112,16 @@ static int g_ui_mode = 6;       // +0x53c
+ static int g_safe;              // DM_UW_SAFE flag (0x1014c3000+0x28c)
+ static bool g_hook_ok;
+ 
+-// --- hooked calcMatrix slots (0102 A2/A3) ---
+-// Every vtable slot the hook replaced (the primary's, then the scan's). Direct-write (A3) checks a projection object's vtable against
+-// this set: one of its first 64 slots must be a hooked calcMatrix slot, so a stale or wrong object is never written to.
++// --- hooked calcMatrix slots (0102 A2) ---
++// Every vtable slot the hook replaced (the primary's, then the scan's). Kept for diagnostics (the direct-write log reports how many
++// slots are hooked). 0103: direct-write no longer validates an object through this set — the main camera's [obj] is a heap address,
++// not a module vtable, so that check always failed for the object that matters (shadow-flicker-investigation.md §2.3).
+ static uintptr_t g_hooked_slots[UW_VT_MAX];
+ static int g_hooked_slots_n;
+ static void uw_record_hook_slot(uintptr_t slot) {
+     for (int i = 0; i < g_hooked_slots_n; i++) if (g_hooked_slots[i] == slot) return;
+     if (g_hooked_slots_n < UW_VT_MAX) g_hooked_slots[g_hooked_slots_n++] = slot;
+ }
+-static int uw_vt_has_hooked_slot(uintptr_t vt) {
+-    if (!vt || (vt & 7)) return 0;
+-    for (int i = 0; i < g_hooked_slots_n; i++) {
+-        uintptr_t q = g_hooked_slots[i];
+-        if (q >= vt && q < vt + 64 * 8 && (q - vt) % 8 == 0) return 1;
+-    }
+-    return 0;
+-}
+ 
+ // --- helpers ---
+ static void uw_flush(void *addr, size_t len) {
+@@ -210,7 +206,13 @@ static void uw_trampoline(void *x0, uint64_t x1, uint64_t x2, uint64_t x3, uint6
+     // could not tell whether the main camera ever entered the hook. The first call of each class is logged once; the totals are
+     // summarised every 600 presents in uw_frame_hook. (The counters are written on the render thread and read on the present thread:
+     // 32-bit aligned accesses are single-copy on ARM64, and a stale count only shifts the summary by one window.)
+-    if (fabsf(cur + UW_NEG_169) <= UW_CHECK_169) {
++    // 0103: "wide" is checked first — once direct-write has made the main camera's aspect field persistent (2.16912), the trampoline
++    // reads the target instead of 16:9. That is the fix working, not a regression, so it gets its own bucket instead of "other".
++    if (g_st.enabled && g_st.aspect != 0.0f && fabsf(cur - g_st.aspect) <= UW_TOL) {
++        g_st.n_wide++;
++        if (g_st.n_wide == 1)
++            UW_LOG("calcMatrix first wide this=%p aspect %g (already widened)", x0, (double)cur);
++    } else if (fabsf(cur + UW_NEG_169) <= UW_CHECK_169) {
+         g_st.n_169++;
+         g_st.last_proj = (uintptr_t)x0;   // 64-bit aligned store, single-copy on ARM64; a stale value means direct-write uses the
+                                           // previous frame's object, which is the same camera
+@@ -419,23 +421,30 @@ static void uw_direct_write(void) {
+         return;
+     }
+     g_st.call_n++;
+-    // The object must be a projection object on a hooked vtable: its vtable must hold one of the hooked calcMatrix slots. A stale object
+-    // (freed and reused) fails this and is skipped, plainly logged once — the old [RED] (vtab != CAM[1]) fired because the "object" was
+-    // the vtable itself, which cannot happen through last_proj.
+-    uintptr_t vtab = *(uintptr_t *)obj;
+-    if (!uw_vt_has_hooked_slot(vtab)) {
++    // 0103: no vtable check. The object comes from last_proj, which the trampoline sets only when it sees a projection with aspect
++    // ~16:9 through the hooked calcMatrix — that is already proof it is a perspective projection on a hooked vtable. The old check
++    // (uw_vt_has_hooked_slot, reading [obj] as a vtable pointer) always failed for the main camera: sead projection objects do not
++    // store their vtable at [obj] (log-10/11: the main camera's [obj] is a heap address, 0x70e07ffd80 / 0x70e64b1fb0), so
++    // direct-write skipped the main camera in every session and only ever widened the rarely-called 4:3 object. The shadow system
++    // reads the aspect FIELD to derive its ortho range, so the field must be persistently widened — that is the fix for the
++    // fullscreen shadow flicker (shadow-flicker-investigation.md §2, §4.2). Validation is now on the aspect field itself: it must
++    // read a sane finite float in [0.5, 8.0]; garbage (e.g. the 5.6e-45 denormal seen in log-10/11) is rejected as a stale object.
++    if (!obj || (obj & 7)) {
+         g_st.bad_n++;
+-        if (g_st.bad_n == 1)
+-            UW_LOG("direct: object %p vtab %#llx has no hooked calcMatrix slot, skipping (stale object?)",
+-                   (void *)obj, (unsigned long long)vtab);
+         return;
+     }
+     float *field = (float *)((char *)obj + g_cfg.cam[3]);
++    float probe = *field;
++    if (!isfinite(probe) || probe < UW_ASPECT_MIN || probe > UW_ASPECT_MAX) {
++        g_st.bad_n++;
++        if (g_st.bad_n == 1)
++            UW_LOG("direct: object %p aspect field %g is not a sane aspect, skipping (stale object?)",
++                   (void *)obj, (double)probe);
++        return;
++    }
+     if (g_st.call_n <= 3)
+-        UW_LOG("direct: obj %p vtab %#llx aspect %g (hooked slots %d)",
+-               (void *)obj, (unsigned long long)vtab,
+-               (double)*(float *)((char *)obj + g_cfg.cam[3]),
+-               g_hooked_slots_n);
++        UW_LOG("direct: obj %p aspect %g (hooked slots %d)",
++               (void *)obj, (double)probe, g_hooked_slots_n);
+     if (!g_st.enabled || g_st.aspect == 0.0f) {               // restore path
+         if (g_st.written) {
+             uw_flush(field, 4);
+@@ -461,6 +470,12 @@ static void uw_direct_write(void) {
+     uw_flush(field, 4);
+     *field = g_st.aspect;
+     *(uint8_t *)((char *)obj + g_cfg.cam[4]) = 1;
++    // 0103: verify the write stuck. If the game resets the field (it owns the object and may set it back to 16:9), the next frame
++    // writes it again (idempotent, once per frame). Without the read-back, a silently lost write would look like success.
++    if (fabsf(*field - g_st.aspect) > UW_TOL) {
++        UW_LOG("direct: write to obj %p did not stick (read back %g), will retry", (void *)obj, (double)*field);
++        return;
++    }
+     g_st.written = 1;
+     atomic_store_explicit(&g_st.active, 1, memory_order_release);
+     if (g_st.write_n++ == 0)
+@@ -542,9 +557,11 @@ void uw_frame_hook(double w, double h) {
+     }
+     // A1 (0102): every 600 presents (~10 s at 60 fps), summarise the calcMatrix calls by aspect, so the log shows whether the main camera
+     // (16:9) ever enters the hook. Logged even when all counts are zero: silence would be ambiguous with a dead hook.
++    // 0103: "wide" is the main camera after direct-write made its aspect field persistent — a falling 16:9 count with a rising wide
++    // count means the fix is working, not that the hook died.
+     if (g_st.inited && ++g_st.frame_n % 600 == 0)
+-        UW_LOG("calcMatrix calls after %u presents: 16:9=%u 4:3=%u other=%u",
+-               g_st.frame_n, g_st.n_169, g_st.n_43, g_st.n_other);
++        UW_LOG("calcMatrix calls after %u presents: 16:9=%u 4:3=%u other=%u wide=%u",
++               g_st.frame_n, g_st.n_169, g_st.n_43, g_st.n_other, g_st.n_wide);
+     uw_update_from_size(w, h);
+     uw_direct_write();
+ }
+-- 
+2.43.0
+
