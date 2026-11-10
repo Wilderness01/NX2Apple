@@ -1,0 +1,158 @@
+From 1c4ede0c444814adcb7a4342e590d6d853bc386d Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Tue, 10 Nov 2026 11:19:00 +0800
+Subject: [PATCH] UW: NOP PerspectiveProjection::set aspect store so the field
+ stays widened (0106)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+log-13 (V1.3.4) showed the shadows stopped flickering but the 16:9
+count still rose ~1/present (9519 at 6600 presents). The game calls
+PerspectiveProjection::set every frame, which stores the aspect at
+[this+0xb0] and resets the field to 1.77778 after the trampoline
+widened it — the field oscillates at the frame boundary even though
+the matrix (and the shadows) are correct. NOP the single aspect store
+in set() (mod+0x968348, bytes verified first so another build skips
+the patch); the trampoline owns the aspect from then on (widen when UW
+is on, restore when off). Also record a 16:9 histogram so the log can
+tell whether any remaining 16:9 calls are one object being reset by
+another path or many fresh objects (main camera re-created per frame,
+expected and harmless).
+---
+ dm/host/uw.c | 77 +++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 76 insertions(+), 1 deletion(-)
+
+diff --git a/dm/host/uw.c b/dm/host/uw.c
+index c4fd97d..706d763 100644
+--- a/dm/host/uw.c
++++ b/dm/host/uw.c
+@@ -28,6 +28,17 @@
+ #define UW_CALC_MATRIX_OFF 0x9683c0          // NSO offset of sead::PerspectiveProjection::calcMatrix (DmIOS fileoff 0xa5c3c0; it reads
+                                              // [x0+0xb0] (aspect) and multiplies it into the matrix, uw-main-camera-investigation.md §1.2).
+                                              // Odyssey 1.4.1 only: the same offset the vtable hook's orig resolves to on device (log-7).
++#define UW_SET_ASPECT_STR_OFF 0x968348       // (0106) NSO offset of the aspect store in sead::PerspectiveProjection::set
++                                             // (DmIOS fileoff 0xa5c348: `str s8, [x19, #0xb0]`, bytes 68 b2 00 bd). set() takes the
++                                             // aspect in s3 and stores it at [this+0xb0]; the game calls it every frame, which resets
++                                             // the field to 1.77778 after the trampoline widened it — that is why the 16:9 count kept
++                                             // rising ~1/present in log-13 even though the shadows stopped flickering (0104 fixed the
++                                             // shadow camera, but the field still oscillates at the frame boundary). NOPing this one
++                                             // store stops set() from resetting the field; the trampoline (widen when on, restore when
++                                             // off) owns the aspect from then on. Odyssey 1.4.1 only: the bytes are verified before
++                                             // patching, so a different build simply skips the patch (no-op, [RED] logged).
++#define UW_SET_ASPECT_STR 0xbd00b268u        // (0106) encoding of `str s8, [x19, #0xb0]` (verified before patching).
++#define UW_NOP_INSN       0xd503201fu        // (0106) AArch64 `nop` (hint #0).
+ #define UW_ASPECT_LO      1.3                // loader.c / front_ios.m accept 1.3-2.2 for DM_SCREEN_ASPECT
+ #define UW_ASPECT_HI      2.2
+ #define UW_TALL_MAX       1.77               // below this: taller than 16:9 (loader.c dm_fps_state_apply)
+@@ -102,6 +113,13 @@ static struct {
+     uintptr_t wide_addrs[8];    // (0104 B1) distinct addresses of "wide" calcMatrix calls, with per-address counts, so the
+     uint32_t wide_counts[8];    // log can tell whether wide comes from many long-lived objects (H1) or one object read in the
+     int wide_addrs_n;           // trampoline's swap window (H2). Recorded in the trampoline, reported in uw_frame_hook.
++    uintptr_t n169_addrs[8];    // (0106) distinct addresses of 16:9 calcMatrix calls, with per-address counts. If the 16:9
++    uint32_t n169_counts[8];    // count keeps rising after the set() NOP, this tells whether it is ONE object being reset every
++    int n169_addrs_n;           // frame (one address, high count = set() was not the resetter) or MANY fresh objects (many
++                                // addresses = the main camera is re-created per frame and each new instance starts at 16:9,
++                                // which is expected and harmless — the trampoline widens each one). Reported in uw_frame_hook.
++    uint8_t set_nop_done;       // (0106) the set() aspect-store NOP was attempted (once, at first present).
++    uint8_t set_nop_ok;         // (0106) the NOP landed (bytes verified and patched).
+ } g_st;
+ 
+ // --- MOD table (DmIOS 0x10236a900 header + 0x10236a970 entries, stride 0xf8) ---
+@@ -214,6 +232,53 @@ static void uw_record_wide(uintptr_t addr) {
+         g_st.wide_counts[i] = 1;
+     }
+ }
++// (0106) Same histogram for 16:9 calls, so the log can tell whether a rising 16:9 count is one object
++// being reset every frame or many fresh objects.
++static void uw_record_169(uintptr_t addr) {
++    for (int i = 0; i < g_st.n169_addrs_n; i++) {
++        if (g_st.n169_addrs[i] == addr) { g_st.n169_counts[i]++; return; }
++    }
++    if (g_st.n169_addrs_n < 8) {
++        int i = g_st.n169_addrs_n++;
++        g_st.n169_addrs[i] = addr;
++        g_st.n169_counts[i] = 1;
++    }
++}
++// (0106) NOP the aspect store in PerspectiveProjection::set so the game stops resetting the field to
++// 1.77778 every frame. The store is at mod_base + UW_SET_ASPECT_STR_OFF; the bytes are verified first
++// (a different game build simply skips the patch). The page is the game's RX text: mprotect RW, write the
++// NOP, flush the icache, restore to RX (the vtable-hook code in uw_install_hook does the same dance for
++// data pages; text needs PROT_EXEC on restore, unlike the vtable). Runs once, at first present, only when
++// UW is enabled — when UW is off the trampoline's restore path owns the field and set() is left alone.
++static void uw_nop_set_aspect(void) {
++    if (g_st.set_nop_done) return;
++    g_st.set_nop_done = 1;
++    if (!g_st.enabled || g_st.aspect == 0.0f) return;   // UW off: leave set() alone
++    if (!g_st.mod_base || !g_st.mod_size) return;
++    uintptr_t addr = g_st.mod_base + UW_SET_ASPECT_STR_OFF;
++    if (addr < g_st.mod_base || addr + 4 > g_st.mod_base + g_st.mod_size) return;
++    if (*(uint32_t *)addr != UW_SET_ASPECT_STR) {
++        UW_LOG("[RED] set-nop: bytes at %#x are %#x, not the aspect store — patch skipped (other build?)",
++               (unsigned)UW_SET_ASPECT_STR_OFF, *(uint32_t *)addr);
++        return;
++    }
++    long ps = sysconf(_SC_PAGESIZE);
++    if (ps <= 0) ps = 0x4000;
++    uintptr_t page = addr & ~(uintptr_t)(ps - 1);
++    if (mprotect((void *)page, (size_t)ps, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
++        UW_LOG("[RED] set-nop: mprotect RWX failed (%p)", (void *)page);
++        return;
++    }
++    *(uint32_t *)addr = UW_NOP_INSN;
++    sys_icache_invalidate((void *)addr, 4);
++    if (mprotect((void *)page, (size_t)ps, PROT_READ | PROT_EXEC) != 0)
++        UW_LOG("[RED] set-nop: mprotect restore failed (%p)", (void *)page);
++    else {
++        g_st.set_nop_ok = 1;
++        UW_LOG("set-nop: aspect store in PerspectiveProjection::set NOPed (mod+%#x); set() can no longer reset the field to 16:9",
++               (unsigned)UW_SET_ASPECT_STR_OFF);
++    }
++}
+ static void uw_trampoline(void *x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4,
+                           uint64_t x5, uint64_t x6, uint64_t x7,
+                           double d0, double d1, double d2, double d3,
+@@ -241,6 +306,7 @@ static void uw_trampoline(void *x0, uint64_t x1, uint64_t x2, uint64_t x3, uint6
+             UW_LOG("calcMatrix first wide this=%p aspect %g (already widened)", x0, (double)cur);
+     } else if (fabsf(cur + UW_NEG_169) <= UW_CHECK_169) {
+         g_st.n_169++;
++        uw_record_169((uintptr_t)x0);   // (0106) which objects keep arriving at 16:9
+         g_st.last_proj = (uintptr_t)x0;   // 64-bit aligned store, single-copy on ARM64; a stale value means direct-write uses the
+                                           // previous frame's object, which is the same camera
+         if (g_st.main_cam == 0) g_st.main_cam = (uintptr_t)x0;   // B2: first 16:9 object (the main camera)
+@@ -626,6 +692,7 @@ void uw_frame_hook(double w, double h) {
+             UW_LOG("[RED] UW: vtable hook not installed, direct-write only");
+             g_hook_ok = false;
+         }
++        uw_nop_set_aspect();   // (0106) stop set() resetting the aspect field to 16:9 every frame
+     }
+     // A1 (0102): every 600 presents (~10 s at 60 fps), summarise the calcMatrix calls by aspect, so the log shows whether the main camera
+     // (16:9) ever enters the hook. Logged even when all counts are zero: silence would be ambiguous with a dead hook.
+@@ -634,7 +701,11 @@ void uw_frame_hook(double w, double h) {
+     // field persistent, and the correct signal is a FALLING 16:9 count (the main camera moving into "wide"); a rising wide
+     // count alone does not prove it (log-12: wide rose to 14803 while 16:9 also rose to 12705 — the main camera was never
+     // persistently widened). B1 logs which addresses the wide calls come from; B2 samples the first 16:9 object's field at
+-    // present time (garbage there = that short-lived object is already freed).
++    // present time (garbage there = that short-lived object is already freed). 0106: log-13 still showed 16:9 rising ~1/present
++    // (9519 at 6600 presents) although the shadows stopped flickering — the game calls PerspectiveProjection::set every frame,
++    // which resets the field to 1.77778 after the trampoline widened it. 0106 NOPs set()'s aspect store, so the field stays
++    // widened; the 16:9 histogram shows whether the remaining 16:9 calls are one object (reset by another path) or many fresh
++    // objects (the main camera re-created per frame, expected and harmless).
+     if (g_st.inited && ++g_st.frame_n % 600 == 0) {
+         UW_LOG("calcMatrix calls after %u presents: 16:9=%u 4:3=%u other=%u wide=%u",
+                g_st.frame_n, g_st.n_169, g_st.n_43, g_st.n_other, g_st.n_wide);
+@@ -642,6 +713,10 @@ void uw_frame_hook(double w, double h) {
+             for (int i = 0; i < g_st.wide_addrs_n; i++)
+                 UW_LOG("wide histogram: obj %p x%u", (void *)g_st.wide_addrs[i], g_st.wide_counts[i]);
+         }
++        if (g_st.n169_addrs_n > 0) {
++            for (int i = 0; i < g_st.n169_addrs_n; i++)
++                UW_LOG("16:9 histogram: obj %p x%u", (void *)g_st.n169_addrs[i], g_st.n169_counts[i]);
++        }
+         if (g_st.main_cam != 0) {
+             float probe = *(float *)((char *)g_st.main_cam + g_cfg.cam[3]);
+             UW_LOG("main-cam field sample: obj %p aspect %g (garbage = object already freed)",
+-- 
+2.43.0
+
