@@ -1,0 +1,88 @@
+From 7597528239a96be862dad78c0206caa4809550ab Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Tue, 10 Nov 2026 06:09:15 +0000
+Subject: [PATCH] UW: disable the set() aspect-store NOP (0108) and bundle the
+ pad icons
+
+The NOP cannot work on iOS: PerspectiveProjection::set lives in signed
+RX text, so mprotect cannot restore the page to RX after the write (the
+restore fails and the page stays RWX); executing the patched code then gets
+the process killed by code-signing enforcement, which is exactly how V1.3.5
+crashed on the first frame (log-14). Without the NOP the 16:9 count keeps
+rising, as in V1.3.4, which plays fine.
+
+The pad icons were also missing from the bundle: the shell build only builds
+the DmShellGame framework target, whose sources never listed Sources/PadIcons,
+and [UIImage imageNamed:] only searches the main bundle. Add PadIcons as
+framework resources and load the icons from this class's bundle, which is
+the app bundle in the one-game app and the framework bundle in the shell.
+---
+ dm/host/uw.c                 |  7 +++++++
+ dm/ios/Sources/DmGamepad.m   | 11 +++++++++--
+ dm/ios/project-framework.yml |  2 ++
+ 3 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/dm/host/uw.c b/dm/host/uw.c
+index 706d763..a7b4910 100644
+--- a/dm/host/uw.c
++++ b/dm/host/uw.c
+@@ -253,6 +253,13 @@ static void uw_record_169(uintptr_t addr) {
+ static void uw_nop_set_aspect(void) {
+     if (g_st.set_nop_done) return;
+     g_st.set_nop_done = 1;
++    // (0108) Disabled: iOS code signing forbids patching the game's __TEXT at runtime. The aspect
++    // store lives in signed RX text, so mprotect cannot restore the page to RX after the write (the
++    // restore fails — log-14: "[RED] set-nop: mprotect restore failed" — and the page stays RWX);
++    // executing the patched code then gets the process killed, which is exactly how V1.3.5 crashed
++    // on the first frame. Without the NOP the 16:9 count keeps rising, as in V1.3.4, which plays
++    // fine: the trampoline still owns the widened matrix and the shadows stay fixed.
++    return;
+     if (!g_st.enabled || g_st.aspect == 0.0f) return;   // UW off: leave set() alone
+     if (!g_st.mod_base || !g_st.mod_size) return;
+     uintptr_t addr = g_st.mod_base + UW_SET_ASPECT_STR_OFF;
+diff --git a/dm/ios/Sources/DmGamepad.m b/dm/ios/Sources/DmGamepad.m
+index 8f298c8..38a3f7c 100644
+--- a/dm/ios/Sources/DmGamepad.m
++++ b/dm/ios/Sources/DmGamepad.m
+@@ -183,8 +183,15 @@ static void pads_start(void);   // Physical controllers, below
+ // ZL / L / ZR / R are round buttons here (not the teardrops of the fixed set), and the
+ // D-pad is a single connected cross (pad_dpad) instead of four separate arms: the four
+ // arm key layers below still exist (k_padImage is indexed by B_*) but are never shown.
++// (0108) The icons are resources of this class's bundle: the shell build embeds Sources/PadIcons
++// in the game's framework bundle, never in the app. [UIImage imageNamed:] only searches the main
++// bundle, so load from the framework bundle instead: in the one-game app that is the app bundle
++// itself, in the shell it is the game's framework bundle.
++static UIImage *padUIImage(NSString *name) {
++    return [UIImage imageNamed:name inBundle:[NSBundle bundleForClass:[DmGamepad class]] compatibleWithTraitCollection:nil];
++}
+ static CGImageRef padImage(NSString *name) {
+-    UIImage *im = [UIImage imageNamed:name];
++    UIImage *im = padUIImage(name);
+     if (!im) { LOG("front end: pad icon %s missing from the bundle", name.UTF8String); return NULL; }
+     return im.CGImage;
+ }
+@@ -232,7 +239,7 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
+         for (int b = 0; b < B_N; b++) _key[b] = padLayer(_controls, padImage(k_padImage[b]));
+         _menu = [DmMenuButton buttonWithType:UIButtonTypeCustom];
+         _menu.backgroundColor = UIColor.clearColor;
+-        [_menu setBackgroundImage:[UIImage imageNamed:@"pad_menu"] forState:UIControlStateNormal];   // the gunmetal circle + silver gear, scaled to the button
++        [_menu setBackgroundImage:padUIImage(@"pad_menu") forState:UIControlStateNormal];   // the gunmetal circle + silver gear, scaled to the button
+         _menu.accessibilityLabel = @"Menu";
+         _menu.menu = CFBridgingRelease(dm_game_menu()); _menu.showsMenuAsPrimaryAction = YES;
+         __weak DmGamepad *weakSelf = self;
+diff --git a/dm/ios/project-framework.yml b/dm/ios/project-framework.yml
+index 89a2df5..b7bd19e 100644
+--- a/dm/ios/project-framework.yml
++++ b/dm/ios/project-framework.yml
+@@ -161,6 +161,8 @@ targets:
+         buildPhase: resources
+       - path: Gen/framework/game.manifest.json
+         buildPhase: resources
++      - path: Sources/PadIcons
++        buildPhase: resources
+     info:
+       path: Gen/framework/ShellGame-Info.plist
+       properties:
+-- 
+2.43.0
+
