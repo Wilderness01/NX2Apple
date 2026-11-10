@@ -1,0 +1,203 @@
+From b43050d54feaa7ff939b5ad5f59413c469c35e9d Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Tue, 10 Nov 2026 09:32:31 +0800
+Subject: [PATCH] Ultrawide: persist the camera aspect field from the
+ trampoline so the shadow map stops flickering
+
+Direct-write cannot reach the main camera: it is a short-lived object
+(a stack temporary, a new address every run), and by the time the
+present thread reads [obj+176] a frame later the memory already holds
+a pointer's low half (log-12: -3.09e+22 = 0xe4d17f68). Move the
+persistent write into the trampoline, which holds the object while it
+is alive: write the field to the target and do not restore it, so the
+aspect field stops oscillating between 16:9 and the target and the
+shadow ortho box derived from it stops flickering. Direct-write stays
+as a backup for long-lived objects. Adds a synchronous restore path
+for UW-off, a wide-call address histogram (B1) and a present-time
+main-camera field sample (B2).
+
+Upstream-Status: fork-only
+Reason: iOS-only ultrawide support for Odyssey; the shadow flicker is specific to this game's shadow system reading the aspect field.
+Issue: Wilderness01/NX2Apple#1
+---
+ dm/host/uw.c | 114 ++++++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 100 insertions(+), 14 deletions(-)
+
+diff --git a/dm/host/uw.c b/dm/host/uw.c
+index 8e02b68..c4fd97d 100644
+--- a/dm/host/uw.c
++++ b/dm/host/uw.c
+@@ -87,10 +87,21 @@ static struct {
+     uint32_t n_other;           // calcMatrix calls with any other aspect (0102 A1)
+     uint32_t n_wide;            // calcMatrix calls whose aspect is already the widened target (0103: direct-write made the field
+                                 // persistent, so the main camera now reads 2.16912 instead of 16:9; counted separately from "other"
+-                                // so a falling n_169 is not misread as a regression)
++                                // so a falling n_169 is not misread as a regression). 0104: the trampoline now makes it persistent
++                                // synchronously (direct-write cannot reach the short-lived main camera); n_wide rising with n_169
++                                // falling is the fix working.
+     uint32_t frame_n;           // presents seen (0102 A1: summary every 600)
+     uintptr_t last_proj;        // most recent trampoline-seen projection object with aspect ~16:9 (0102 A3)
+     double sa_aspect;           // DM_SCREEN_ASPECT target (0102 B1): -1 = auto/unset, 0 = explicit 16:9 (off), >0 = explicit target
++    float prev_aspect;          // (0104) the widened target the trampoline last wrote persistently. The restore path (UW off)
++                                // compares the field against this, because g_st.aspect is 0 when UW is off. Also lets the
++                                // trampoline re-widen an object still holding an older target when the target changes.
++    uintptr_t main_cam;         // (0104 B2) address of the first 16:9 projection the trampoline saw (the main camera). Sampled
++                                // at present time in uw_frame_hook to show whether that object is still alive and what its
++                                // aspect field reads (garbage = short-lived, already freed; 2.16912 = persistently widened).
++    uintptr_t wide_addrs[8];    // (0104 B1) distinct addresses of "wide" calcMatrix calls, with per-address counts, so the
++    uint32_t wide_counts[8];    // log can tell whether wide comes from many long-lived objects (H1) or one object read in the
++    int wide_addrs_n;           // trampoline's swap window (H2). Recorded in the trampoline, reported in uw_frame_hook.
+ } g_st;
+ 
+ // --- MOD table (DmIOS 0x10236a900 header + 0x10236a970 entries, stride 0xf8) ---
+@@ -190,6 +201,19 @@ static void uw_apply_aspect(float aspect) {
+ // original asm clobbers them as scratch), so forwarding is safe.
+ typedef void (*uw_calc_fn)(void *, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                            double, double, double, double, double, double, double, double);
++// (0104 B1) Record a "wide" call's object address in the histogram, so the 600-present summary can show
++// which objects read the widened target (many long-lived objects = H1, one object read in the swap
++// window = H2). First 8 distinct addresses only; the rest are dropped.
++static void uw_record_wide(uintptr_t addr) {
++    for (int i = 0; i < g_st.wide_addrs_n; i++) {
++        if (g_st.wide_addrs[i] == addr) { g_st.wide_counts[i]++; return; }
++    }
++    if (g_st.wide_addrs_n < 8) {
++        int i = g_st.wide_addrs_n++;
++        g_st.wide_addrs[i] = addr;
++        g_st.wide_counts[i] = 1;
++    }
++}
+ static void uw_trampoline(void *x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4,
+                           uint64_t x5, uint64_t x6, uint64_t x7,
+                           double d0, double d1, double d2, double d3,
+@@ -201,21 +225,25 @@ static void uw_trampoline(void *x0, uint64_t x1, uint64_t x2, uint64_t x3, uint6
+     // the widened value is non-zero (s0 side effect); otherwise d0 passes through.
+     double d0o = d0;
+     if (g_st.enabled && g_st.aspect != 0.0f) d0o = (double)g_st.aspect;
+-    // A1 (0102): count every call by the aspect it reads, and remember the most recent 16:9 projection object for direct-write (A3).
+-    // The old code only logged the first call, which happened to be a 4:3 projection — the main camera's calls were invisible, so V1.3.1
+-    // could not tell whether the main camera ever entered the hook. The first call of each class is logged once; the totals are
+-    // summarised every 600 presents in uw_frame_hook. (The counters are written on the render thread and read on the present thread:
+-    // 32-bit aligned accesses are single-copy on ARM64, and a stale count only shifts the summary by one window.)
+-    // 0103: "wide" is checked first — once direct-write has made the main camera's aspect field persistent (2.16912), the trampoline
+-    // reads the target instead of 16:9. That is the fix working, not a regression, so it gets its own bucket instead of "other".
++
++    // 1. Bucket the call by the aspect it reads (diagnostic; runs whether UW is on or off, so a 16:9
++    // session still shows the hook is alive and the main camera enters it). The first call of each class
++    // is logged once; the totals are summarised every 600 presents in uw_frame_hook. (The counters are
++    // written on the render thread and read on the present thread: 32-bit aligned accesses are single-copy
++    // on ARM64, and a stale count only shifts the summary by one window.)
++    // "Wide" is checked first and only when UW is on (there is a target): once the field is persistently
++    // widened, the trampoline reads the target instead of 16:9. That is the fix working, not a regression,
++    // so it gets its own bucket instead of "other".
+     if (g_st.enabled && g_st.aspect != 0.0f && fabsf(cur - g_st.aspect) <= UW_TOL) {
+         g_st.n_wide++;
++        uw_record_wide((uintptr_t)x0);   // B1
+         if (g_st.n_wide == 1)
+             UW_LOG("calcMatrix first wide this=%p aspect %g (already widened)", x0, (double)cur);
+     } else if (fabsf(cur + UW_NEG_169) <= UW_CHECK_169) {
+         g_st.n_169++;
+         g_st.last_proj = (uintptr_t)x0;   // 64-bit aligned store, single-copy on ARM64; a stale value means direct-write uses the
+                                           // previous frame's object, which is the same camera
++        if (g_st.main_cam == 0) g_st.main_cam = (uintptr_t)x0;   // B2: first 16:9 object (the main camera)
+         if (g_st.n_169 == 1)
+             UW_LOG("calcMatrix first 16:9 this=%p aspect %g -> %g", x0, (double)cur, (double)g_st.aspect);
+     } else if (fabsf(cur - 1.33333333f) <= UW_CHECK_169) {
+@@ -227,12 +255,52 @@ static void uw_trampoline(void *x0, uint64_t x1, uint64_t x2, uint64_t x3, uint6
+         if (g_st.n_other == 1)
+             UW_LOG("calcMatrix first other this=%p aspect %g -> %g", x0, (double)cur, (double)g_st.aspect);
+     }
+-    if (g_st.enabled && g_st.aspect != 0.0f &&
+-        (g_st.force || fabsf(cur + UW_NEG_169) <= UW_CHECK_169)) {
+-        *field = g_st.aspect;                              // temporary swap
++
++    // 2. Act on the field.
++    if (!g_st.enabled || g_st.aspect == 0.0f) {
++        // UW off: restore a field we previously widened, then call orig plain. g_st.aspect is 0 when UW
++        // is off, so compare against prev_aspect (the target the trampoline last wrote). This covers the
++        // short-lived main camera synchronously; direct-write's restore path covers long-lived objects.
++        // Each object triggers this at most once (after the restore it reads 1.77778, not prev_aspect).
++        if (g_st.prev_aspect != 0.0f && fabsf(cur - g_st.prev_aspect) <= UW_TOL) {
++            *(uint32_t *)field = UW_RESTORE_169;   // 1.7777778f
++            *(uint8_t *)((char *)x0 + g_cfg.cam[4]) = 1;   // dirty flag, matching direct-write
++            UW_LOG("trampoline: restored aspect to 16:9 (obj %p)", x0);
++        }
++        orig(x0, x1, x2, x3, x4, x5, x6, x7, d0, d1, d2, d3, d4, d5, d6, d7);
++    } else if (fabsf(cur - g_st.aspect) <= UW_TOL) {
++        // Already at the target: nothing to write.
++        orig(x0, x1, x2, x3, x4, x5, x6, x7, d0o, d1, d2, d3, d4, d5, d6, d7);
++    } else if (g_st.prev_aspect != 0.0f && g_st.prev_aspect != g_st.aspect &&
++               fabsf(cur - g_st.prev_aspect) <= UW_TOL) {
++        // Holds an older widened target (the target changed, e.g. canvas resize in auto mode): re-widen
++        // to the current target.
++        *field = g_st.aspect;
++        *(uint8_t *)((char *)x0 + g_cfg.cam[4]) = 1;
++        g_st.prev_aspect = g_st.aspect;
+         orig(x0, x1, x2, x3, x4, x5, x6, x7, d0o, d1, d2, d3, d4, d5, d6, d7);
+-        *field = cur;                                      // restore
++    } else if (fabsf(cur + UW_NEG_169) <= UW_CHECK_169) {
++        // 16:9: the main camera (and other 16:9 projections). Widen it persistently.
++        // 0104: write the field to the target and DO NOT restore it. The trampoline holds the object while
++        // it is alive (it is executing this object's method), so the write always lands — unlike direct-write,
++        // which reads it a frame later from another thread, by which time the short-lived main camera is gone
++        // (shadow-flicker-0104-investigation.md §1: the garbage -3.09e+22 was a pointer's low half, the
++        // object already freed). Leaving the field widened stops the aspect-field oscillation that made the
++        // shadow ortho box (and the shadow) flicker (§3). The dirty flag tells the game the projection
++        // changed, matching direct-write.
++        *field = g_st.aspect;
++        *(uint8_t *)((char *)x0 + g_cfg.cam[4]) = 1;
++        g_st.prev_aspect = g_st.aspect;
++        orig(x0, x1, x2, x3, x4, x5, x6, x7, d0o, d1, d2, d3, d4, d5, d6, d7);
++    } else if (g_st.force) {
++        // Force mode (DM_UW_FORCE), non-16:9 aspect: widen it, but restore it afterwards (old behaviour).
++        // Force is off in the shipped build; persistently widening a 4:3 or square projection would be
++        // wrong, so force keeps the temporary swap.
++        *field = g_st.aspect;
++        orig(x0, x1, x2, x3, x4, x5, x6, x7, d0o, d1, d2, d3, d4, d5, d6, d7);
++        *field = cur;
+     } else {
++        // 4:3 or other: no field write, only the d0 side effect.
+         orig(x0, x1, x2, x3, x4, x5, x6, x7, d0o, d1, d2, d3, d4, d5, d6, d7);
+     }
+     g_st.tramp_n++;   // the hook has run: direct-write (0101) used this as its "hook owns the aspect" signal; A3 no longer gates on it
+@@ -429,6 +497,10 @@ static void uw_direct_write(void) {
+     // reads the aspect FIELD to derive its ortho range, so the field must be persistently widened — that is the fix for the
+     // fullscreen shadow flicker (shadow-flicker-investigation.md §2, §4.2). Validation is now on the aspect field itself: it must
+     // read a sane finite float in [0.5, 8.0]; garbage (e.g. the 5.6e-45 denormal seen in log-10/11) is rejected as a stale object.
++    // 0104: direct-write is now a BACKUP. The trampoline persistently widens the field synchronously during calcMatrix (the object
++    // is alive then); direct-write cannot reach the short-lived main camera at all (log-12: it read -3.09e+22 — a pointer's low
++    // half — from [obj+176] a frame later, the object already freed; shadow-flicker-0104-investigation.md §1). Direct-write
++    // still widens long-lived 16:9 objects (HUD/secondary cameras) and still restores them when UW is off, so it stays.
+     if (!obj || (obj & 7)) {
+         g_st.bad_n++;
+         return;
+@@ -558,10 +630,24 @@ void uw_frame_hook(double w, double h) {
+     // A1 (0102): every 600 presents (~10 s at 60 fps), summarise the calcMatrix calls by aspect, so the log shows whether the main camera
+     // (16:9) ever enters the hook. Logged even when all counts are zero: silence would be ambiguous with a dead hook.
+     // 0103: "wide" is the main camera after direct-write made its aspect field persistent — a falling 16:9 count with a rising wide
+-    // count means the fix is working, not that the hook died.
+-    if (g_st.inited && ++g_st.frame_n % 600 == 0)
++    // count means the fix is working, not that the hook died. 0104 corrects this: the trampoline (not direct-write) makes the
++    // field persistent, and the correct signal is a FALLING 16:9 count (the main camera moving into "wide"); a rising wide
++    // count alone does not prove it (log-12: wide rose to 14803 while 16:9 also rose to 12705 — the main camera was never
++    // persistently widened). B1 logs which addresses the wide calls come from; B2 samples the first 16:9 object's field at
++    // present time (garbage there = that short-lived object is already freed).
++    if (g_st.inited && ++g_st.frame_n % 600 == 0) {
+         UW_LOG("calcMatrix calls after %u presents: 16:9=%u 4:3=%u other=%u wide=%u",
+                g_st.frame_n, g_st.n_169, g_st.n_43, g_st.n_other, g_st.n_wide);
++        if (g_st.wide_addrs_n > 0) {
++            for (int i = 0; i < g_st.wide_addrs_n; i++)
++                UW_LOG("wide histogram: obj %p x%u", (void *)g_st.wide_addrs[i], g_st.wide_counts[i]);
++        }
++        if (g_st.main_cam != 0) {
++            float probe = *(float *)((char *)g_st.main_cam + g_cfg.cam[3]);
++            UW_LOG("main-cam field sample: obj %p aspect %g (garbage = object already freed)",
++                   (void *)g_st.main_cam, (double)probe);
++        }
++    }
+     uw_update_from_size(w, h);
+     uw_direct_write();
+ }
+-- 
+2.43.0
+
