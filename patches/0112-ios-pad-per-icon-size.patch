@@ -1,0 +1,340 @@
+From 6cb13dd417ff9ff37cb7e5c297f8f462091a78e2 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Wed, 11 Nov 2026 09:53:15 +0000
+Subject: [PATCH] Pad: per-icon size in the button editor (0112)
+
+The button editor's size slider tunes only the selected icon now:
+tap an icon to select it (a ring around it, its name in the hint
+line), the slider resizes that icon alone (0.7-1.4, live). Each
+icon's size is stored per icon in DmPadLineLayout ("sizes"); a
+missing size falls back to the legacy global "scale", then 1, so
+a V1.3.8 layout migrates with its sizes intact. The glass disc
+follows the same per-icon geometry. The menu stays fixed and the
+floating stick is not adjustable.
+---
+ dm/ios/Sources/DmGamepad.m | 164 +++++++++++++++++++++++++++----------
+ 1 file changed, 119 insertions(+), 45 deletions(-)
+
+diff --git a/dm/ios/Sources/DmGamepad.m b/dm/ios/Sources/DmGamepad.m
+index 5b6052c..ae297c5 100644
+--- a/dm/ios/Sources/DmGamepad.m
++++ b/dm/ios/Sources/DmGamepad.m
+@@ -12,7 +12,7 @@
+ //   Touch-down ownership (dm_pad_menu_takes and dm_pad_hit in DmPadGeometry.h): the menu button where it is nearer than a locked key (a view of its own, DmMenuButton), locked keys next (shoulders, − / +, L3 / R3), the jump and photo buttons next, then whichever of the diamond and the left stick has the smallest distance / grab radius (the left half holds the floating stick),
+ //     then in 3D the right stick for a touch in the right third. X, ZR, R, L3, R3 and the D-pad are hidden and disabled: a touch on one of them falls through to the floating stick (left half) or the right stick (right third) instead.
+ //   The player can move single controls in the shell's settings (DM_TOUCH_LAYOUT, one arrangement per layout): the geometry places each only where it fits and keeps the rest where they were.
+-//   The in-game menu's "按键设置" (button settings) opens a panel above the game: a slider for the icons' size and dragging the icons to move them, saved in NSUserDefaults (DmPadLineLayout) so it survives a restart. See "The line skin" below.
++//   The in-game menu's "按键设置" (button settings) opens a panel above the game: tapping an icon selects it, a slider for the selected icon's own size and dragging the icons to move them, saved per icon in NSUserDefaults (DmPadLineLayout) so it survives a restart. See "The line skin" below.
+ //   Everything hugs the edges and corners to leave the picture room; each control is one
+ //   image layer (dm/ios/Sources/PadIcons/pad_line_*.png, the line set, bundled as resources):
+ //   the artwork never changes on press (no pressed state), only the left stick's knob moves,
+@@ -50,6 +50,7 @@ enum { B_A = 0, B_B, B_X, B_Y, B_LS, B_RS, B_L, B_R, B_ZL, B_ZR, B_PLUS, B_MINUS
+ enum { E_A = 0, E_B, E_Y, E_ZL, E_L, E_MINUS, E_PLUS, E_JUMP, E_PHOTO, E_N };   // the movable controls (the button editor); others are hidden (X, ZR, R, L3, R3, D-pad), fixed (the menu) or floating (the stick)
+ enum { G_A = 0, G_B, G_Y, G_ZL, G_L, G_PLUS, G_MINUS, G_JUMP, G_PHOTO, G_MENU, G_N };   // the controls with a glass disc behind them (0111)
+ static NSString *const k_lineEditKeys[E_N] = {@"a", @"b", @"y", @"zl", @"l", @"minus", @"plus", @"jump", @"photo"};   // the NSUserDefaults offsets' keys
++static NSString *const k_lineEditNames[E_N] = {@"A键", @"B键", @"攻击键", @"撞地键", @"视角键", @"+键", @"−键", @"跳跃键", @"拍照键"};   // the editor's name for the selected icon
+ enum { C_NONE = 0, C_STICK, C_DPAD, C_FACE, C_BTN, C_GAME };   // which control a touch holds; C_GAME: none, the touch goes to the game's touch screen (finger slot << 8)
+ 
+ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+@@ -168,7 +169,10 @@ static void pads_start(void);   // Physical controllers, below
+     UIVisualEffectView *_glassView[G_N];           // iOS 26+: the real Liquid Glass behind each icon (nil below iOS 26)
+     CAGradientLayer *_glassDisc[G_N];              // below iOS 26: a vector glass disc drawn in code (nil on iOS 26+)
+     CGPoint _lCentre;                              // the floating left stick's centre: where its touch landed
+-    CGFloat _lineScale;                            // the icons' size (the editor's size slider): 0.7 to 1.4, 1 is built-in
++    CGFloat _lineScale;                            // the legacy global size (migration default): 0.7 to 1.4, 1 is built-in; the slider no longer changes it
++    CGFloat _lineSizes[E_N];                       // each movable icon's own size, 0.7 to 1.4 (NSUserDefaults DmPadLineLayout "sizes")
++    int _editSelected;                             // the movable control the size slider tunes (E_*, A by default)
++    CAShapeLayer *_editHighlight;                  // the ring around the selected icon while the editor is open
+     NSMutableDictionary<NSString *, NSValue *> *_lineOffsets;   // the drag offsets, points from each control's built-in centre (NSUserDefaults DmPadLineLayout)
+     BOOL _editing;                                 // the button editor is open: touches drag controls instead of pressing them
+     UIView *_editBar; UISlider *_editSlider;       // the editor's bar: the size slider, hint and Done
+@@ -456,8 +460,8 @@ static int lockedKey(int c) {   // DmPadGeometry.h's control → the key it pres
+     return dm_pad_menu_takes(self.geo, _full, _layout.separated, p);
+ }
+ - (uint64_t)faceAt:(CGPoint)p {   // keys under the finger in the diamond (between two keys both count)
+-    uint64_t m = 0; CGFloat r = self.faceHitR;
+-    for (int b = B_A; b <= B_Y; b++) if (dist(p, [self facePos:b]) <= r) m |= 1ull << b;
++    uint64_t m = 0;
++    for (int b = B_A; b <= B_Y; b++) if (dist(p, [self facePos:b]) <= [self lineFaceHitR:b]) m |= 1ull << b;
+     return m;
+ }
+ - (uint64_t)dpadAt:(CGPoint)p {   // 8 directions: 45° each, diagonals press two keys; a small centre circle counts as none
+@@ -615,7 +619,7 @@ static CGRect growRect(CGRect r, CGFloat fill) {   // grow a rect about its cent
+     UIWindowScene *ws = self.window.windowScene; if (ws) atomic_store(&g_iface_orient, (int)ws.effectiveGeometry.interfaceOrientation);
+     [CATransaction begin]; [CATransaction setDisableActions:YES];
+     _controls.frame = self.layer.bounds;
+-    for (int b = B_A; b <= B_Y; b++) { CGPoint c = [self facePos:b]; _key[b].frame = growRect(squareFrame(c, 2 * self.faceR), k_padFill[b]); }   // X is hidden (applyLayout)
++    for (int b = B_A; b <= B_Y; b++) { CGPoint c = [self facePos:b]; _key[b].frame = growRect(squareFrame(c, 2 * [self lineFaceR:b]), k_padFill[b]); }   // X is hidden (applyLayout)
+     for (int i = 0; i < (int)(sizeof k_btns / sizeof *k_btns); i++) { int b = k_btns[i];
+         if (isDrop(b)) {   // ZL / L are round buttons: a square frame on the drop centre (ZR / R are hidden)
+             CGPoint c = [self dropCenter:b];
+@@ -624,12 +628,12 @@ static CGRect growRect(CGRect r, CGFloat fill) {   // grow a rect about its cent
+             CGPoint c = [self clickCenter:b]; _key[b].frame = growRect(squareFrame(c, 2 * self.geo->clickR), k_padFill[b]);   // L3 / R3 are hidden (applyLayout)
+         } else {   // + / - are circles in this set, not pills: a square frame on the pill's centre
+             CGRect pr = [self pillRect:b]; CGPoint pc = CGPointMake(CGRectGetMidX(pr), CGRectGetMidY(pr));
+-            _key[b].frame = growRect(squareFrame(pc, 2 * [self linePillR]), k_padFill[b]);
++            _key[b].frame = growRect(squareFrame(pc, 2 * [self linePillRFor:(b == B_PLUS ? E_PLUS : E_MINUS)]), k_padFill[b]);
+         }
+     }
+     // the extra buttons: jump left of the diamond, photo left of jump, at the diamond's height
+-    _jump.frame = growRect(squareFrame([self jumpCenter], 2 * [self extraR]), DM_PAD_LINE_FILL);
+-    _photo.frame = growRect(squareFrame([self photoCenter], 2 * [self extraR]), DM_PAD_LINE_FILL);
++    _jump.frame = growRect(squareFrame([self jumpCenter], 2 * [self lineExtraRFor:E_JUMP]), DM_PAD_LINE_FILL);
++    _photo.frame = growRect(squareFrame([self photoCenter], 2 * [self lineExtraRFor:E_PHOTO]), DM_PAD_LINE_FILL);
+     CGFloat mr = self.geo->swapR; CGPoint mc = self.menuCenter;
+     _menu.frame = growRect(squareFrame(mc, 2 * mr), k_padMenuFill); _menu.layer.cornerRadius = _menu.frame.size.width / 2;
+     for (int g = 0; g < G_N; g++) {   // the glass follows its button: the same centre and size, through the size slider and drags (the geometry already carries them)
+@@ -645,6 +649,7 @@ static CGRect growRect(CGRect r, CGFloat fill) {   // grow a rect about its cent
+     [CATransaction commit];
+     [self placeHint];
+     [self layoutEditBar];
++    [self layoutEditHighlight];
+     [self refresh];
+ }
+ 
+@@ -660,15 +665,15 @@ static CGRect growRect(CGRect r, CGFloat fill) {   // grow a rect about its cent
+ }
+ - (CGRect)glassFrame:(int)g {   // the button's own square (the icon frame is the same square grown by 1/fill)
+     switch (g) {
+-        case G_A: return squareFrame([self facePos:B_A], 2 * self.faceR);
+-        case G_B: return squareFrame([self facePos:B_B], 2 * self.faceR);
+-        case G_Y: return squareFrame([self facePos:B_Y], 2 * self.faceR);
++        case G_A: return squareFrame([self facePos:B_A], 2 * [self lineFaceR:B_A]);
++        case G_B: return squareFrame([self facePos:B_B], 2 * [self lineFaceR:B_B]);
++        case G_Y: return squareFrame([self facePos:B_Y], 2 * [self lineFaceR:B_Y]);
+         case G_ZL: return squareFrame([self dropCenter:B_ZL], 2 * [self dropR:B_ZL]);
+         case G_L: return squareFrame([self dropCenter:B_L], 2 * [self dropR:B_L]);
+-        case G_PLUS: { CGRect r = [self pillRect:B_PLUS]; return squareFrame(CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r)), 2 * [self linePillR]); }
+-        case G_MINUS: { CGRect r = [self pillRect:B_MINUS]; return squareFrame(CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r)), 2 * [self linePillR]); }
+-        case G_JUMP: return squareFrame([self jumpCenter], 2 * [self extraR]);
+-        case G_PHOTO: return squareFrame([self photoCenter], 2 * [self extraR]);
++        case G_PLUS: { CGRect r = [self pillRect:B_PLUS]; return squareFrame(CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r)), 2 * [self linePillRFor:E_PLUS]); }
++        case G_MINUS: { CGRect r = [self pillRect:B_MINUS]; return squareFrame(CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r)), 2 * [self linePillRFor:E_MINUS]); }
++        case G_JUMP: return squareFrame([self jumpCenter], 2 * [self lineExtraRFor:E_JUMP]);
++        case G_PHOTO: return squareFrame([self photoCenter], 2 * [self lineExtraRFor:E_PHOTO]);
+         default: return squareFrame(self.menuCenter, 2 * self.geo->swapR);
+     }
+ }
+@@ -734,20 +739,34 @@ static BOOL g_hintShown;   // once per launch
+ 
+ // ---- The line skin: extra buttons, size and drag offsets, the button editor ----
+ // The line icons' 0.95 fill (k_padFill) is measured on the shipped PNGs; the exported layout
+-// (NSUserDefaults DmPadLineLayout, @{@"scale": NSNumber, @"offsets": @{name: @[@(dx), @(dy)]}})
+-// holds the size slider's value and each dragged control's offset in points from its built-in
+-// centre, so it survives a restart and works in every orientation. X, ZR, R, L3, R3 and the
+-// D-pad are hidden and disabled (applyLayout, recompute, touchesBegan); the menu is fixed; the
+-// left stick floats, so it has no stored position. The extra buttons anchor on the diamond's
+-// centre and gap, so they follow its layout. With an offset, the dragged face key falls out of
+-// the diamond's shared test and is hit-tested on its own (faceSplit, dm_pad_hit).
++// (NSUserDefaults DmPadLineLayout, @{@"scale": NSNumber, @"sizes": @{name: NSNumber},
++// @"offsets": @{name: @[@(dx), @(dy)]}}) holds each icon's own size (the editor's slider tunes
++// the selected icon only; a missing size falls back to the legacy global "scale", then 1) and
++// each dragged control's offset in points from its built-in centre, so it survives a restart
++// and works in every orientation. X, ZR, R, L3, R3 and the D-pad are hidden and disabled
++// (applyLayout, recompute, touchesBegan); the menu is fixed; the left stick floats, so it has
++// no stored position. The extra buttons anchor on the diamond's centre and gap, so they follow
++// its layout. With an offset, the dragged face key falls out of the diamond's shared test and
++// is hit-tested on its own (faceSplit, dm_pad_hit).
+ - (CGPoint)lineOffset:(NSString *)name { NSValue *v = _lineOffsets[name]; return v ? v.CGPointValue : CGPointZero; }   // the editor's drag offset for a control, or none
++- (CGFloat)lineFaceR:(int)b {   // a diamond key's drawn radius: the built-in radius times its own size (the diamond's centres do not depend on it: faceKey comes from face and faceGap)
++    return self.faceR * _lineSizes[b == B_A ? E_A : b == B_B ? E_B : E_Y];
++}
++- (CGFloat)lineFaceHitR:(int)b {   // a diamond key's hit radius, likewise (faceAt, the editor)
++    return self.faceHitR * _lineSizes[b == B_A ? E_A : b == B_B ? E_B : E_Y];
++}
++- (CGFloat)linePillRFor:(int)e { return 20 * self.u * _lineSizes[e]; }   // + / - are circles of 20u radius (DmPadGeometry.h), times their own size
++- (CGFloat)lineExtraRFor:(int)e { return self.faceR * _lineSizes[e]; }   // jump / photo are the diamond key's size, times their own size
+ - (void)applyLineAdjustments:(DmPadGeo *)g {   // the editor's size and drag offsets, on top of the built-in geometry
++    // The diamond keys share faceR, so it stays built-in here: each key's own radius is
++    // applied where it is drawn and hit-tested (lineFaceR, lineFaceHitR), and the geometry's
++    // hit test has room for it (its face test divides by faceR * 1.6, which covers a 1.4x key).
++    // The drop keys and the pills have their own slots, so they scale there. The stick, the
++    // knob, the menu and L3 / R3 are not adjustable, so they keep the legacy global size.
+     CGFloat s = _lineScale;
+-    g->faceR *= s; g->faceHitR *= s;
+-    for (int i = 0; i < 4; i++) g->dropR[i] *= s;
++    g->dropR[DM_PAD_ZL] *= _lineSizes[E_ZL]; g->dropR[DM_PAD_L] *= _lineSizes[E_L];
+     g->clickR *= s; g->stickR *= s; g->knobR *= s; g->swapR *= s;
+-    for (int i = 0; i < 2; i++) { CGRect r = g->pill[i]; CGFloat w = r.size.width * s, h = r.size.height * s; g->pill[i] = CGRectMake(CGRectGetMidX(r) - w / 2, CGRectGetMidY(r) - h / 2, w, h); }
++    for (int i = 0; i < 2; i++) { CGFloat ps = _lineSizes[i == DM_PAD_MINUS ? E_MINUS : E_PLUS]; CGRect r = g->pill[i]; CGFloat w = r.size.width * ps, h = r.size.height * ps; g->pill[i] = CGRectMake(CGRectGetMidX(r) - w / 2, CGRectGetMidY(r) - h / 2, w, h); }
+     static const int faceMoved[] = {0, 1, 3}; static NSString *const faceNames[] = {@"a", @"b", @"y"};   // faceKey[] is A B X Y
+     BOOL split = NO;
+     for (unsigned i = 0; i < 3; i++) { CGPoint o = [self lineOffset:faceNames[i]]; g->faceKey[faceMoved[i]].x += o.x; g->faceKey[faceMoved[i]].y += o.y; if (o.x || o.y) split = YES; }
+@@ -758,25 +777,33 @@ static BOOL g_hintShown;   // once per launch
+     for (unsigned i = 0; i < 2; i++) { CGPoint o = [self lineOffset:pillNames[i]]; g->pill[pillMoved[i]].origin.x += o.x; g->pill[pillMoved[i]].origin.y += o.y; }
+ }
+ // The extra buttons: jump is left of the diamond's Y at the diamond's height, photo left of jump.
+-- (CGFloat)extraR { return self.faceR; }   // the extra buttons are the diamond's key size
+-- (CGPoint)jumpCenter { CGPoint f = self.faceCenter; CGFloat g = self.faceGap, r = self.faceR; CGPoint o = [self lineOffset:@"jump"]; return CGPointMake(f.x - g - 2 * r - 12 * self.u + o.x, f.y + o.y); }
+-- (CGPoint)photoCenter { CGPoint f = self.faceCenter; CGFloat g = self.faceGap, r = self.faceR; CGPoint o = [self lineOffset:@"photo"]; return CGPointMake(f.x - 2 * g - 4 * r - 24 * self.u + o.x, f.y + o.y); }
++// Their centres anchor on Y's own size (so they stay clear of a bigger Y and follow a smaller one);
++// their radii are their own sizes.
++- (CGPoint)jumpCenter { CGPoint f = self.faceCenter; CGFloat g = self.faceGap, r = self.faceR * _lineSizes[E_Y]; CGPoint o = [self lineOffset:@"jump"]; return CGPointMake(f.x - g - 2 * r - 12 * self.u + o.x, f.y + o.y); }
++- (CGPoint)photoCenter { CGPoint f = self.faceCenter; CGFloat g = self.faceGap, r = self.faceR * _lineSizes[E_Y]; CGPoint o = [self lineOffset:@"photo"]; return CGPointMake(f.x - 2 * g - 4 * r - 24 * self.u + o.x, f.y + o.y); }
+ - (int)extraButtonAt:(CGPoint)p {   // 1 jump, 2 photo
+-    if (dist(p, [self jumpCenter]) <= self.extraR) return 1;
+-    if (dist(p, [self photoCenter]) <= self.extraR) return 2;
++    if (dist(p, [self jumpCenter]) <= [self lineExtraRFor:E_JUMP]) return 1;
++    if (dist(p, [self photoCenter]) <= [self lineExtraRFor:E_PHOTO]) return 2;
+     return 0;
+ }
+-- (CGFloat)linePillR { return 20 * self.u * _lineScale; }   // + / - are circles of 20u radius (DmPadGeometry.h), times the editor's size
+ 
+-// The button editor's stored layout: NSUserDefaults DmPadLineLayout, {"scale": NSNumber, "offsets": {name: [dx, dy]}}.
++// The button editor's stored layout: NSUserDefaults DmPadLineLayout, {"scale": NSNumber,
++// "sizes": {name: NSNumber}, "offsets": {name: [dx, dy]}}. "scale" is the legacy global size:
++// it is kept as the default each icon's own size falls back to, and the slider no longer changes it.
+ static NSString *const k_line_layout_key = @"DmPadLineLayout";
+ - (void)loadLineLayout {
+     _lineScale = 1;
++    for (int e = 0; e < E_N; e++) _lineSizes[e] = 1;   // fresh: every icon at its built-in size
+     _lineOffsets = [NSMutableDictionary dictionary];
+     NSDictionary *d = [NSUserDefaults.standardUserDefaults dictionaryForKey:k_line_layout_key];
+     if (![d isKindOfClass:[NSDictionary class]]) return;
+     NSNumber *s = d[@"scale"];
+     if ([s isKindOfClass:[NSNumber class]]) _lineScale = fmin(fmax(s.doubleValue, 0.7), 1.4);   // the slider's range
++    NSDictionary *z = d[@"sizes"];
++    for (int e = 0; e < E_N; e++) {   // an icon's own size, else the legacy global size (migration), else built-in
++        NSNumber *v = [z isKindOfClass:[NSDictionary class]] ? z[k_lineEditKeys[e]] : nil;
++        _lineSizes[e] = [v isKindOfClass:[NSNumber class]] ? fmin(fmax(v.doubleValue, 0.7), 1.4) : _lineScale;
++    }
+     NSDictionary *o = d[@"offsets"];
+     if ([o isKindOfClass:[NSDictionary class]]) for (NSString *name in o) {
+         NSArray *v = o[name];
+@@ -787,14 +814,18 @@ static NSString *const k_line_layout_key = @"DmPadLineLayout";
+ - (void)saveLineLayout {
+     NSMutableDictionary *o = [NSMutableDictionary dictionary];
+     for (NSString *name in _lineOffsets) { CGPoint p = [_lineOffsets[name] CGPointValue]; o[name] = @[@(p.x), @(p.y)]; }
+-    NSDictionary *d = @{@"scale": @(_lineScale), @"offsets": o};
++    NSMutableDictionary *z = [NSMutableDictionary dictionary];
++    for (int e = 0; e < E_N; e++) z[k_lineEditKeys[e]] = @(_lineSizes[e]);
++    NSDictionary *d = @{@"scale": @(_lineScale), @"sizes": z, @"offsets": o};
+     [NSUserDefaults.standardUserDefaults setObject:d forKey:k_line_layout_key];
+ }
+ 
+ // The button editor: a bar at the top (title, the size slider, Done, and a hint), and dragging
+-// the icons. While it is open, touches drag controls instead of pressing them; the gear is
+-// hidden (it cannot be tapped now); the game keeps running behind it. The text is Chinese:
+-// the user asked for the settings panel in Chinese (the rest of the repository is English).
++// the icons. While it is open, touches drag controls instead of pressing them; tapping an icon
++// selects it (a ring around it, its name in the hint line) and the slider tunes that icon's
++// own size; the gear is hidden (it cannot be tapped now); the game keeps running behind it.
++// The text is Chinese: the user asked for the settings panel in Chinese (the rest of the
++// repository is English).
+ - (void)buildEditBar {
+     _editBar = [[UIView alloc] init];
+     _editBar.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
+@@ -807,7 +838,7 @@ static NSString *const k_line_layout_key = @"DmPadLineLayout";
+     size.text = @"大小"; size.textColor = UIColor.whiteColor; size.font = [UIFont systemFontOfSize:13]; size.textAlignment = NSTextAlignmentRight;
+     [_editBar addSubview:size];
+     _editSlider = [[UISlider alloc] init];
+-    _editSlider.minimumValue = 0.7; _editSlider.maximumValue = 1.4; _editSlider.value = _lineScale;
++    _editSlider.minimumValue = 0.7; _editSlider.maximumValue = 1.4; _editSlider.value = _lineSizes[E_A];   // A is selected by default (openPadSettings)
+     [_editSlider addTarget:self action:@selector(editSliderChanged:) forControlEvents:UIControlEventValueChanged];
+     [_editSlider addTarget:self action:@selector(editSliderDone:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside];
+     [_editBar addSubview:_editSlider];
+@@ -819,6 +850,12 @@ static NSString *const k_line_layout_key = @"DmPadLineLayout";
+     hint.text = @"拖动图标可以移动位置"; hint.textColor = UIColor.whiteColor; hint.font = [UIFont systemFontOfSize:12]; hint.textAlignment = NSTextAlignmentCenter;
+     [_editBar addSubview:hint];
+     [self addSubview:_editBar];
++    _editHighlight = [CAShapeLayer layer];   // the ring around the selected icon (the slider's target): on top of the icons, hidden until the editor opens
++    _editHighlight.fillColor = [UIColor colorWithWhite:1 alpha:0.08].CGColor;
++    _editHighlight.strokeColor = [UIColor colorWithWhite:1 alpha:0.85].CGColor; _editHighlight.lineWidth = 2;
++    _editHighlight.shadowColor = UIColor.blackColor.CGColor; _editHighlight.shadowOpacity = 0.2; _editHighlight.shadowRadius = 3; _editHighlight.shadowOffset = CGSizeMake(0, 1);
++    _editHighlight.hidden = YES;
++    [_controls addSublayer:_editHighlight];
+ }
+ - (void)layoutEditBar {   // the bar's top row (title, size label, slider, Done), the hint below, centred at the top
+     if (!_editBar) return;
+@@ -837,7 +874,7 @@ static NSString *const k_line_layout_key = @"DmPadLineLayout";
+     _editing = YES;
+     [self updateControlVisibility];
+     _editBar.hidden = NO;
+-    _editSlider.value = _lineScale;
++    [self selectEditControl:E_A];   // A is selected by default, so the slider always has a target
+     [self setNeedsLayout];
+ }
+ - (void)closePadSettings {   // Done: save the layout and go back to playing
+@@ -849,8 +886,8 @@ static NSString *const k_line_layout_key = @"DmPadLineLayout";
+     _editBar.hidden = YES;
+     [self setNeedsLayout];
+ }
+-- (void)editSliderChanged:(UISlider *)s {   // the size slider: resize the icons live
+-    _lineScale = s.value;
++- (void)editSliderChanged:(UISlider *)s {   // the size slider: resize the selected icon only, live
++    _lineSizes[_editSelected] = s.value;
+     _geoValid = NO;
+     [self setNeedsLayout];
+ }
+@@ -858,6 +895,42 @@ static NSString *const k_line_layout_key = @"DmPadLineLayout";
+     (void)s;
+     [self saveLineLayout];
+ }
++- (void)selectEditControl:(int)e {   // tap an icon in the editor: it becomes the one the slider tunes
++    if (e < 0 || e >= E_N) return;
++    _editSelected = e;
++    _editSlider.value = _lineSizes[e];
++    UILabel *hint = (UILabel *)[_editBar viewWithTag:304];
++    hint.text = [NSString stringWithFormat:@"当前：%@ · 拖动图标可以移动位置", k_lineEditNames[e]];
++    [self layoutEditHighlight];
++}
++- (void)layoutEditHighlight {   // the ring around the selected icon while the editor is open
++    if (!_editHighlight) return;
++    BOOL show = _editing && ![self editIconHidden:_editSelected];
++    _editHighlight.hidden = !show;
++    if (!show) return;
++    CGPoint c = [self editCentre:_editSelected];
++    CGFloat r = [self editDrawnR:_editSelected] + 4;
++    [CATransaction begin]; [CATransaction setDisableActions:YES];
++    _editHighlight.frame = squareFrame(c, 2 * r);
++    setPath(_editHighlight, circlePath(CGPointMake(r, r), r - 1));
++    [CATransaction commit];
++}
++- (BOOL)editIconHidden:(int)e {   // the icon's layer is hidden (the Tap layout hides jump and photo, and every key)
++    switch (e) {
++        case E_A: return _key[B_A].hidden; case E_B: return _key[B_B].hidden; case E_Y: return _key[B_Y].hidden;
++        case E_ZL: return _key[B_ZL].hidden; case E_L: return _key[B_L].hidden;
++        case E_MINUS: return _key[B_MINUS].hidden; case E_PLUS: return _key[B_PLUS].hidden;
++        case E_JUMP: return _jump.hidden; default: return _photo.hidden;
++    }
++}
++- (CGFloat)editDrawnR:(int)e {   // the selected icon's drawn radius (the highlight rings this, not the hit circle)
++    switch (e) {
++        case E_A: return [self lineFaceR:B_A]; case E_B: return [self lineFaceR:B_B]; case E_Y: return [self lineFaceR:B_Y];
++        case E_ZL: return [self dropR:B_ZL]; case E_L: return [self dropR:B_L];
++        case E_MINUS: case E_PLUS: return [self linePillRFor:e];
++        default: return [self lineExtraRFor:e];
++    }
++}
+ - (CGPoint)editCentre:(int)e {   // a movable control's centre where it is now (with its stored offset)
+     switch (e) {
+         case E_A: return [self facePos:B_A]; case E_B: return [self facePos:B_B]; case E_Y: return [self facePos:B_Y];
+@@ -869,19 +942,20 @@ static NSString *const k_line_layout_key = @"DmPadLineLayout";
+ }
+ - (CGFloat)editRadius:(int)e {   // a movable control's hit radius, in points
+     switch (e) {
+-        case E_A: case E_B: case E_Y: return self.faceHitR;
++        case E_A: return [self lineFaceHitR:B_A]; case E_B: return [self lineFaceHitR:B_B]; case E_Y: return [self lineFaceHitR:B_Y];
+         case E_ZL: return [self dropR:B_ZL]; case E_L: return [self dropR:B_L];
+-        case E_MINUS: case E_PLUS: return [self linePillR];
+-        default: return self.extraR;   // jump and photo
++        case E_MINUS: case E_PLUS: return [self linePillRFor:e];
++        default: return [self lineExtraRFor:e];   // jump and photo
+     }
+ }
+-- (int)lineEditControlAt:(CGPoint)p {   // the movable control under a point, or -1
+-    for (int e = 0; e < E_N; e++) if (dist(p, [self editCentre:e]) <= MAX([self editRadius:e], 24)) return e;
++- (int)lineEditControlAt:(CGPoint)p {   // the movable control under a point, or -1 (a hidden icon cannot be picked)
++    for (int e = 0; e < E_N; e++) if (![self editIconHidden:e] && dist(p, [self editCentre:e]) <= MAX([self editRadius:e], 24)) return e;
+     return -1;
+ }
+ - (void)editTouchBegan:(UITouch *)t at:(CGPoint)p {
+     int e = [self lineEditControlAt:p];
+     if (e < 0) return;
++    [self selectEditControl:e];   // a tap selects the icon (the drag below still starts, as before)
+     _editTouch = t; _editControl = e;
+     CGPoint cur = [self editCentre:e];
+     CGPoint off = [self lineOffset:k_lineEditKeys[e]];
+-- 
+2.43.0
+
