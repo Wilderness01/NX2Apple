@@ -1,0 +1,203 @@
+From 1e9db9f2f318a207aff7d802888faac4516a2b36 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Wed, 11 Nov 2026 09:50:39 +0000
+Subject: [PATCH] Pad: real Liquid Glass behind the line icons, vector disc
+ below iOS 26 (0111)
+
+---
+ dm/ios/Sources/DmGamepad.m | 116 ++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 115 insertions(+), 1 deletion(-)
+
+diff --git a/dm/ios/Sources/DmGamepad.m b/dm/ios/Sources/DmGamepad.m
+index 5c71926..5b6052c 100644
+--- a/dm/ios/Sources/DmGamepad.m
++++ b/dm/ios/Sources/DmGamepad.m
+@@ -16,7 +16,9 @@
+ //   Everything hugs the edges and corners to leave the picture room; each control is one
+ //   image layer (dm/ios/Sources/PadIcons/pad_line_*.png, the line set, bundled as resources):
+ //   the artwork never changes on press (no pressed state), only the left stick's knob moves,
+-//   nothing redraws the whole screen. Where each control sits is DmPadGeometry.h (pure, tested
++//   nothing redraws the whole screen. Each icon sits on a glass disc behind it (the system's
++//   Liquid Glass on iOS 26+, a vector disc below that), so the picture shows through it.
++//   Where each control sits is DmPadGeometry.h (pure, tested
+ //   on the Mac); the player picks the size there through DM_TOUCH_SIZE (small, medium, large;
+ //   a size that does not fit the screen moves toward medium) and the left stick's place through
+ //   DM_TOUCH_STICK (corner, higher, inward).
+@@ -46,6 +48,7 @@
+ 
+ enum { B_A = 0, B_B, B_X, B_Y, B_LS, B_RS, B_L, B_R, B_ZL, B_ZR, B_PLUS, B_MINUS, B_LEFT, B_UP, B_RIGHT, B_DOWN, B_N };
+ enum { E_A = 0, E_B, E_Y, E_ZL, E_L, E_MINUS, E_PLUS, E_JUMP, E_PHOTO, E_N };   // the movable controls (the button editor); others are hidden (X, ZR, R, L3, R3, D-pad), fixed (the menu) or floating (the stick)
++enum { G_A = 0, G_B, G_Y, G_ZL, G_L, G_PLUS, G_MINUS, G_JUMP, G_PHOTO, G_MENU, G_N };   // the controls with a glass disc behind them (0111)
+ static NSString *const k_lineEditKeys[E_N] = {@"a", @"b", @"y", @"zl", @"l", @"minus", @"plus", @"jump", @"photo"};   // the NSUserDefaults offsets' keys
+ enum { C_NONE = 0, C_STICK, C_DPAD, C_FACE, C_BTN, C_GAME };   // which control a touch holds; C_GAME: none, the touch goes to the game's touch screen (finger slot << 8)
+ 
+@@ -162,6 +165,8 @@ static void pads_start(void);   // Physical controllers, below
+     CALayer *_key[B_N];                            // one image layer per key (line icons; hidden keys carry a placeholder, never shown)
+     CAShapeLayer *_ring, *_knob;                   // the left stick: the upstream default vector ring + knob (the knob moves; the stick floats, drawn only while held)
+     CALayer *_jump, *_photo;                       // the extra buttons: jump (B) and photo (D-pad down)
++    UIVisualEffectView *_glassView[G_N];           // iOS 26+: the real Liquid Glass behind each icon (nil below iOS 26)
++    CAGradientLayer *_glassDisc[G_N];              // below iOS 26: a vector glass disc drawn in code (nil on iOS 26+)
+     CGPoint _lCentre;                              // the floating left stick's centre: where its touch landed
+     CGFloat _lineScale;                            // the icons' size (the editor's size slider): 0.7 to 1.4, 1 is built-in
+     NSMutableDictionary<NSString *, NSValue *> *_lineOffsets;   // the drag offsets, points from each control's built-in centre (NSUserDefaults DmPadLineLayout)
+@@ -236,6 +241,49 @@ static CGPathRef circlePath(CGPoint c, CGFloat r) { return CGPathCreateWithEllip
+ static void setPath(CAShapeLayer *l, CGPathRef p) { l.path = p; l.shadowPath = p; CGPathRelease(p); }
+ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }   // keys shown only in the 3D layout
+ 
++// ---- Liquid Glass behind the line icons (0111) ----
++// On iOS 26+ each icon sits on the system's own Liquid Glass (UIGlassEffect, regular):
++// the system blurs and refracts the picture behind the button in real time, so the game
++// shows through the disc. The effect views are subviews added before _controls, so the
++// controls' layer ends up on top of them and the glass stays behind the icons; the views
++// take no touches (the pad does). Below iOS 26 the same disc is drawn in vector: a
++// diagonal white gradient (0.50 top-left to 0.26 bottom-right, the "more solid" look),
++// a bright rim, a highlight arc across the top and a dark arc at the bottom; the disc is
++// the button's own circle (the icon layer's frame is the same square grown by 1/fill).
++// Hidden keys (ZR, R, X, the D-pad, L3 / R3) and the floating stick get no glass.
++// Every UIGlassEffect reference sits inside if (@available(iOS 26.0, *)): the type exists
++// only on iOS 26+, so an unguarded reference is a compile error.
++static const CGFloat k_glassGradTop = 0.50, k_glassGradBottom = 0.26;
++static const CGFloat k_glassRimAlpha = 0.90, k_glassHiAlpha = 0.75, k_glassShadeAlpha = 0.27;
++static CGPathRef glassCirclePath(CGRect r) { return CGPathCreateWithEllipseInRect(r, NULL); }
++static void setGlassPath(CAShapeLayer *l, CGPathRef p) { l.path = p; CGPathRelease(p); }
++static CGPathRef glassArcPath(CGRect r, CGFloat a0, CGFloat a1) {   // an arc of the circle, inset so the stroke sits inside the rim; angles in radians, 270 is the top
++    CGRect in = CGRectInset(r, 2, 2);
++    CGMutablePathRef p = CGPathCreateMutable();
++    CGPathAddArc(p, NULL, CGRectGetMidX(in), CGRectGetMidY(in), in.size.width / 2, a0, a1, false);
++    return p;
++}
++static CAGradientLayer *glassDiscLayer(void) {
++    CAGradientLayer *disc = [CAGradientLayer layer];
++    disc.colors = @[(id)[UIColor colorWithWhite:1 alpha:k_glassGradTop].CGColor, (id)[UIColor colorWithWhite:1 alpha:k_glassGradBottom].CGColor];
++    disc.startPoint = CGPointMake(0, 0); disc.endPoint = CGPointMake(1, 1);
++    CAShapeLayer *mask = [CAShapeLayer layer]; disc.mask = mask;   // the gradient fills the disc only
++    CAShapeLayer *rim = [CAShapeLayer layer]; rim.fillColor = nil; rim.strokeColor = [UIColor colorWithWhite:1 alpha:k_glassRimAlpha].CGColor; rim.lineWidth = 1.5;
++    CAShapeLayer *hi = [CAShapeLayer layer]; hi.fillColor = nil; hi.strokeColor = [UIColor colorWithWhite:1 alpha:k_glassHiAlpha].CGColor; hi.lineWidth = 1.5;
++    CAShapeLayer *shade = [CAShapeLayer layer]; shade.fillColor = nil; shade.strokeColor = [UIColor colorWithWhite:0 alpha:k_glassShadeAlpha].CGColor; shade.lineWidth = 1.5;
++    [disc addSublayer:rim]; [disc addSublayer:hi]; [disc addSublayer:shade];
++    disc.shadowColor = UIColor.blackColor.CGColor; disc.shadowOpacity = 0.2; disc.shadowRadius = 3; disc.shadowOffset = CGSizeMake(0, 1);
++    return disc;
++}
++static void glassDiscLayout(CAGradientLayer *disc, CGRect frame) {   // the disc's frame and every path on it, from the button's square
++    disc.frame = frame;
++    CGRect b = disc.bounds;
++    setGlassPath((CAShapeLayer *)disc.mask, glassCirclePath(b));
++    setGlassPath((CAShapeLayer *)disc.sublayers[0], glassCirclePath(b));   // rim
++    setGlassPath((CAShapeLayer *)disc.sublayers[1], glassArcPath(b, 195 * M_PI / 180, 345 * M_PI / 180));   // the top highlight
++    setGlassPath((CAShapeLayer *)disc.sublayers[2], glassArcPath(b, 15 * M_PI / 180, 165 * M_PI / 180));   // the bottom shade
++}
++
+ - (instancetype)initWithFrame:(CGRect)f {
+     if ((self = [super initWithFrame:f])) {
+         _layout = dm_layout(self.bounds, UIEdgeInsetsZero, NO, CGRectNull, DM_PICTURE_16_9);   // until the front end arranges it
+@@ -266,6 +314,19 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
+             k_idle = [UIColor colorWithWhite:1 alpha:0.14]; k_on = [UIColor colorWithWhite:1 alpha:0.45]; k_line = [UIColor colorWithWhite:1 alpha:0.38];
+             k_ringFill = [UIColor colorWithWhite:1 alpha:0.06];
+         });
++        // Liquid Glass (0111): the real glass views go in first, so the controls' layer
++        // (added next) sits on top of them and the glass stays behind the icons.
++        if (@available(iOS 26.0, *)) {
++            for (int g = 0; g < G_N; g++) {
++                UIGlassEffect *effect = [UIGlassEffect effectWithStyle:UIGlassEffectStyleRegular];
++                effect.interactive = YES;   // the glass shimmers under a touch
++                UIVisualEffectView *v = [[UIVisualEffectView alloc] initWithEffect:effect];
++                v.userInteractionEnabled = NO;   // the pad takes every touch itself
++                v.clipsToBounds = YES; v.hidden = YES;   // shown by syncGlassVisibility, once laid out
++                [self addSubview:v];
++                _glassView[g] = v;
++            }
++        }
+         _controls = [CALayer layer]; [self.layer addSublayer:_controls];
+         _ring = shape(_controls); _ring.fillColor = k_ringFill.CGColor;   // the upstream default vector stick (no image)
+         _knob = shape(_controls);
+@@ -283,6 +344,16 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
+         __weak DmGamepad *weakSelf = self;
+         [_menu addAction:[UIAction actionWithHandler:^(UIAction *a) { (void)a; [weakSelf reset]; }] forControlEvents:UIControlEventMenuActionTriggered];   // the menu opens: release every key and touch first
+         [self addSubview:_menu];
++        if (!_glassView[0]) {   // below iOS 26 (no real glass): the vector glass discs, each below its icon layer (the menu's below the menu's layer)
++            for (int g = 0; g < G_N; g++) {
++                CAGradientLayer *disc = glassDiscLayer();
++                CALayer *icon = [self glassIconLayer:g];
++                if (icon) [_controls insertSublayer:disc below:icon];
++                else [self.layer insertSublayer:disc below:_menu.layer];
++                disc.hidden = YES;   // shown by syncGlassVisibility, once laid out
++                _glassDisc[g] = disc;
++            }
++        }
+         const char *hint = getenv("DM_TOUCH_HINT");   // the shell passes the player's language; empty turns the hint off
+         _hintWords = hint ? [NSString stringWithUTF8String:hint] : @"Right stick: drag here";
+         _hint = [CALayer layer]; _hint.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5].CGColor; _hint.opacity = 0; _hint.hidden = YES;
+@@ -309,6 +380,7 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
+     _ring.hidden = _knob.hidden = YES;   // the floating stick is drawn only while a finger holds it (refresh)
+     _jump.hidden = _photo.hidden = _tap;   // the extra buttons: jump (B) and photo (D-pad down)
+     [CATransaction commit];
++    [self syncGlassVisibility];   // the glass follows its control: hidden with it in the Tap layout
+ }
+ - (int)padLayout { return _tap ? 2 : _full ? 1 : 0; }
+ - (void)setPadLayout:(int)l {   // the in-game menu's pick: release every touch first (no key stays held), save, lay out again
+@@ -560,6 +632,11 @@ static CGRect growRect(CGRect r, CGFloat fill) {   // grow a rect about its cent
+     _photo.frame = growRect(squareFrame([self photoCenter], 2 * [self extraR]), DM_PAD_LINE_FILL);
+     CGFloat mr = self.geo->swapR; CGPoint mc = self.menuCenter;
+     _menu.frame = growRect(squareFrame(mc, 2 * mr), k_padMenuFill); _menu.layer.cornerRadius = _menu.frame.size.width / 2;
++    for (int g = 0; g < G_N; g++) {   // the glass follows its button: the same centre and size, through the size slider and drags (the geometry already carries them)
++        CGRect f = [self glassFrame:g];
++        if (_glassView[g]) { _glassView[g].frame = f; _glassView[g].layer.cornerRadius = f.size.width / 2; }
++        if (_glassDisc[g]) glassDiscLayout(_glassDisc[g], f);
++    }
+     setPath(_ring, circlePath([self stickCentre:0], [self stickR:0]));   // the floating stick's ring (refresh moves it only while held)
+     CGFloat k = self.geo->knobR; _knob.bounds = CGRectMake(0, 0, 2 * k, 2 * k);
+     setPath(_knob, circlePath(CGPointMake(k, k), k));
+@@ -571,6 +648,42 @@ static CGRect growRect(CGRect r, CGFloat fill) {   // grow a rect about its cent
+     [self refresh];
+ }
+ 
++// ---- Liquid Glass (0111): the glass behind each icon ----
++- (CALayer *)glassIconLayer:(int)g {   // the icon a glass disc sits behind (nil for the menu button, a view of its own)
++    switch (g) {
++        case G_A: return _key[B_A]; case G_B: return _key[B_B]; case G_Y: return _key[B_Y];
++        case G_ZL: return _key[B_ZL]; case G_L: return _key[B_L];
++        case G_PLUS: return _key[B_PLUS]; case G_MINUS: return _key[B_MINUS];
++        case G_JUMP: return _jump; case G_PHOTO: return _photo;
++        default: return nil;
++    }
++}
++- (CGRect)glassFrame:(int)g {   // the button's own square (the icon frame is the same square grown by 1/fill)
++    switch (g) {
++        case G_A: return squareFrame([self facePos:B_A], 2 * self.faceR);
++        case G_B: return squareFrame([self facePos:B_B], 2 * self.faceR);
++        case G_Y: return squareFrame([self facePos:B_Y], 2 * self.faceR);
++        case G_ZL: return squareFrame([self dropCenter:B_ZL], 2 * [self dropR:B_ZL]);
++        case G_L: return squareFrame([self dropCenter:B_L], 2 * [self dropR:B_L]);
++        case G_PLUS: { CGRect r = [self pillRect:B_PLUS]; return squareFrame(CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r)), 2 * [self linePillR]); }
++        case G_MINUS: { CGRect r = [self pillRect:B_MINUS]; return squareFrame(CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r)), 2 * [self linePillR]); }
++        case G_JUMP: return squareFrame([self jumpCenter], 2 * [self extraR]);
++        case G_PHOTO: return squareFrame([self photoCenter], 2 * [self extraR]);
++        default: return squareFrame(self.menuCenter, 2 * self.geo->swapR);
++    }
++}
++- (BOOL)glassHidden:(int)g {   // the glass follows its control: hidden with it in the Tap layout, and with the menu while the editor is open
++    CALayer *icon = [self glassIconLayer:g];
++    return icon ? icon.hidden : _menu.hidden;
++}
++- (void)syncGlassVisibility {
++    for (int g = 0; g < G_N; g++) {
++        BOOL hide = _padOff || [self glassHidden:g];   // a controller hides the whole touch pad, glass included
++        if (_glassView[g]) _glassView[g].hidden = hide;
++        if (_glassDisc[g]) _glassDisc[g].hidden = hide;
++    }
++}
++
+ // ---- The right-stick hint ----
+ // The 3D layout's right stick is not drawn (it answers anywhere in the right third), and players read the layout as having none (GitHub issues #347, #414).
+ // So the first time the 3D layout shows in a launch, a few words say where it is, for two seconds, then fade. Words only: a ring or a knob would read as
+@@ -882,6 +995,7 @@ static BOOL pads_slotted(GCController *gone) {
+ - (void)updateControlVisibility {
+     _controls.hidden = _padOff;
+     _menu.hidden = _editing || (_padOff && _layout.onTV);   // the gear stays hidden while the button editor is open
++    [self syncGlassVisibility];   // the glass hides with the whole touch pad while a controller is in use
+ }
+ - (void)padsChanged:(NSNotification *)note {
+     GCController *c = note.object, *gone = [note.name isEqual:GCControllerDidDisconnectNotification] ? c : nil;
+-- 
+2.43.0
+
