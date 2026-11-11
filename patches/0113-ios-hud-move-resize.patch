@@ -1,0 +1,1368 @@
+From 7ce1dcdcee4dec45d3fcaddeef2f19ef81f6ff32 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Wed, 11 Nov 2026 15:23:40 +0000
+Subject: [PATCH] Odyssey HUD move / resize + full-screen UI (0113)
+
+Two cuts into Pane::Calculate (entry + 0x13c) so static panes are hooked too;
+structural counter matching (TxtTotalShine / TxtCounterSh / TxtLife under a
+small RootPane); PauseMenu and WorldMap roots classified by subtree and both
+widened to the screen shape so their backgrounds fill it (the map's picture
+behind it has to fill the screen); log grows to 160 entries of 64 bytes with
+native + scaled root pairs.
+---
+ dm/games/0100000000010000/hud_calc.c | 608 +++++++++++++++++++++++++++
+ dm/games/0100000000010000/patches.py | 188 +++++++++
+ dm/host/Makefile                     |   2 +-
+ dm/host/hud.c                        | 128 ++++++
+ dm/host/hud.h                        |  48 +++
+ dm/host/uw.c                         |   2 +
+ dm/ios/Sources/DmGameMenu.h          |   1 +
+ dm/ios/Sources/DmGamepad.m           | 163 ++++++-
+ dm/ios/Sources/GameMenu.swift        |   5 +-
+ 9 files changed, 1140 insertions(+), 5 deletions(-)
+ create mode 100644 dm/games/0100000000010000/hud_calc.c
+ create mode 100644 dm/games/0100000000010000/patches.py
+ create mode 100644 dm/host/hud.c
+ create mode 100644 dm/host/hud.h
+
+diff --git a/dm/games/0100000000010000/hud_calc.c b/dm/games/0100000000010000/hud_calc.c
+new file mode 100644
+index 0000000..9e0f1c1
+--- /dev/null
++++ b/dm/games/0100000000010000/hud_calc.c
+@@ -0,0 +1,608 @@
++// hud_calc.c -- Super Mario Odyssey HUD move / resize + full-screen UI hook (0113 v3).
++//
++// The game draws its HUD (compass, life, coins, moons) and its full-screen menus
++// (the PauseMenu settings screen, the WorldMap map screen) with Nintendo's nn::ui2d
++// Layout / Pane system: every pane's Pane::Calculate (main+0x909494, the vtable's
++// slot 19) recomputes its global matrix (pane+0x70, a 3x4 row-major matrix, the
++// translation at +0x7c / +0x8c) and then calculates its children. This function runs
++// from TWO rewriter cuts at Pane::Calculate (see patches.py): the +0x13c cut
++// (main+0x9095d0), after the pane's own global matrix is final and before its
++// children's, and the entry cut (main+0x9094b4), at the function's first
++// instruction. Both call this same function with the same arguments. It edits only
++// a pane's global matrix: a translation moves it, a scale about its centre (from
++// its size at +0x50 / +0x54 and its origin byte at +0x5b) resizes it. It never
++// writes an object field, never accumulates (the transform is always re-derived
++// from the stored original matrix), and never fights the game's own animation (when
++// the game recomputes the matrix, the stored original follows it). The layout space
++// is y-up with its origin at the parent's centre (confirmed by disassembly of the
++// local matrix helper at main+0x9096d0, which adds +parent_h/2 for a top origin and
++// -parent_h/2 for a bottom one, and by the duo_anchor anchors: a bottom widget sits
++// at a negative y, a top one at a positive y), so a positive dy moves a pane UP, and
++// a drag down the screen is a negative dy; the HUD editor (DmGamepad.m) negates the
++// drag's y for this.
++//
++// Why two cuts (v3): the +0x13c cut alone misses every pane whose Calculate takes
++// the skip path. Disassembly of Pane::Calculate (main+0x909494, DmIOS fileoff
++// 0x9fd494) shows three ways to reach the +0x13c site -- flags bit 6 set (matrix
++// already current), flags bit 5 set (the inline matrix path), or the helper path
++// (flags bit 4 or the parent's force flag) -- and one way to jump OVER it:
++// 0x9fd528 `tbz w10, #0, 0x9096c8`, when neither the parent changed (w3 bit 0 == 0)
++// nor this pane is dirty (flags bit 4 == 0), jumps to site+4 with w22 = 0, running
++// the child loop but never the hook. A layout that has gone static (the PauseMenu
++// sitting open, a HUD widget at rest) takes that path on every frame after its
++// first, so the hook never runs for it again. Worse, the first frame is a race:
++// the state page's root scale is only written by the host's first present tick, so
++// a layout that calculates its first frame before that tick sees a scale of 1, and
++// then goes static and is never hooked again. That is the P3 root cause: log-18
++// proves the hook saw the PauseMenu / WorldMap roots (they are in the log buffer)
++// yet the V1.3.9 screenshots show the pause menu still exactly 1280/1560 wide --
++// the root scale never landed on the rendered frames. The entry cut runs before
++// any of those paths (it replaces the first instruction after the prologue), so a
++// static pane is hooked on every Calculate call and a settings change or the root
++// scale lands on the next frame, not never. The +0x13c cut stays: for a dirty pane
++// the game recomputes the matrix after the entry hook (wiping its edit), and the
++// +0x13c hook re-applies it to the fresh matrix; the recompute check below makes
++// the two hooks agree instead of fighting. The early-return path (DrawInfo byte
++// 0x1d == 0, a hidden layout) also returns after the entry hook, so hidden panes
++// are hooked too, harmlessly: their matrices are overwritten when they calculate
++// for real, and the +0x13c hook re-applies then.
++//
++// Two things ride on this one hook:
++//
++//  1. The four HUD widgets (compass, life, coins, moons), matched by pane name or
++//     by structure, are moved / resized by the player's own settings (the gear
++//     menu's "HUD 设置"). V1 matched the actor class names CompassArea /
++//     CoinCounter / MoonNum, which log-18 (65 [hud] lines, 0 matches) and the
++//     binary both refute: those strings are actor / Nerve state-machine names
++//     (CoinCounterNrvEnd/Wait/Appear..., CompassArea among Area actors, MoonNum
++//     among save-data keys), not pane names -- pane names in a .bflyt are short
++//     Pic/Txt/Par/Win names, and the ones the game code itself looks up by name
++//     (TxtTotalShine, ParList00, TxtContent...) are the only pane names in the
++//     binary at all. V3 matches the counters structurally instead, from the one
++//     widget log-18 DID capture: the moon counter is its own small layout (a
++//     300x256 RootPane) whose child is a pane named 'Counter' (320x200) holding a
++//     128x128 'PicIcon' and a 'TxtTotalShine' text (log-18 lines 457-468, twice,
++//     two layout instances). The coin and life counters are the same kind of
++//     layout (their layout names CounterCoin / CounterLife sit in the string pool
++//     next to the moon's CounterShine and the pane names TxtCounterSh / TxtLife),
++//     so a pane named 'Counter' whose parent is a small RootPane and whose
++//     subtree holds 'TxtTotalShine' is the moon counter, 'TxtCounterSh' the coin
++//     counter, 'TxtLife' the life counter. The coin and life rules are inferences
++//     from that string-pool neighbourhood, not log-confirmed; the log below will
++//     confirm or refute them on the next run. The compass has no such evidence at
++//     all -- no Compass pane name exists anywhere in the binary -- so it stays
++//     unmatched; the enlarged log is the probe that will name it. The v1 actor
++//     names are kept as a fallback (a layout group named after its actor is still
++//     possible), clearly labelled, in case a pane ever does carry one.
++//  2. Full-screen layout roots (the PauseMenu settings screen, the WorldMap map
++//     screen, and any other full-screen layout) are stretched to the screen shape,
++//     because they are built on the game's 1280x720 layout while the main HUD is
++//     built on the wider layout the screen shape asks for (1560 wide at 2.167).
++//     The stretch is automatic, from DM_SCREEN_ASPECT, not a player setting. V1
++//     split roots by size (standard roots widened, oversized roots shrunk), but
++//     log-18 proves every root is 1280x720 -- no oversized root exists, the
++//     1400/800 split never fired and cannot tell the map from the pause menu.
++//     V3 tells them apart by structure instead: a root whose subtree holds a
++//     'PicMapCap' pane is the WorldMap, one holding 'ParList00' or 'WinSelect'
++//     is the PauseMenu. Both are widened to the screen shape's layout -- and the
++//     map is widened because of what the user said on 2026-11-11 23:22, correcting
++//     the first reading of the map screenshot: it is NOT the map panel being cut,
++//     it is the picture BEHIND the map that does not fill the screen (the blurred
++//     game scene on the left of the screenshot is the unfilled strip showing
++//     through), and when the map is panned into the side black bars it stutters
++//     and leaves a residual image of the map there. So the map root's stretch has
++//     to land on the picture, exactly like the PauseMenu's: the root's background
++//     fills the screen only if the root matrix is widened. The panning ghost is
++//     most likely a knock-on of the same cause -- the uncovered strip is not
++//     redrawn every frame -- so v3 fixes the fill first and the next run's log and
++//     screenshots decide whether the ghost is gone; if widening the whole map root
++//     distorts the map content or cuts the yellow side panel further, the next
++//     step is to stretch only the background child, not the whole root (the
++//     classification and the native/scaled log pair tell us which root to aim at).
++//     The pause menu and any other unclassified full-screen root are widened to
++//     the screen shape's layout (root_sx / root_sy, from DM_SCREEN_ASPECT): 1560
++//     wide at 2.167, so the PauseMenu fills the screen the way the main HUD
++//     already does. 16:9 is the identity. The map's 3D part (WorldMapCamera) is
++//     NOT handled here: a camera projection is not a Pane, and it needs its own
++//     hook -- but it does not need one, see fix-0113-notes.md (the UW vtable scan
++//     already widens every calcMatrix, and the 3D landmass keeps its proportions).
++//     A layout root is recognised structurally -- it has no parent pane -- and by
++//     its full-screen size, not by its name alone (the name is "RootPane" by
++//     nn::ui2d convention, but the romfs .bflyt that would confirm it is not on
++//     this host, so the name is only logged, never required). The root table grew
++//     from 8 to 20 entries: layouts reload into fresh pane objects (the moon
++//     counter alone appears at two addresses in log-18), and 8 slots exhaust over
++//     a session, leaving later roots unscaled.
++//
++// Compiled with: aarch64-linux-gnu-gcc -O2 -ffreestanding -fno-builtin
++//   -fno-stack-protector -fno-jump-tables -fno-asynchronous-unwind-tables -c
++// (the same flags the engine's duo_anchor.c uses, but with gcc; clang's
++// -target arm64-apple-macos is not installed on this host). The words of the
++// resulting __text are embedded in patches.py as HUD_WORDS. This file takes
++// everything through its arguments -- no static data, no literal pool, no external
++// calls -- so the emitted words are position-independent and relocation-free and
++// can be dropped into the rewriter's patch area verbatim:
++//   x0 = the pane (nn::ui2d::Pane *), x1 = params (state page + 0x200: 12 floats,
++//   dx / dy / scale per HUD element, then a u32 generation at +48, then the root
++//   scale root_sx at +52 and root_sy at +56), x2 = HUD table (state page + 0x300:
++//   one 120-byte entry per HUD element), x3 = log buffer (state page + 0x1000: a
++//   u32 count, then 160 entries of 64 bytes). The root table lives at state page
++//   + 0x500 (20 entries of 120 bytes, derived here as table + 0x200). Element order:
++//   0 compass, 1 life, 2 coins, 3 moons. The state page starts zeroed, so a table
++//   entry with pane == 0 is unused and a generation of 0 means "never applied".
++//   A zeroed scale (k, root_sx, root_sy all 0 before the host writes) reads as 1,
++//   so an unwritten state page is a no-op, never a collapse.
++//
++// The log buffer records, deduped by pane address, name and matched code, every
++// pane the hook meets that is a full-screen layout root or sits in the screen's
++// top strip (name, position, size, which HUD element it matched if any, which
++// class of root it is, the pane's global matrix scale, its flags and origin, and
++// the pane's address), plus one extra entry per root after its transform is
++// applied (the same pane, the scaled size and matrix scale), so one run's log.txt
++// shows the real pane names -- which layout is "RootPane", whether the PauseMenu /
++// WorldMap roots are the ones this hook scaled, and by exactly how much. A pane
++// is only logged once it has calculated at least once (flags bit 7, set by
++// Pane::Calculate's epilogue): on a pane's very first frame its global matrix is
++// still zero, so logging it then would record (0,0) and a scale of 0. Panes named
++// 'All' are never logged: they are 30x40 placeholder groups, and log-18 wasted
++// over a dozen of its 64 entries on them. The buffer grew from 64 to 160 entries
++// for the same reason: log-18 filled up in its first ~30 seconds (title, pause,
++// map, objective panes) and the session's remaining ~160 seconds of gameplay HUD
++// contributed nothing -- the compass, coins and life panes were very likely never
++// logged because the buffer was already full, not because their names are wrong.
++
++typedef unsigned int u32;
++typedef unsigned long uintptr_t;
++
++#define HUD_N 4
++#define HUD_NAME_MAX 24
++#define HUD_ENTRY 120          // bytes per table entry (HUD table and root table)
++#define HUD_ROOT_MAX 20
++#define HUD_LOG_MAX 160
++#define HUD_LOG_ENTRY 64       // 24 name + 4 tx + 4 ty + 4 w + 4 h + 4 matched + 8 address + 4 g0 + 4 g5 + 2 flags + 1 origin + 1 class
++#define HUD_MATCH_NONE 0xffffffffu
++#define HUD_MATCH_ROOT 0xfffffffeu
++#define HUD_MATCH_ROOT_PAUSE 0xfffffffdu
++#define HUD_MATCH_ROOT_MAP 0xfffffffcu
++#define HUD_MATCH_ROOT_SCALED 0xfffffffbu
++#define HUD_MATCH_ROOT_SCALED_PAUSE 0xfffffffa
++#define HUD_MATCH_ROOT_SCALED_MAP 0xfffffff9u
++
++#define HUD_CLASS_UNKNOWN 0u
++#define HUD_CLASS_PAUSE 1u
++#define HUD_CLASS_MAP 2u
++
++// The first four bytes of each target name, as a little-endian u32: a fast reject
++// before the full compare. "Comp" (CompassArea), "Coin" (CoinCounter), "Moon" (MoonNum).
++#define HUD_P_COMP 0x706d6f43u
++#define HUD_P_COIN 0x6e696f43u
++#define HUD_P_MOON 0x6e6f6f4du
++// The rest of each name as little-endian u32s, NUL included, so the full compare
++// needs no string literal: a literal would sit in .rodata and the code would load
++// its address with an adrp (a relocation), and the embedded words carry no literal
++// pool. "CompassArea": bytes 4-7 "assA", 8-11 "rea\0"; "CoinCounter": "Coun",
++// "ter\0"; "MoonNum": bytes 4-7 "Num\0" (8 bytes: no third word to compare).
++#define HUD_C_COMP1 0x41737361u
++#define HUD_C_COMP2 0x00616572u
++#define HUD_C_COIN1 0x6e756f43u
++#define HUD_C_COIN2 0x00726574u
++#define HUD_C_MOON1 0x006d754eu
++// The counter widgets (v3, structural): the container pane is named "Counter"
++// ("Coun", "ter\0"); its identifying text child is 'TxtTotalShine' (moons),
++// 'TxtCounterSh' (coins) or 'TxtLife' (life). "TxtTotalShine": "TxtT", "otal",
++// "Shin", "e\0"; "TxtCounterSh": "TxtC", "ount", "erSh", 0 (12 bytes, so the
++// fourth word is the NUL word); "TxtLife": "TxtL", "ife\0".
++#define HUD_W_COUNTER0 0x6e756f43u
++#define HUD_W_COUNTER1 0x00726574u
++#define HUD_W_TSHINE0 0x54747854u
++#define HUD_W_TSHINE1 0x6c61746fu
++#define HUD_W_TSHINE2 0x6e696853u
++#define HUD_W_TSHINE3 0x00000065u
++#define HUD_W_TCSH0 0x43747854u
++#define HUD_W_TCSH1 0x746e756fu
++#define HUD_W_TCSH2 0x68537265u
++#define HUD_W_TCSH3 0x00000000u
++#define HUD_W_TLIFE0 0x4c747854u
++#define HUD_W_TLIFE1 0x00656669u
++// The layout classifiers (v3, structural): 'PicMapCap' ("PicM", "apCa", "p\0")
++// marks the WorldMap, 'ParList00' ("ParL", "ist0", "0\0") and 'WinSelect'
++// ("WinS", "elec", "t\0") the PauseMenu. The small counter layouts' parent root
++// is named "RootPane" ("Root", "Pane", 0).
++#define HUD_W_MAPCAP0 0x4d636950u
++#define HUD_W_MAPCAP1 0x61437061u
++#define HUD_W_MAPCAP2 0x00000070u
++#define HUD_W_PARLIST0 0x4c726150u
++#define HUD_W_PARLIST1 0x30747369u
++#define HUD_W_PARLIST2 0x00000030u
++#define HUD_W_WINSEL0 0x536e6957u
++#define HUD_W_WINSEL1 0x63656c65u
++#define HUD_W_WINSEL2 0x00000074u
++#define HUD_W_ROOT0 0x746f6f52u
++#define HUD_W_ROOT1 0x656e6150u
++#define HUD_W_ROOT2 0x00000000u
++// The placeholder group name "All" ("All\0" as one word), never logged.
++#define HUD_W_ALL 0x006c6c41u
++
++// Bounded compare of a pane name (at most 24 bytes, stops at NUL) against a name
++// already recorded in the log buffer (both are runtime data, never a literal).
++static inline __attribute__((always_inline)) int hud_name_eq(const char *name, const char *target) {
++    for (int i = 0; i < HUD_NAME_MAX; i++) {
++        if (name[i] != target[i]) return 0;
++        if (name[i] == 0) return 1;
++    }
++    return 0;
++}
++
++// Compare a pane name's words against a target's words (nwords of 4 bytes each,
++// NUL included where the name is short, so a longer name with the same prefix is
++// rejected). The name lives at pane+0xb8, 8-byte aligned, so the u32 reads are
++// aligned, exactly as v1's matcher did.
++static inline __attribute__((always_inline)) int hud_words_eq(const u32 *nw, u32 a, u32 b, u32 c, u32 d, int n) {
++    if (n > 0 && nw[0] != a) return 0;
++    if (n > 1 && nw[1] != b) return 0;
++    if (n > 2 && nw[2] != c) return 0;
++    if (n > 3 && nw[3] != d) return 0;
++    return 1;
++}
++
++static inline __attribute__((always_inline)) float hud_clamp_k(float k) {
++    // A scale outside [0.2, 3.0], or not a number, is the settings panel's bug, not
++    // a request: fall back to 1 (no resize). A zero scale is not a request either:
++    // the state page starts zeroed, so an unwritten slot reads as 0 and must mean
++    // identity, never a collapse. The NaN test is k != k (a NaN is not equal to
++    // itself); a negative scale would mirror the widget, which nobody asked for.
++    if (k == 0.0f || k != k) return 1.0f;
++    if (k < 0.2f) return 0.2f;
++    if (k > 3.0f) return 3.0f;
++    return k;
++}
++
++static inline __attribute__((always_inline)) float hud_clamp_root(float s) {
++    // The root stretch, from the screen shape: 1 is 16:9 (no stretch). A zero or
++    // non-number is an unwritten state page, so identity; outside [0.5, 2.0] is a
++    // host bug, so clamp. The screen's widest (2.2) asks for 2.2 / (16/9) = 1.24,
++    // and its tallest (1.3) for (16/9) / 1.3 = 1.37.
++    if (s == 0.0f || s != s) return 1.0f;
++    if (s < 0.5f) return 0.5f;
++    if (s > 2.0f) return 2.0f;
++    return s;
++}
++
++// Scale orig about the pane's centre, then move by (dx, dy) in layout units, into
++// mod. sx scales the x row, sy the y row (a HUD widget passes sx == sy == k; a
++// layout root passes the screen shape's sx / sy with dx == dy == 0). The centre is
++// the pane's middle passed through its own matrix. The middle is found from the
++// pane's origin (the byte at +0x5b, confirmed by disassembly of the local matrix
++// helper at main+0x9096d0: bits 4-5 the horizontal origin, 1 left, 2 right; bits
++// 6-7 the vertical origin, 1 top, 2 bottom; 0 is the centre either way) and its
++// size at +0x50 / +0x54: the centre is the origin plus half the size towards the
++// middle (the layout is y-up, the origin at the parent's centre, so a top
++// origin's centre is half the height below it, a left origin's half the width
++// to its right). A pane with no usable size scales about its translation (its
++// origin), which is the same thing for a point-sized pane. The third row (depth)
++// is left alone: this is a 2D widget, and scaling its depth would change its
++// draw order.
++static inline __attribute__((always_inline)) void hud_xform(const float *orig, float *mod, float dx, float dy,
++                      float sx, float sy, float w, float h, unsigned char origin) {
++    float cx, cy;
++    if (w > 0.0f && w < 100000.0f && h > 0.0f && h < 100000.0f) {
++        float ox = ((origin >> 4) & 3) == 1 ? w * 0.5f : ((origin >> 4) & 3) == 2 ? -w * 0.5f : 0.0f;
++        float oy = ((origin >> 6) & 3) == 1 ? -h * 0.5f : ((origin >> 6) & 3) == 2 ? h * 0.5f : 0.0f;
++        cx = orig[0] * ox + orig[1] * oy + orig[3];
++        cy = orig[4] * ox + orig[5] * oy + orig[7];
++    } else {
++        cx = orig[3];
++        cy = orig[7];
++    }
++    for (int i = 0; i < 3; i++) { mod[i] = orig[i] * sx; mod[4 + i] = orig[4 + i] * sy; }
++    mod[3] = cx + (orig[3] - cx) * sx + dx;
++    mod[7] = cy + (orig[7] - cy) * sy + dy;
++    for (int i = 8; i < 12; i++) mod[i] = orig[i];
++}
++
++// Walk a pane's children (at most 16 per pane) and their children (one more
++// level), calling the name test on each child's name, and report whether any of
++// them is named by the given words. The child list is the game's own intrusive
++// list, the same one Pane::FindPaneByName (main+0x909310) and the child loop in
++// Pane::Calculate walk: the head is at pane+0x20, the first node at pane+0x28,
++// a node's pane is 8 bytes below the node, and the next node is at (pane+0x10)
++// once the node is stepped back to its pane. The walk is iterative (an explicit
++// stack, so the function can be inlined and the emitted words stay one function
++// starting at hud_calc), bounded (64 node visits at most) and NULL-guarded; a
++// layout instantiates all its panes at load time, so a root's whole subtree is
++// walkable from its first sighting.
++static inline __attribute__((always_inline)) int hud_tree_has(void *pane, u32 a, u32 b, u32 c, u32 d, int n) {
++    if (!pane) return 0;
++    void *stack[32];
++    unsigned char sdepth[32];
++    int sp = 0, visits = 0;
++    stack[sp] = pane;
++    sdepth[sp] = 1;
++    sp++;
++    while (sp > 0 && visits < 64) {
++        sp--;
++        void *p = stack[sp];
++        unsigned char depth = sdepth[sp];
++        void *head = (char *)p + 0x20;
++        void *node = *(void **)((const char *)p + 0x28);
++        for (int i = 0; i < 16 && node && node != head; i++) {
++            void *child = (char *)node - 8;
++            if (!child) break;
++            visits++;
++            if (hud_words_eq((const u32 *)((const char *)child + 0xb8), a, b, c, d, n)) return 1;
++            if (depth > 0 && sp < 32) {
++                stack[sp] = child;
++                sdepth[sp] = depth - 1;
++                sp++;
++            }
++            node = *(void **)((const char *)child + 0x10);
++        }
++    }
++    return 0;
++}
++
++// Which class of full-screen root is this: the WorldMap (a 'PicMapCap' pane
++// somewhere in its subtree), the PauseMenu (a 'ParList00' or 'WinSelect'), or
++// unknown (some other full-screen layout). Walked on every root sighting; the
++// subtree is small (a layout's panes) and roots are rare, so the cost is nothing.
++static inline __attribute__((always_inline)) u32 hud_root_class(void *pane) {
++    if (hud_tree_has(pane, HUD_W_MAPCAP0, HUD_W_MAPCAP1, HUD_W_MAPCAP2, 0, 3)) return HUD_CLASS_MAP;
++    if (hud_tree_has(pane, HUD_W_PARLIST0, HUD_W_PARLIST1, HUD_W_PARLIST2, 0, 3)) return HUD_CLASS_PAUSE;
++    if (hud_tree_has(pane, HUD_W_WINSEL0, HUD_W_WINSEL1, HUD_W_WINSEL2, 0, 3)) return HUD_CLASS_PAUSE;
++    return HUD_CLASS_UNKNOWN;
++}
++
++// Append one log entry (name, position, size, matched code, address, matrix
++// scale, flags, origin, class), deduped by pane address, name and matched code.
++// Returns 1 if the entry was written. The caller checks the count first.
++static inline __attribute__((always_inline)) int hud_log_add(void *logbuf, void *pane, const char *name,
++                      float tx, float ty, float w, float h, u32 matched,
++                      float g0, float g5, unsigned short pflags, unsigned char origin, u32 cls) {
++    if (!logbuf) return 0;
++    u32 *count = (u32 *)logbuf;
++    if (*count >= HUD_LOG_MAX) return 0;
++    char *entries = (char *)logbuf + 4;
++    for (u32 e = 0; e < *count; e++) {
++        char *en = entries + e * HUD_LOG_ENTRY;
++        if (*(uintptr_t *)(en + 44) == (uintptr_t)pane && hud_name_eq(en, name) &&
++            *(u32 *)(en + 40) == matched) return 0;
++    }
++    char *dst = entries + (*count) * HUD_LOG_ENTRY;
++    for (int i = 0; i < HUD_NAME_MAX; i++) {
++        dst[i] = name[i];
++        if (!name[i]) break;
++    }
++    // A slot the loop above did not write keeps the previous entry's bytes only
++    // if the name is shorter: zero the tail past the NUL so a stale name can
++    // never be read back.
++    for (int i = 0; i < HUD_NAME_MAX; i++) if (!dst[i]) { for (int j = i + 1; j < HUD_NAME_MAX; j++) dst[j] = 0; break; }
++    *(float *)(dst + 24) = tx;
++    *(float *)(dst + 28) = ty;
++    *(float *)(dst + 32) = w;
++    *(float *)(dst + 36) = h;
++    *(u32 *)(dst + 40) = matched;
++    *(uintptr_t *)(dst + 44) = (uintptr_t)pane;
++    *(float *)(dst + 52) = g0;
++    *(float *)(dst + 56) = g5;
++    *(unsigned short *)(dst + 60) = pflags;
++    dst[62] = (char)origin;
++    dst[63] = (char)cls;
++    (*count)++;
++    return 1;
++}
++
++void hud_calc(void *pane, const float *params, void *table, void *logbuf) {
++    if (!pane || !params || !table) return;
++    const char *name = (const char *)pane + 0xb8;
++    const u32 *nw = (const u32 *)name;
++
++    // Which HUD element is this pane. First the v1 actor names, kept as a
++    // fallback (a layout group named after its actor is still possible, and
++    // they cost two word compares): CompassArea, CoinCounter, MoonNum. Then the
++    // v3 structural rule: a pane named 'Counter' whose parent is a small
++    // RootPane (a counter widget's own layout, not the full-screen HUD) and
++    // whose subtree holds the widget's identifying text -- 'TxtTotalShine' is
++    // the moon counter (log-18 confirmed), 'TxtCounterSh' the coin counter,
++    // 'TxtLife' the life counter (both inferred from the string pool, see the
++    // header). Element 1 (life) no longer has "no locked name": it has an
++    // inferred one, and the log will confirm or refute it. The compass still
++    // has no structural rule: no Compass pane name exists anywhere to build one
++    // from.
++    int idx = -1;
++    if (nw[0] == HUD_P_COMP && nw[1] == HUD_C_COMP1 && nw[2] == HUD_C_COMP2) idx = 0;
++    else if (nw[0] == HUD_P_COIN && nw[1] == HUD_C_COIN1 && nw[2] == HUD_C_COIN2) idx = 2;
++    else if (nw[0] == HUD_P_MOON && nw[1] == HUD_C_MOON1) idx = 3;
++    else if (hud_words_eq(nw, HUD_W_COUNTER0, HUD_W_COUNTER1, 0, 0, 2)) {
++        void *parent = *(void **)((const char *)pane + 0x18);
++        if (parent) {
++            const u32 *pw = (const u32 *)((const char *)parent + 0xb8);
++            float pw_f = *(const float *)((const char *)parent + 0x50);
++            float ph_f = *(const float *)((const char *)parent + 0x54);
++            if (hud_words_eq(pw, HUD_W_ROOT0, HUD_W_ROOT1, HUD_W_ROOT2, 0, 3) &&
++                pw_f >= 100.0f && pw_f <= 600.0f && ph_f >= 100.0f && ph_f <= 600.0f) {
++                if (hud_tree_has(pane, HUD_W_TSHINE0, HUD_W_TSHINE1, HUD_W_TSHINE2, HUD_W_TSHINE3, 4)) idx = 3;
++                else if (hud_tree_has(pane, HUD_W_TCSH0, HUD_W_TCSH1, HUD_W_TCSH2, HUD_W_TCSH3, 4)) idx = 2;
++                else if (hud_tree_has(pane, HUD_W_TLIFE0, HUD_W_TLIFE1, 0, 0, 2)) idx = 1;
++            }
++        }
++    }
++
++    // The pane's current global matrix (as the game computed it), its size, its
++    // origin (the pivot's place in its own rectangle, +0x5b), its flags (+0x58:
++    // bit 7 is set by Pane::Calculate's epilogue, so it tells whether this pane
++    // has ever calculated -- on a pane's very first frame its matrix is still
++    // zero), and its parent. A layout root has no parent: it is the pane
++    // Layout::Calculate hands in, not a child of another pane.
++    const float *g = (const float *)pane + 0x70 / 4;
++    float tx = g[3], ty = g[7];
++    float w = *(const float *)((const char *)pane + 0x50);
++    float h = *(const float *)((const char *)pane + 0x54);
++    unsigned char origin = *(const unsigned char *)((const char *)pane + 0x5b);
++    unsigned short pflags = *(const unsigned short *)((const char *)pane + 0x58);
++    void *parent = *(void **)((const char *)pane + 0x18);
++
++    // A full-screen layout root (the PauseMenu settings screen, the WorldMap map
++    // screen, any other full-screen layout): no parent, and a full-screen size. The
++    // size test is the engine's own full-screen rule (loader.c dm_fps_state_apply,
++    // the duo_anchor anc values: a pane 1270 wide and 710 tall or larger is a
++    // full-screen pane; a looser width once stretched a half-width side panel past
++    // its bars). A HUD widget's own root is excluded by name (idx >= 0): it takes
++    // the player's settings, never the root stretch, so it is never stretched twice.
++    // Small widget roots are excluded by size: they are not full-screen layouts.
++    int is_root = (parent == 0 && idx < 0 && w >= 1270.0f && h >= 710.0f);
++    u32 cls = HUD_CLASS_UNKNOWN;
++    if (is_root) cls = hud_root_class(pane);
++
++    // Calibration log: every pane in the screen's top strip, and every full-screen
++    // layout root, deduped by pane address, name and matched code, so one run's
++    // log.txt shows the real pane names (which layout is "RootPane", which root the
++    // hook scaled, and by how much) and the positions and sizes they had. The top
++    // strip is the HUD's row (ty < 150 layout units); full-screen backgrounds
++    // (w >= 1200) and unnamed panes are not HUD widgets, but a full-screen root
++    // is logged by its own rule below. Panes named 'All' are never logged (30x40
++    // placeholder groups). A pane is only logged once it has calculated at least
++    // once (flags bit 7): before that its matrix is still zero, and the entry
++    // would record a scale of 0. Capped at 160 entries; once full the scan stops
++    // (the count check is the only per-pane cost after that).
++    if (logbuf && (pflags & 0x80u) && nw[0] != HUD_W_ALL) {
++        u32 matched = HUD_MATCH_NONE;
++        int want = 0;
++        if (is_root) {
++            want = 1;
++            matched = cls == HUD_CLASS_PAUSE ? HUD_MATCH_ROOT_PAUSE :
++                      cls == HUD_CLASS_MAP ? HUD_MATCH_ROOT_MAP : HUD_MATCH_ROOT;
++        } else if (ty < 150.0f && ty > -50.0f && w > 0.0f && w < 1200.0f && name[0]) {
++            want = 1;
++            matched = idx < 0 ? HUD_MATCH_NONE : (u32)idx;
++        }
++        if (want) hud_log_add(logbuf, pane, name, tx, ty, w, h, matched, g[0], g[5], pflags, origin, cls);
++    }
++
++    if (idx >= 0) {
++        // A HUD widget: the player's own settings (dx, dy, scale) and the
++        // generation the host bumped on every write, so a settings change is
++        // applied even when the game did not recompute the matrix this frame (a
++        // static widget's matrix stays put). The entry cut is what makes this
++        // work for a static widget at all: the +0x13c cut never runs for it (the
++        // skip path), but the entry cut runs on every Calculate call.
++        float dx = params[idx * 3 + 0];
++        float dy = params[idx * 3 + 1];
++        float k = hud_clamp_k(params[idx * 3 + 2]);
++        u32 gen = ((const u32 *)params)[12];
++
++        // The per-element entry: the pane, its original matrix (as the game
++        // computed it), the modified matrix (the original + this transform), and
++        // the generation the modified matrix was computed from.
++        char *ent = (char *)table + idx * HUD_ENTRY;
++        uintptr_t *e_pane = (uintptr_t *)(ent + 0);
++        float *e_orig = (float *)(ent + 8);
++        float *e_mod = (float *)(ent + 56);
++        u32 *e_gen = (u32 *)(ent + 104);
++        if (*e_pane != (uintptr_t)pane) {   // first sighting, or the layout reloaded
++            *e_pane = (uintptr_t)pane;
++            *(u32 *)(ent + 108) = (u32)idx;
++            *(u32 *)(ent + 112) = 1u;
++            *e_gen = 0;   // force a recompute below (the stored modified matrix is stale)
++            for (int i = 0; i < 12; i++) { e_orig[i] = 0.0f; e_mod[i] = 0.0f; }
++        }
++
++        // Did the game recompute the matrix since the last frame? Compare the
++        // current matrix against the stored modified one: if they differ, the game
++        // wrote a new original (an animation, a parent that moved, the layout
++        // reloading), so the stored original follows it. If they are the same, the
++        // game left our modified matrix alone, and only a settings change (a new
++        // generation) needs a recompute.
++        int recomputed = 0;
++        {
++            const u32 *cur = (const u32 *)g;
++            u32 *mod = (u32 *)e_mod;
++            for (int i = 0; i < 12; i++) if (cur[i] != mod[i]) { recomputed = 1; break; }
++        }
++        if (recomputed) for (int i = 0; i < 12; i++) e_orig[i] = g[i];
++        if (!recomputed && *e_gen == gen) return;   // already correct: nothing to do
++        hud_xform(e_orig, e_mod, dx, dy, k, k, w, h, origin);
++        *e_gen = gen;
++
++        // Write the modified matrix back to the pane. Its children are calculated
++        // after this hook, so they inherit the moved / resized parent.
++        float *dst = (float *)pane + 0x70 / 4;
++        for (int i = 0; i < 12; i++) dst[i] = e_mod[i];
++        return;
++    }
++
++    if (is_root) {
++        // A full-screen layout root: the screen shape's stretch, about the pane's
++        // centre. The PauseMenu, the WorldMap (its background has to fill the
++        // screen -- see the header: the user's 2026-11-11 23:22 correction) and any
++        // other unclassified root are widened / heightened to the screen shape's
++        // layout (root_sx / root_sy, from DM_SCREEN_ASPECT, written by the host):
++        // 1560x720 at 2.167, so the PauseMenu and the map background fill the
++        // screen the way the main HUD already does. 16:9 is the identity (sx == sy
++        // == 1). The stretch is applied by whichever cut reaches the root -- the
++        // entry cut for a static root, the +0x13c cut for a dirty one -- so a root
++        // that goes static before the host has written the scale still gets it on
++        // the next frame.
++        float sx = hud_clamp_root(params[13]);
++        float sy = hud_clamp_root(params[14]);
++        if (sx == 1.0f && sy == 1.0f) return;   // 16:9, or an unwritten state page: nothing to do
++
++        // The root table (state page + 0x500, derived from the HUD table's base):
++        // one entry per root pane, found by pane pointer, so two layouts whose
++        // roots share the "RootPane" name still get their own entries. Twenty
++        // slots, because layouts reload into fresh pane objects and eight (v1)
++        // exhaust over a session.
++        char *rtable = (char *)table + 0x200;
++        char *ent = 0;
++        for (int i = 0; i < HUD_ROOT_MAX; i++) {
++            char *e = rtable + i * HUD_ENTRY;
++            if (*(uintptr_t *)(e + 0) == (uintptr_t)pane) { ent = e; break; }
++            if (!ent && *(u32 *)(e + 112) == 0) ent = e;   // first free slot
++        }
++        if (!ent) return;   // no free slot: leave the root alone, never grow the table
++        uintptr_t *e_pane = (uintptr_t *)(ent + 0);
++        float *e_orig = (float *)(ent + 8);
++        float *e_mod = (float *)(ent + 56);
++        float *e_sx = (float *)(ent + 104);
++        float *e_sy = (float *)(ent + 108);
++        if (*e_pane != (uintptr_t)pane) {   // first sighting, or the slot was reused
++            *e_pane = (uintptr_t)pane;
++            *(u32 *)(ent + 112) = 1u;
++            *(u32 *)(ent + 116) = cls;
++            *e_sx = 0.0f;   // force a recompute below (the stored scale is stale)
++            *e_sy = 0.0f;
++            for (int i = 0; i < 12; i++) { e_orig[i] = 0.0f; e_mod[i] = 0.0f; }
++        } else {
++            *(u32 *)(ent + 116) = cls;   // the class can only get surer, never stale
++        }
++        int recomputed = 0;
++        {
++            const u32 *cur = (const u32 *)g;
++            u32 *mod = (u32 *)e_mod;
++            for (int i = 0; i < 12; i++) if (cur[i] != mod[i]) { recomputed = 1; break; }
++        }
++        if (recomputed) for (int i = 0; i < 12; i++) e_orig[i] = g[i];
++        // A changed screen shape needs a recompute even when the game did not
++        // recompute the matrix (the root is static, its matrix stays put).
++        if (!recomputed && *e_sx == sx && *e_sy == sy) return;
++        hud_xform(e_orig, e_mod, 0.0f, 0.0f, sx, sy, w, h, origin);
++        *e_sx = sx;
++        *e_sy = sy;
++        float *dst = (float *)pane + 0x70 / 4;
++        for (int i = 0; i < 12; i++) dst[i] = e_mod[i];
++
++        // Proof the transform landed, in the log: a second entry for the same
++        // pane, with the scaled size and matrix scale and a SCALED matched code,
++        // so the next run's log.txt shows the native entry and the scaled entry
++        // side by side. Only once the pane has calculated at least once (flags
++        // bit 7): before that the stored original is still zero and the scaled
++        // entry would record a scale of 0.
++        if (pflags & 0x80u) {
++            u32 smatched = cls == HUD_CLASS_PAUSE ? HUD_MATCH_ROOT_SCALED_PAUSE :
++                           cls == HUD_CLASS_MAP ? HUD_MATCH_ROOT_SCALED_MAP :
++                           HUD_MATCH_ROOT_SCALED;
++            hud_log_add(logbuf, pane, name, e_mod[3], e_mod[7], w * sx, h * sy,
++                        smatched, e_mod[0], e_mod[5], pflags, origin, cls);
++        }
++        return;
++    }
++}
+diff --git a/dm/games/0100000000010000/patches.py b/dm/games/0100000000010000/patches.py
+new file mode 100644
+index 0000000..0e84072
+--- /dev/null
++++ b/dm/games/0100000000010000/patches.py
+@@ -0,0 +1,188 @@
++# Super Mario Odyssey (0100000000010000): the rewriter's patches of this game's own builds.
++# dm/tools/patch_nso.py loads every profile's patches.py and applies those of a module's
++# NSO build ID; CUTS, OBS and FRAME_STEP as described there ("Registered patches").
++# Only FRAME_STEP is used here: the HUD move / resize hook (0113). There are no word
++# cuts and no observation gates.
++from nso_asm import ADDI, ADRP, B, LDP_POST, STP_PRE
++
++BUILD_141 = 'b424be150a8e7d78701cbe7a439d9ebf'   # main 1.4.1 (game.tsv v393216)
++
++# hud_calc, compiled from hud_calc.c (hud_calc at +0) with
++# aarch64-linux-gnu-gcc -O2 -ffreestanding -fno-builtin -fno-stack-protector
++# -fno-jump-tables -fno-asynchronous-unwind-tables -c -- the same flags the engine's
++# duo_anchor.c uses, but with gcc (clang's -target arm64-apple-macos is not installed
++# on this host). The function takes everything through its arguments (no static data,
++# no literal pool, no external calls), so these words are position-independent and
++# relocation-free and can be dropped into the rewriter's patch area verbatim:
++#   x0 = the pane, x1 = params (state page + 0x200: 12 floats for the four HUD
++#   elements, a u32 generation at +48, the root stretch root_sx at +52 and root_sy
++#   at +56), x2 = table (state page + 0x300), x3 = log buffer (state page + 0x1000).
++#   The root table is at state page + 0x500 (20 entries). The log buffer holds 160
++#   entries of 64 bytes. Element order: 0 compass, 1 life, 2 coins, 3 moons.
++#   See hud_calc.c for the layouts and the design.
++HUD_WORDS = (
++    'f100003ffa401844fa40180454000400a9ab7bfd528de8649102e007910003fdb940b8059101c0082d4a0c0272ae0da4bd407c04bd408c01'
++    '39416c0a7940b00d6b0400bf54000260528de86472adcd246b0400bf54001100528de9a472adcde46b0400bf540018c1b940bc0652800024'
++    '12800009515b5cc6711538c65400022152800069b50003231400001fd65f03c0b940bc0b528e6c2672a82e6652800024128000096b06017f'
++    '540000c1b940c004515858847115c8841a9f07e44b0403e9f9400c06f10000df7a40088454001a005298000472a893c41e2700801e202050'
++    '54000e6ab4000c43f27901bf528d882472a00d847a4410a454001c213100053f54000b600b09052393407c63910004648b040825bc637825'
++    'bc647826bd4004a01e2020081e20140054001a01529999a372a7c9831e2700611e212010540019241e2110011e212010540018cc531c6d24'
++    'b940302b4b090084531d708493407c86f864c8478b0600459100e0a3910020a1eb0000ff540002004f000401910020c79100e0c6f824c840'
++    '8b0700478b060046d280000052800022290d24bfb90070a23ca068e13ca068c191004000f100c01f54ffff81d2800000b8606904b8606862'
++    '910010006b02009f540013e1f100c01f54ffff41b94068a06b0b001f540004801e202058540011ecbd4014a4bd4024a3aa0103e0910050a1'
++    'bd40000291001000bd400c011e2008421e200821bd002c02bd003c01eb01001f54ffff01bd4014a2d2800000bd4024a13cc280a71e243842'
++    '1e233821b90068ab3c8580a71f0210041f010c031e2428a41e2328c3bd0044a4bd0054a3d503201fbc606860bc20690091001000f100c01f'
++    '54ffff81a8d57bfdd65f03c0b940bc0b114300a652800024128000096b06017f54fff1c1b940c00b528cae8672a00e466b06017f54fff121'
++    '52800049b5fff22317ffff975290000472a886241e2700801e2020705400004a17ffff89528d2a12528e0c3eaa0003efa90153f39100c3f4'
++    'a9025bf5910143f55280002452800031528000165280000672a9ac7272ac287e3900c3e4f9002be0f94015e4910081eff100009ffa4411e4'
++    '54003720510006335280000cd503201fb940b08ed10020901100058b6b1201df54000541b940b48e6b1e01df540004e1b940b88e7101c1df'
++    '54000481b4000e83f27901bf528d882472a00d847a4410a454003ec13100053f54000da0a94153f352800009a9425bf517ffff63528de864'
++    '72adcea46b0400bf54000741b940bc04515c98847115d084540006c1f9400c04b4002ce4b940b889528dea4672ae8de66b06013f540000c1'
++    'b940bc89528c2a0672acadc66b06013f5400338012800009b5ffe8c317ffffa67100023f7a5f18c05400008cf826dab03826ca93110004c6'
++    'f9400484f100009f7a4f1960fa44d1e454002f602a0b03ec17ffffc6b5ffe6e33100053f54fff2c05280000917ffff3a528a000072a8f860'
++    '1e2700011e2120505400004417ffff6d1e202078540002ac17ffff6ad2800000bc606901bc20682191001000f100c01f54ffff8117ffff61'
++    '1e20402017ffff3a1e2e100017ffff38528000241280000917ffff1252a862c41e2700801e202030540000a417ffff1c1e212070540000e4'
++    '17ffff5452b849041e2700801e202030540017ec17ffff14d34415407100041f54003d600f0004077100081f540000611e2c10071e278847'
++    '53067d4a7100055f54003c000f0004017100095f540000611e2c10011e2108612d4110b12d4308b01e2408241f0712241e220823bd4014a2'
++    '1f100ce3bd4024a11e2228841e21286317ffff36a94153f35280004ea9425bf52d4690211e2020881a9f17e11e2420801a9f07e41e202028'
++    '2a0400211e21142054001fe11e2c10001e20203054001ec41e2010001e20203054001e6c350035c11e2c10001e20209054001da41e201000'
++    '1e20209054001d4c1e2e10001e2020801a9f17e17100003f1e2e10001e20142054ffe6a0d503201ff941004191080044aa0403e5912d8042'
++    'eb00003f54000200b9407081350015819101e0a1eb02003f54000160f9403ca5eb0000bf540000e09101e021eb02003f540000a0f9400025'
++    'eb0000bf54ffff61aa0103e4aa0403e591002082f84384a1eb00003f540029604f000400aa0203e152800026f9000080f900349f290e3886'
++    '910040213c9f00203d800820eb0100bf54ffff81d2800001b8616909b86168a6910010216b06013f54001e81f100c03f54ffff41bd406880'
++    '1e21200054000081bd406c801e24200054ffe0201e2020585400170cbd401487bd402486aa0203e191005082bd40002591001021bd400c20'
++    '1e2108a51e240800bd002c25bd003c20eb02003f54ffff01bd4014850f000410bd402480d28000013cc280911e2738a51e2638002d0d1081'
++    '3c8580911f011ca51f0418001e3028a51e302800bd004485bd005480d503201fbc6168a0bc21690091001021f100c03f54ffff81363fdb8d'
++    '128000a9710005df540000a0710009df12800089128000c11a811129bd403886bd404480bd404c87bd405485b4ffda03b940006b71027d7f'
++    '54ffd9a891001066340021eb52800808aa0603e29ba819681400000491010042eb02011f54002100f842c041eb00003f54ffff61d2800001'
++    '14000003f100603f54fffee038616845386168e4910004216b05009f54fffe4135ffff24b94028416b01013f54fffdc117fffeb31e202058'
++    '5400004c17fffe5452a892c41e2700801e2020505400004417fffe4f3942e00434ffc9a4bd407000bd408405b94000703100053f54002c00'
++    '71027e1f54ffc9082a0903f25280000e52800011d503201f9100106c340004905280080faa0c03e59baf320f14000004910100a5eb0f00bf'
++    '540003a0f842c0a4eb00009f54ffff61d280000414000003f100609f54fffee0386468ab386468e6910004846b0b00df54fffe4135ffff26'
++    'b94028a46b12009f54fffdc13100053f54ffc52135ffe63117fffe819101e0a5eb0200bf54ffcfc0f94000a1aa0503e4eb00003f54ffe9a1'
++    '17ffff5b531a6610d28000048b10018514000003f100609f540000a0386468e6382468a69100048435ffff66d10004abd280002414000004'
++    '91000484f100649f540001403864696635ffff8693407c867100609f540000a0382668bf910004c6710060df54ffffa1b90028b23900f8aa'
++    '3900fcaebd0018a4b94000642d0388a111000484bd0024a3f802c0a02d0694a0790078adb900006417ffffcf1e20400417ffff1e1e204001'
++    '34ffe1c11e2e100417ffff1a1280000917fffde41e2e100134ffe10117fffe48528a000172a8f8611e2700201e2020505400004417ffff44'
++    '1e2020785400004c17ffff411e2020705400004417ffff3ed34415417100043f54001de00f0004057100083f540000611e2c10051e258845'
++    '53067d417100043f54001d400f0004007100083f540000611e2c10001e2008602d411c922d42c490bd401c861e2708071f051e471e260806'
++    'bd4024801f1118a61e3028e71e2028c617ffff25110006d60b0c02d67100fedf7a40d8c4540013ad510004c6910143eb9100c3e4f866d96f'
++    '3866c89117fffe3bd2800001d503201fbc616900bc21684091001021f100c03f54ffff8117ffff0eb940c08635ffcc86bd40508652a85906'
++    '1e2700c01e2020d05400004a17fffe5e52a882c61e2700c51e2520d05400004917fffe59bd4054861e2020d05400004a17fffe551e2520d0'
++    '5400004917fffe52910143eb9100c3e4a90153f3528f0a9352800026a9025bf5528e8df6528d0a755280000c5280002972aa8e9372ad8c36'
++    '72adcd353900c3e6f9002be051000529f869d9663869c890910080d1f94014c6f10000dffa461224540016405100061e5280000eb940b0d2'
++    'd10020d4110005cf6b13025f54000941b940b4d26b16025f540008e1b940b8d26b15025f54000881b940bcd27101965f54000821a94153f3'
++    'a9425bf517fffd55b900748e17fffec05280004e12800072b940007071027e1f540000e8a94153f352800031a9425bf5bd407000bd408405'
++    '17ffff26a94153f3a9425bf53100053f54ffcdc05280000917fffd63531a656bd28000018b0b00c414000003f100603f540000a0386168e2'
++    '382168829100042135ffff62d1000485d28000211400000491000421f100643f54000140386168a235ffff8293407c227100603f540000a0'
++    '3822689f910004427100605f54ffffa11e2208211e230884b90028893900f88a3900fc8ebd001880b94000612d03848511000421bd002484'
++    'f802c0802d069c867900788db900006117fffd951e2e100417fffe5b7100021f7a5f19205400008cf829d9743829c89e11000529f94004c6'
++    'f10000df7a4f19e0fa46d22454000aa02a0f03ee17ffffa61e2c10011e21886117fffe241e2c10071e27084717fffe19528c2a13528e6d36'
++    'aa0003eb910143f59100c3f452800024528000305280000f5280000672a98e5372a60e963900c3e4f9002be0f94015649100816bf100009f'
++    'fa441164540006405100061e5280000eb940b091d1002092110005cc6b13023f540000e1b940b4916b16023f54000081b940b8917100c23f'
++    '540001c07100021f7a5f18c05400008cf826dab23826ca9e110004c6f9400484f100009f7a4f1980fa44d164540003002a0c03ee17ffffe9'
++    'b40016a3f27901bf528d882472a00d847a4410a4540015c05280002e1280005217ffff801e2c10051e25084517ffff151e2c10001e208860'
++    '17ffff1a71027e1f54ffa8682a0903f25280000e5280001117fffea2110005ef0b0e01ef7100fdff7a40d8c45400074d510004c6910143eb'
++    '9100c3e4f866d96b3866c89017ffffc21100058c0b0e018c7100fd9f7a40d92454ffe8ac528f0a92528eadf1528e4cb0528000295280000e'
++    '5280002672a86e9272ae8dd172ad0a703900c3e9f9002be0510004c65280000cf866d9693866c88f91008134f9401529510005f3f100013f'
++    'd10021357a4f1980fa49d284540009c0b940b1361100058c6b1202df54000181b940b5366b1102df54000121b940b9366b1002df540000c1'
++    'b940bd3635000096a94153f3a9425bf517fffd16710001ff7a5f18c05400008cf826d9753826c893110004c6f940052917ffffe5528d2af2'
++    '528d8cb1910143eb9100c3e45280002c5280000f5280002672aa6dd272ac6cb13900c3ecf9002be0510004c65280000ef866d96c3866c890'
++    '91008194f940158c51000613f100019fd10021957a4f19c0fa4cd28454000260b940b196110005ce6b1202df540000e1b940b5966b1102df'
++    '54000081b940b9967101d2df54fff1a07100021f7a5f18c05400008cf826d9753826c893110004c6f940058c17ffffea0b0f01cf7100fdff'
++    '7a40d8c454fffbecb40005e3f27901bf528d882472a00d847a4410a4540005005280000e1280003217ffff000b0e018e7100fddf7a40d8c4'
++    '54fff48c528f0a91528ccd30528000295280000e5280002672a98e9172a00cb03900c3e9f9002be0510004c65280000cf866d9693866c88f'
++    '91008133f9401529510005f2f100013f7a4f1980fa49d26454000440b940b1341100058c6b11029f540002a1b940b5346b10029f54000241'
++    'a94153f352800029a9425bf5b5ff88e317fffc4d3100053f54ff9ca1a94153f35280000ea9425bf517fffd503100053f54ff9be1a94153f3'
++    '5280002ea9425bf517fffd4a710001ffd10021347a5f18c05400008cf826d9743826c892110004c6f940052917ffffdc0b0e018e7100fddf'
++    '7a40d8c454fffa2ca94153f3a9425bf517fffce3'
++)
++# The HUD move / resize hook (0113 v3): Pane::Calculate (main+0x909494, the vtable's
++# slot 19) recomputes every pane's global matrix and then its children's. TWO cuts
++# call the same hud_calc, because one cut misses static panes (see hud_calc.c):
++# the +0x13c cut (main+0x9095d0), where all paths converge after the pane's own
++# global matrix is final (the inline matrix at +0xc4, the helper at +0x13c's callers)
++# and before both child loops, so moving a container carries its children with it;
++# and the entry cut (main+0x9094b4), replacing the first instruction after the
++# prologue, so a pane whose Calculate takes the skip path (neither the parent
++# changed nor this pane is dirty: 0x9fd528 `tbz w10, #0, 0x9096c8` jumps over the
++# +0x13c site) is still hooked on every Calculate call.
++# Two things ride on them: the four HUD widgets (compass, life, coins, moons),
++# matched by pane name or by structure (a 'Counter' pane under a small RootPane
++# holding 'TxtTotalShine' / 'TxtCounterSh' / 'TxtLife'), moved / resized by the
++# gear menu's "HUD 设置"; and the full-screen layout roots (the PauseMenu settings
++# screen, the WorldMap map screen, any other full-screen layout), recognised
++# structurally (no parent pane, a full-screen size) and classified by their
++# subtree ('PicMapCap' = WorldMap, 'ParList00' / 'WinSelect' = PauseMenu): the
++# PauseMenu and the WorldMap roots are both stretched to the screen shape's layout
++# (the map's stretch has to land on the picture: the user said on 2026-11-11
++# 23:22 that it is not the map panel being cut, it is the picture BEHIND the map
++# that does not fill the screen -- the blurred game scene on the left of the map
++# screenshot is the unfilled strip -- and panning the map into the side black bars
++# stutters and leaves a residual image there, most likely a knock-on of the same
++# cause, the uncovered strip not being redrawn every frame; v3 fixes the fill
++# first and the next run decides whether the ghost is gone). The map's 3D part
++# (WorldMapCamera) is NOT handled here: a camera projection is not a Pane, and it
++# needs its own hook -- but it does not need one (see fix-0113-notes.md: the UW
++# scan found only the main camera's calcMatrix slot in the whole module, and the 3D
++# landmass keeps its proportions).
++# The instruction at the +0x13c site is `orr w22, wzr, #0x1` (w22 = 1, the flag the
++# children's Calculate calls take); x19 is the pane, x20 the DrawInfo, x21 the first
++# argument. w8 / w9 (the flags, read at the entry and used just after the site) are
++# live past it, so the +0x13c stub saves and restores x8 / x9; x0-x7 and x10-x18 are
++# dead there, the vector registers are reloaded after it, and x30 is restored from
++# the stack by the function's own epilogue, so the stub's bl is safe. At the entry
++# site the instruction is `ldrh w8, [x19, #0x58]` (the flags load); x19 is the pane
++# (set just before it), x1 / x2 are still live (they are copied to x21 / x20 after
++# the site), x3 is live (the force flag, used later), and x8 is dead (the load
++# itself writes it) -- so the entry stub saves x1, x2, x3 and x8 (x8 only so the
++# save is a pair), calls hud_calc, restores them, re-executes the load, and returns
++# to site+4. No runtime __TEXT write anywhere: the cuts are the rewriter's
++# load-time replacements, the duo_anchor pattern.
++def _hud_frame_step(ctx):
++    here, emit, fs_site, fs_put, FS_STATE_OFF = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state
++    hud_code = here()
++    hx = ''.join(HUD_WORDS)
++    for i in range(0, len(hx), 8):
++        emit(int(hx[i:i + 8], 16))
++    # The +0x13c cut: `orr w22, wzr, #0x1` at Pane::Calculate+0x13c (main+ offsets:
++    # fs_site/fs_put/B take IMG offsets, not DmIOS file offsets, which are +0xf4000).
++    fs_site(0x9095d0, 'f6030032')
++    start = here()
++    emit(STP_PRE(8, 9, 31, -16))              # stp x8, x9, [sp, #-0x10]! (the live flags)
++    emit(0xaa1303e0)                          # mov x0, x19 (the pane)
++    emit(ADRP(1, here(), FS_STATE_OFF)); emit(ADDI(1, 1, 0x200))   # x1 = state + 0x200 (params)
++    emit(ADRP(2, here(), FS_STATE_OFF)); emit(ADDI(2, 2, 0x300))   # x2 = state + 0x300 (table)
++    emit(ADRP(3, here(), FS_STATE_OFF + 0x1000))   # x3 = state + 0x1000 (log buffer; a page, so no add is needed)
++    emit(B(here(), hud_code) | 0x80000000)    # bl hud_calc
++    emit(LDP_POST(8, 9, 31, 16))              # ldp x8, x9, [sp], #0x10 (restore the flags)
++    emit(0x320003f6)                          # orr w22, wzr, #0x1 (the replaced instruction)
++    emit(B(here(), 0x9095d4))                 # back to the hook site + 4
++    fs_put(0x9095d0, [B(0x9095d0, start)], 'Pane::Calculate: a HUD widget moved / resized by the HUD settings, the PauseMenu and WorldMap roots stretched to the screen shape so their backgrounds fill it (hud_calc.c)')
++    # The entry cut: `ldrh w8, [x19, #0x58]` at Pane::Calculate+0x20, the first
++    # instruction after the prologue (x19 is the pane already; x1 / x2 are copied to
++    # x21 / x20 just after the site, x3 is the force flag, x8 is dead -- the load
++    # itself writes it). It runs hud_calc before any of the flag paths, so a static
++    # pane (the skip path over the +0x13c site) is hooked on every Calculate call.
++    fs_site(0x9094b4, '68b24079')
++    estart = here()
++    emit(STP_PRE(1, 2, 31, -16))              # stp x1, x2, [sp, #-0x10]! (live: copied after the site)
++    emit(STP_PRE(3, 8, 31, -16))              # stp x3, x8, [sp, #-0x10]! (x3 live: the force flag; x8 dead, saved as a pair)
++    emit(0xaa1303e0)                          # mov x0, x19 (the pane)
++    emit(ADRP(1, here(), FS_STATE_OFF)); emit(ADDI(1, 1, 0x200))   # x1 = state + 0x200 (params)
++    emit(ADRP(2, here(), FS_STATE_OFF)); emit(ADDI(2, 2, 0x300))   # x2 = state + 0x300 (table)
++    emit(ADRP(3, here(), FS_STATE_OFF + 0x1000))   # x3 = state + 0x1000 (log buffer; a page, so no add is needed)
++    emit(B(here(), hud_code) | 0x80000000)    # bl hud_calc
++    emit(LDP_POST(3, 8, 31, 16))              # ldp x3, x8, [sp], #0x10
++    emit(LDP_POST(1, 2, 31, 16))              # ldp x1, x2, [sp], #0x10
++    emit(0x7940b268)                          # ldrh w8, [x19, #0x58] (the replaced instruction)
++    emit(B(here(), 0x9094b8))                 # back to the hook site + 4
++    fs_put(0x9094b4, [B(0x9094b4, estart)], 'Pane::Calculate entry: the HUD / root hook, so static panes (which skip the +0x13c site) are hooked too (hud_calc.c)')
++
++FRAME_STEP = {BUILD_141: _hud_frame_step}
++
++BINDING = [
++    {'what': "HUD move / resize and full-screen UI, v3 (the gear menu's HUD settings, hud_calc.c: entry + 0x13c cuts, structural counter matching, PauseMenu/WorldMap root classification)", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
++     'why': "Pane::Calculate and the pane layout are this build's nn::ui2d code, found by the HUDLOG diagnostic run (log-17) and confirmed by disassembly of DmIOS; the v3 cuts and matchers are the answer to the V1.3.9 log-18 run (see fix-0113v3-notes.md)",
++     'blocked': 'the stubs have no function-matched form yet'},
++]
+diff --git a/dm/host/Makefile b/dm/host/Makefile
+index 928ad55..f8e274c 100644
+--- a/dm/host/Makefile
++++ b/dm/host/Makefile
+@@ -20,7 +20,7 @@ GAME_H = gen/$(GAME)/game_profile.h
+ include ../mac/min_os.mk
+ CFLAGS=-O1 -g -Wall -Wno-unused-function -mmacosx-version-min=$(MACOS_MIN)
+ # Service-layer takeover hle_*.c files are included by wildcard: adding a file does not touch this line (avoids merge conflicts)
+-SRC=main.c loader.c uw.c hle.c crash.c probe.c thread.c save_sync.c memstat.m haptics_apple.m $(sort $(wildcard hle_*.c)) front_mac.m controllers_mac.m web_apple.m entry.S
++SRC=main.c loader.c uw.c hud.c hle.c crash.c probe.c thread.c save_sync.c memstat.m haptics_apple.m $(sort $(wildcard hle_*.c)) front_mac.m controllers_mac.m web_apple.m entry.S
+ # NVN null device + nn::vi + the Vulkan layer (dm/gfx/)
+ # Sources under dm/gfx, dm/gfx/nvn, dm/gfx/tex, dm/gfx/vk and dm/gfx/gl are included by wildcard (tests/ and metal/ do not go into the host): adding a file does not touch this line
+ GFX=$(sort $(wildcard ../gfx/*.c ../gfx/nvn/*.c ../gfx/nvn/*.m ../gfx/nvn/*.S ../gfx/tex/*.c ../gfx/tex/*.m ../gfx/vk/*.m ../gfx/gl/*.m))
+diff --git a/dm/host/hud.c b/dm/host/hud.c
+new file mode 100644
+index 0000000..04c156c
+--- /dev/null
++++ b/dm/host/hud.c
+@@ -0,0 +1,128 @@
++// hud.c — The HUD editor's host side (see hud.h). The settings and the root
++// scale live in the frame step state page; the rewriter stub (hud_calc.c,
++// called from Pane::Calculate) reads them every frame. Nothing here writes game
++// code: the stub is a load-time rewriter cut (patches.py), and this file only
++// writes the state page's data.
++#include "hud.h"
++#include "dm.h"    // LOG
++#include "hle.h"   // dm_fps_state
++#include <math.h>
++#include <stdatomic.h>
++#include <stdlib.h>
++#include <string.h>
++
++// The HUD block in the frame step state page (patches.py, hud_calc.c):
++//   +0x200: 12 floats, per element (dx, dy, k): compass, life, coins, moons
++//   +0x200+48: u32 generation, bumped on every settings write
++//   +0x200+52: float root_sx, +0x200+56: float root_sy (the full-screen roots'
++//     stretch to the screen shape, from DM_SCREEN_ASPECT)
++//   +0x300: the HUD table (4 x 120 bytes, one per element, hud_calc's working copy)
++//   +0x500: the root table (20 x 120 bytes, one per full-screen root)
++//   +0x1000: the log buffer: u32 count, then 160 entries of 64 bytes
++//     (name[24], tx, ty, w, h, matched u32, address u64, g0, g5, flags u16,
++//     origin u8, class u8). The buffer fits the frame step state's reserved
++//     0x4000 bytes (160 x 64 + 4 = 10244 < 0x3000); loader.c's own fields end
++//     below +0x200, so there is no overlap.
++#define HUD_PARAMS_OFF   0x200
++#define HUD_GEN_OFF      (HUD_PARAMS_OFF + 48)
++#define HUD_ROOT_SX_OFF  (HUD_PARAMS_OFF + 52)
++#define HUD_ROOT_SY_OFF  (HUD_PARAMS_OFF + 56)
++#define HUD_LOG_OFF      0x1000
++#define HUD_LOG_ENTRY    64
++#define HUD_LOG_MAX      160
++
++#define HUD_LOG(...) LOG("[hud] " __VA_ARGS__)
++
++static float g_hud_dx[DM_HUD_N], g_hud_dy[DM_HUD_N], g_hud_k[DM_HUD_N] = {1, 1, 1, 1};   // the editor's settings, in layout points (1280x720 space)
++static uint32_t g_hud_gen;          // bumped on every settings write (the stub recomputes when it changes)
++static _Atomic int g_hud_dirty;     // the state page still needs the settings
++static float g_root_sx = 1, g_root_sy = 1;   // the root scale as last written to the state page
++static uint64_t g_hud_frames;       // presents since launch (the log buffer drains every 60)
++static uint32_t g_log_drained;      // log entries already copied to log.txt
++static int g_hud_started;           // the first write has been logged
++
++static float hud_clamp_k(float k) { if (!(k > 0)) return 1; return fminf(fmaxf(k, 0.2f), 3.0f); }
++static float hud_clamp_dx(float dx) { return fminf(fmaxf(dx, -640.0f), 640.0f); }
++static float hud_clamp_dy(float dy) { return fminf(fmaxf(dy, -360.0f), 360.0f); }
++
++// The screen shape's layout, from DM_SCREEN_ASPECT, loader.c dm_fps_state_apply's
++// exact formulas (resolved at frame time, after the front end has resolved "auto"
++// to the screen's shape): wider than 16:9 keeps the height (720) and takes the
++// width that gives the ratio (2.167 -> 1560 wide); taller keeps the width (1280)
++// and takes the height (1.43 -> 896 tall); 16:9, "0", "auto" or a bad value keeps
++// 1280x720. Returns the root scale (layout / 1280, layout / 720).
++static void hud_root_scale(float *sx, float *sy) {
++    *sx = 1; *sy = 1;
++    const char *as = getenv("DM_SCREEN_ASPECT");
++    if (!as || !*as || !strcmp(as, "0") || !strcmp(as, "auto")) return;
++    char *end; float a = strtof(as, &end);
++    if (end == as || *end || !(a >= 1.3f && a <= 2.2f)) return;
++    if (a > 1.78f) { uint32_t lw = (uint32_t)(720.0f * a + 0.5f); *sx = (float)lw / 1280.0f; }
++    else if (a < 1.77f) { uint32_t oh = (uint32_t)(1920.0f / a / 48.0f + 0.5f) * 48, lh = oh * 2 / 3; *sy = (float)lh / 720.0f; }
++}
++
++void dm_hud_set(int elem, float dx, float dy, float k) {
++    if (elem < 0 || elem >= DM_HUD_N) return;
++    dx = hud_clamp_dx(dx); dy = hud_clamp_dy(dy); k = hud_clamp_k(k);
++    if (g_hud_dx[elem] == dx && g_hud_dy[elem] == dy && g_hud_k[elem] == k) return;
++    g_hud_dx[elem] = dx; g_hud_dy[elem] = dy; g_hud_k[elem] = k;
++    g_hud_gen++;
++    atomic_store(&g_hud_dirty, 1);
++}
++
++// Drain the log buffer (state +0x1000) into log.txt: each entry is a pane the
++// stub saw (a HUD panel, a full-screen root, or a top-strip pane it logged for
++// identification), with its name, global position and size, and which rule
++// matched it. Only new entries are copied (g_log_drained); the stub dedupes by
++// pane, so it never re-logs one, and the buffer is never reset -- a reset would
++// make the stub log the same panes again.
++static void hud_log_drain(void) {
++    uint8_t *st = dm_fps_state;
++    if (!st) return;
++    uint32_t n; memcpy(&n, st + HUD_LOG_OFF, 4);
++    if (n > HUD_LOG_MAX) n = HUD_LOG_MAX;
++    if (n <= g_log_drained) return;   // nothing new
++    for (uint32_t i = g_log_drained; i < n; i++) {
++        uint8_t *e = st + HUD_LOG_OFF + 4 + i * HUD_LOG_ENTRY;
++        char name[25]; memcpy(name, e, 24); name[24] = 0;
++        float tx, ty, w, h; memcpy(&tx, e + 24, 4); memcpy(&ty, e + 28, 4); memcpy(&w, e + 32, 4); memcpy(&h, e + 36, 4);
++        uint32_t matched; memcpy(&matched, e + 40, 4);
++        uint64_t addr; memcpy(&addr, e + 44, 8);
++        float g0, g5; memcpy(&g0, e + 52, 4); memcpy(&g5, e + 56, 4);
++        uint16_t pflags; memcpy(&pflags, e + 60, 2);
++        unsigned origin = e[62], cls = e[63];
++        const char *clsname = cls == 1 ? " (pause menu)" : cls == 2 ? " (world map)" : "";
++        if (matched == 0xffffffffu) HUD_LOG("pane '%s' at %p: %.0fx%.0f at (%.0f,%.0f), top strip (not matched)", name, (void *)addr, w, h, tx, ty);
++        else if (matched == 0xfffffffeu || matched == 0xfffffffdu || matched == 0xfffffffcu)
++            HUD_LOG("pane '%s' at %p: %.0fx%.0f at (%.0f,%.0f), full-screen root%s, matrix scale %.3f/%.3f, flags %#x, origin %#x", name, (void *)addr, w, h, tx, ty, clsname, g0, g5, pflags, origin);
++        else if (matched == 0xfffffffbu || matched == 0xfffffffa || matched == 0xfffffff9u)
++            HUD_LOG("pane '%s' at %p: %.0fx%.0f at (%.0f,%.0f), full-screen root%s SCALED (matrix %.3f/%.3f)", name, (void *)addr, w, h, tx, ty, clsname, g0, g5);
++        else if (matched < (uint32_t)DM_HUD_N) HUD_LOG("pane '%s' at %p: %.0fx%.0f at (%.0f,%.0f), HUD element %u", name, (void *)addr, w, h, tx, ty, matched);
++        else HUD_LOG("pane '%s' at %p: %.0fx%.0f at (%.0f,%.0f), matched %#x", name, (void *)addr, w, h, tx, ty, matched);
++    }
++    g_log_drained = n;
++}
++
++void dm_hud_frame_tick(void) {
++    uint8_t *st = dm_fps_state;
++    if (!st) return;
++    g_hud_frames++;
++    float sx, sy; hud_root_scale(&sx, &sy);
++    float old_sx = g_root_sx, old_sy = g_root_sy;
++    int dirty = atomic_load(&g_hud_dirty);
++    if (dirty || sx != g_root_sx || sy != g_root_sy) {
++        // Write the whole params block: the four elements, the generation, and
++        // the root scale. The generation bumps when the settings changed, so the
++        // stub recomputes even on a frame the game did not recompute the matrix.
++        float params[12];
++        for (int i = 0; i < DM_HUD_N; i++) { params[i*3] = g_hud_dx[i]; params[i*3+1] = g_hud_dy[i]; params[i*3+2] = g_hud_k[i]; }
++        memcpy(st + HUD_PARAMS_OFF, params, sizeof params);
++        memcpy(st + HUD_GEN_OFF, &g_hud_gen, 4);
++        memcpy(st + HUD_ROOT_SX_OFF, &sx, 4); memcpy(st + HUD_ROOT_SY_OFF, &sy, 4);
++        g_root_sx = sx; g_root_sy = sy;
++        atomic_store(&g_hud_dirty, 0);
++        if (!g_hud_started) { HUD_LOG("HUD ready: state page at %p, root scale %.3fx%.3f (DM_SCREEN_ASPECT=%s)", (void *)st, sx, sy, getenv("DM_SCREEN_ASPECT") ?: "(unset)"); g_hud_started = 1; }
++        else if (sx != old_sx || sy != old_sy) HUD_LOG("HUD root scale changed to %.3fx%.3f", sx, sy);
++    }
++    if ((g_hud_frames % 60) == 0) hud_log_drain();   // once a second: new panes only
++}
+diff --git a/dm/host/hud.h b/dm/host/hud.h
+new file mode 100644
+index 0000000..d2d1519
+--- /dev/null
++++ b/dm/host/hud.h
+@@ -0,0 +1,48 @@
++// hud.h — The HUD editor: the gear menu's "HUD 设置" (DmGamepad.m) moves and
++// resizes the game's HUD panels (compass, life, coins, moons) and stretches the
++// full-screen layout roots (the PauseMenu settings screen, the WorldMap map
++// screen) to the screen's shape, through the rewriter stub in
++// dm/games/0100000000010000/patches.py (which calls hud_calc in hud_calc.c,
++// hooked into Pane::Calculate at load time, at both its entry and its +0x13c
++// site). The settings live in the frame step state page (+0x200), written by
++// dm_hud_set and applied by dm_hud_frame_tick, called once per present from
++// uw_frame_hook. The stub's log buffer (state +0x1000, 160 entries of 64 bytes:
++// name, position, size, matched code, address, matrix scale, flags, origin,
++// root class) is drained into log.txt by dm_hud_frame_tick.
++#ifndef DM_HOST_HUD_H
++#define DM_HOST_HUD_H
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// The four HUD panels, in hud_calc.c's order. 1 (life) is matched structurally
++// in v3 (a 'Counter' pane holding a 'TxtLife' text, under a small RootPane),
++// as are 2 (coins, 'TxtCounterSh') and 3 (moons, 'TxtTotalShine'); 0 (compass)
++// has no locked pane name yet (see fix-0113v3-notes.md): its settings are stored
++// and pushed, but no pane matches them until the name is locked from the V1.3.10
++// log. The v1 actor names (CompassArea / CoinCounter / MoonNum) are kept in
++// hud_calc.c as an unproven fallback.
++enum { DM_HUD_COMPASS = 0, DM_HUD_LIFE = 1, DM_HUD_COINS = 2, DM_HUD_MOONS = 3, DM_HUD_N = 4 };
++
++// Move / resize one HUD panel, live: dx, dy are layout points (the 1280x720
++// space), k the panel's size (1 = the game's own). Clamped to dx/dy ±640/±360,
++// k 0.2 to 3.0 (0 or NaN = 1). Stored in the host and written to the state page
++// by dm_hud_frame_tick; safe to call before the state page exists (the settings
++// wait for it). Called by the HUD editor (DmGamepad.m) on every drag and slider
++// change, and once per panel at launch to restore the saved layout.
++void dm_hud_set(int elem, float dx, float dy, float k);
++
++// Once per present: refreshes the root scale from DM_SCREEN_ASPECT (loader.c
++// dm_fps_state_apply's exact formulas, resolved at frame time, after the front
++// end has resolved "auto"), writes the settings to the state page when they
++// changed, and drains the log buffer (state +0x1000) into log.txt. Call from
++// uw_frame_hook, after uw_direct_write. A no-op when the build has no state page.
++void dm_hud_frame_tick(void);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/dm/host/uw.c b/dm/host/uw.c
+index 13b273d..890d23d 100644
+--- a/dm/host/uw.c
++++ b/dm/host/uw.c
+@@ -3,6 +3,7 @@
+ #include "uw.h"
+ #include "dm.h"
+ #include "front.h"   // front_display_pixels: the display in pixels, for DM_ASPECT=auto (0099)
++#include "hud.h"     // dm_hud_frame_tick: the HUD editor's settings, once per present (0113)
+ #include <math.h>
+ #include <mach/mach.h>   // vm_region_64: query a page's real protection before restoring it (0101)
+ #include <stdatomic.h>
+@@ -732,6 +733,7 @@ void uw_frame_hook(double w, double h) {
+     }
+     uw_update_from_size(w, h);
+     uw_direct_write();
++    dm_hud_frame_tick();   // (0113) the HUD editor's settings and the full-screen roots' scale, once per present; a no-op when the build has no state page
+ }
+ 
+ float uw_effective_aspect(float in) {
+diff --git a/dm/ios/Sources/DmGameMenu.h b/dm/ios/Sources/DmGameMenu.h
+index 7c2b320..3a623e2 100644
+--- a/dm/ios/Sources/DmGameMenu.h
++++ b/dm/ios/Sources/DmGameMenu.h
+@@ -11,6 +11,7 @@ int dm_pad_layout(void);   // DmGamepad.m: 0 = 2D, 1 = 3D, 2 = Tap (DM_GAME_PAD_
+ bool dm_pad_layout_offered(int layout);   // Tap only in handheld mode
+ void dm_pad_layout_set(int layout);   // releases every touch first, and is saved for the next start
+ void dm_gamepad_open_pad_settings(void);   // DmGamepad.m: the in-game menu's "按键设置" (button settings) opens the button editor
++void dm_gamepad_open_hud_settings(void);   // DmGamepad.m: the in-game menu's "HUD 设置" (HUD settings) opens the HUD editor
+ void dm_gamepad_touch_feedback(bool on);   // DM_TOUCH_HAPTICS
+ bool dm_setting_live(const char *env, const char *value);
+ void *dm_quit_menu(void);   // front_ios.m: the menu's last item, Quit <game>, which opens the quit prompt (a retained UIMenu, shown inline)   // front_ios.m: value NULL asks whether the running game takes env at once; otherwise applies it
+diff --git a/dm/ios/Sources/DmGamepad.m b/dm/ios/Sources/DmGamepad.m
+index ae297c5..b14477b 100644
+--- a/dm/ios/Sources/DmGamepad.m
++++ b/dm/ios/Sources/DmGamepad.m
+@@ -13,6 +13,7 @@
+ //     then in 3D the right stick for a touch in the right third. X, ZR, R, L3, R3 and the D-pad are hidden and disabled: a touch on one of them falls through to the floating stick (left half) or the right stick (right third) instead.
+ //   The player can move single controls in the shell's settings (DM_TOUCH_LAYOUT, one arrangement per layout): the geometry places each only where it fits and keeps the rest where they were.
+ //   The in-game menu's "按键设置" (button settings) opens a panel above the game: tapping an icon selects it, a slider for the selected icon's own size and dragging the icons to move them, saved per icon in NSUserDefaults (DmPadLineLayout) so it survives a restart. See "The line skin" below.
++//   The in-game menu's "HUD 设置" (HUD settings) opens a panel above the game: picking a HUD panel (指南针 / 生命值 / 金币 / 月亮）, a slider for the selected panel's own size and dragging on the screen to move it, saved per panel in NSUserDefaults (DmHudLayout) so it survives a restart, live through dm_hud_set (hud.c) into the rewriter stub in Pane::Calculate (0113). The life panel has no locked pane name yet, so its settings are stored but change nothing until the name is locked from the V1.3.9 log.
+ //   Everything hugs the edges and corners to leave the picture room; each control is one
+ //   image layer (dm/ios/Sources/PadIcons/pad_line_*.png, the line set, bundled as resources):
+ //   the artwork never changes on press (no pressed state), only the left stick's knob moves,
+@@ -34,6 +35,7 @@
+ #include "dm.h"
+ #include "dm_input.h"
+ #include "front.h"
++#include "hud.h"   // dm_hud_set: the HUD editor's settings, live into the 0113 stub
+ #include "game_profile.h"
+ #include "haptics_apple.h"
+ #include "motion_apple.h"
+@@ -51,6 +53,8 @@ enum { E_A = 0, E_B, E_Y, E_ZL, E_L, E_MINUS, E_PLUS, E_JUMP, E_PHOTO, E_N };
+ enum { G_A = 0, G_B, G_Y, G_ZL, G_L, G_PLUS, G_MINUS, G_JUMP, G_PHOTO, G_MENU, G_N };   // the controls with a glass disc behind them (0111)
+ static NSString *const k_lineEditKeys[E_N] = {@"a", @"b", @"y", @"zl", @"l", @"minus", @"plus", @"jump", @"photo"};   // the NSUserDefaults offsets' keys
+ static NSString *const k_lineEditNames[E_N] = {@"A键", @"B键", @"攻击键", @"撞地键", @"视角键", @"+键", @"−键", @"跳跃键", @"拍照键"};   // the editor's name for the selected icon
++static NSString *const k_hudEditKeys[4] = {@"compass", @"life", @"coins", @"moons"};   // the HUD editor's NSUserDefaults keys (the order is hud_calc.c's: 0 compass, 1 life, 2 coins, 3 moons)
++static NSString *const k_hudEditNames[4] = {@"指南针", @"生命值", @"金币", @"月亮"};   // the editor's name for the selected HUD panel
+ enum { C_NONE = 0, C_STICK, C_DPAD, C_FACE, C_BTN, C_GAME };   // which control a touch holds; C_GAME: none, the touch goes to the game's touch screen (finger slot << 8)
+ 
+ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+@@ -177,6 +181,11 @@ static void pads_start(void);   // Physical controllers, below
+     BOOL _editing;                                 // the button editor is open: touches drag controls instead of pressing them
+     UIView *_editBar; UISlider *_editSlider;       // the editor's bar: the size slider, hint and Done
+     UITouch *_editTouch; int _editControl; CGPoint _editGrab, _editBase;   // the control being dragged and where its drag started
++    float _hudDx[4], _hudDy[4], _hudK[4];          // the HUD panels' move / resize (layout points, the 1280x720 space, y up, origin at the screen's centre; 1 = the game's size), NSUserDefaults DmHudLayout
++    int _hudSelected;                              // the HUD panel the size slider tunes (0 compass, 1 life, 2 coins, 3 moons; compass by default)
++    BOOL _hudEditing;                              // the HUD editor is open: touches drag the selected panel instead of pressing keys
++    UIView *_hudEditBar; UISlider *_hudSlider; UISegmentedControl *_hudPicker;   // the editor's bar: the panel picker, the size slider, hint, Reset and Done
++    UITouch *_hudEditTouch; CGPoint _hudEditGrab, _hudEditBase;   // the drag: where the finger landed and the panel's offset at the drag's start
+     DmPadGeo _geoLine;                             // the geometry with the editor's size and drag offsets applied
+     CALayer *_hint; CATextLayer *_hintText; NSString *_hintWords;   // the 3D layout's right-stick hint: words only, once per launch (see "The right-stick hint")
+     DmMenuButton *_menu;                           // opens the in-game menu (GameMenu.swift)
+@@ -312,6 +321,7 @@ static void glassDiscLayout(CAGradientLayer *disc, CGRect frame) {   // the disc
+         }
+         _owner = [NSMapTable strongToStrongObjectsMapTable]; _faceOf = [NSMapTable strongToStrongObjectsMapTable];
+         [self loadLineLayout];   // the editor's stored size and drag offsets, or the built-in layout
++        [self loadHudLayout];   // the HUD editor's stored move / resize, or the game's own HUD
+         static dispatch_once_t once;
+         dispatch_once(&once, ^{
+             // each colour carries its own low opacity instead of lowering the whole view's alpha (that would add an off-screen pass for the full-screen layer)
+@@ -340,6 +350,7 @@ static void glassDiscLayout(CAGradientLayer *disc, CGRect frame) {   // the disc
+         _jump = padLayer(_controls, padImage(@"pad_line_jump"));   // the extra buttons: jump (B) and photo (D-pad down)
+         _photo = padLayer(_controls, padImage(@"pad_line_photo"));
+         [self buildEditBar];   // the button editor's bar (hidden until the in-game menu opens it)
++        [self buildHudEditBar];   // the HUD editor's bar (hidden until the in-game menu opens it)
+         _menu = [DmMenuButton buttonWithType:UIButtonTypeCustom];
+         _menu.backgroundColor = UIColor.clearColor;
+         [_menu setBackgroundImage:padUIImage(@"pad_line_menu") forState:UIControlStateNormal];   // the line circle + gear, scaled to the button
+@@ -554,6 +565,7 @@ int front_web_touch(void);
+         CGPoint p = [t locationInView:self];
+         if (_layout.separated && !CGRectContainsPoint(_layout.controls, p)) { game |= [self gameBegin:t]; continue; }
+         if (_editing) { [self editTouchBegan:t at:p]; continue; }   // the button editor: touches drag controls, not press them
++        if (_hudEditing) { [self hudEditTouchBegan:t at:p]; continue; }   // the HUD editor: touches drag the selected HUD panel, not press keys
+         if (!_tap) {   // the extra buttons take their touches first: jump (B) and photo (D-pad down)
+             int extra = [self extraButtonAt:p];
+             if (extra == 1) { [_owner setObject:@(C_BTN | (uint64_t)B_B << 8) forKey:t]; continue; }
+@@ -581,6 +593,7 @@ int front_web_touch(void);
+     for (UITouch *t in ts) {
+         uint64_t v = [_owner objectForKey:t].unsignedLongLongValue; int c = (int)(v & 0xff); CGPoint p = [t locationInView:self];
+         if (_editing) { [self editTouchMoved:t to:p]; continue; }
++        if (_hudEditing) { [self hudEditTouchMoved:t to:p]; continue; }
+         if (c == C_FACE) [_faceOf setObject:@([self faceAt:p]) forKey:t];
+         else if (c == C_STICK) { _stickNow[v >> 8] = p;
+             if ((v >> 8) == 1) { CGFloat d = dist(p, _rCentre), R = [self stickR:1];   // the right stick's centre follows a finger past its radius, so turning back responds at once
+@@ -596,6 +609,7 @@ int front_web_touch(void);
+     BOOL game = NO;
+     for (UITouch *t in ts) {
+         if (_editing && t == _editTouch) { _editTouch = nil; [self saveLineLayout]; continue; }   // the editor: a drag ends by saving the layout
++        if (_hudEditing && t == _hudEditTouch) { _hudEditTouch = nil; [self saveHudLayout]; continue; }   // the HUD editor: a drag ends by saving the layout
+         uint64_t v = [_owner objectForKey:t].unsignedLongLongValue;
+         if ((v & 0xff) == C_GAME && (v >> 8) < 16) { _game[v >> 8] = nil; game = YES; }
+         [_owner removeObjectForKey:t]; [_faceOf removeObjectForKey:t]; for (int i = 0; i < 2; i++) if (t == _stick[i]) _stick[i] = nil;
+@@ -605,7 +619,7 @@ int front_web_touch(void);
+ }
+ - (void)touchesEnded:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self endTouches:ts tapped:YES]; }
+ - (void)touchesCancelled:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self endTouches:ts tapped:NO]; }
+-- (void)reset { if (_editing && _editTouch) [self saveLineLayout]; _editTouch = nil; [_owner removeAllObjects]; [_faceOf removeAllObjects]; _stick[0] = _stick[1] = nil; for (int i = 0; i < 16; i++) _game[i] = nil; [self pushGame]; [self recompute]; }   // a layout change (rotation, a controller) ends an editor drag: its offset is saved first
++- (void)reset { if (_editing && _editTouch) [self saveLineLayout]; _editTouch = nil; if (_hudEditing && _hudEditTouch) [self saveHudLayout]; _hudEditTouch = nil; [_owner removeAllObjects]; [_faceOf removeAllObjects]; _stick[0] = _stick[1] = nil; for (int i = 0; i < 16; i++) _game[i] = nil; [self pushGame]; [self recompute]; }   // a layout change (rotation, a controller) ends an editor drag: its offset is saved first
+ 
+ // ---- Frames (the image layers are placed on the geometry; the artwork fills only
+ // `fill` of its canvas, so the frame is the bounding box grown by 1/fill) ----
+@@ -649,6 +663,7 @@ static CGRect growRect(CGRect r, CGFloat fill) {   // grow a rect about its cent
+     [CATransaction commit];
+     [self placeHint];
+     [self layoutEditBar];
++    [self layoutHudEditBar];
+     [self layoutEditHighlight];
+     [self refresh];
+ }
+@@ -820,6 +835,35 @@ static NSString *const k_line_layout_key = @"DmPadLineLayout";
+     [NSUserDefaults.standardUserDefaults setObject:d forKey:k_line_layout_key];
+ }
+ 
++// The HUD editor's stored layout: NSUserDefaults DmHudLayout, {"elements": {name:
++// {"dx": NSNumber, "dy": NSNumber, "scale": NSNumber}}}. The offsets are layout
++// points (the 1280x720 space, y up, the origin at the screen's centre), the scale
++// 1 is the game's own size. Loading pushes every panel to the host (dm_hud_set),
++// so the saved layout applies from the first frame, before the editor opens; the
++// host keeps the settings until the state page exists (hud.c).
++static NSString *const k_hud_layout_key = @"DmHudLayout";
++- (void)loadHudLayout {
++    for (int e = 0; e < 4; e++) { _hudDx[e] = 0; _hudDy[e] = 0; _hudK[e] = 1; }   // fresh: every panel where the game puts it, at its own size
++    NSDictionary *d = [NSUserDefaults.standardUserDefaults dictionaryForKey:k_hud_layout_key];
++    if (![d isKindOfClass:[NSDictionary class]]) return;
++    NSDictionary *el = d[@"elements"];
++    if (![el isKindOfClass:[NSDictionary class]]) return;
++    for (int e = 0; e < 4; e++) {
++        NSDictionary *v = el[k_hudEditKeys[e]];
++        if (![v isKindOfClass:[NSDictionary class]]) continue;
++        NSNumber *dx = v[@"dx"], *dy = v[@"dy"], *k = v[@"scale"];
++        if ([dx isKindOfClass:[NSNumber class]]) _hudDx[e] = fmin(fmax(dx.doubleValue, -640), 640);
++        if ([dy isKindOfClass:[NSNumber class]]) _hudDy[e] = fmin(fmax(dy.doubleValue, -360), 360);
++        if ([k isKindOfClass:[NSNumber class]]) _hudK[e] = fmin(fmax(k.doubleValue, 0.5), 2.0);   // the slider's range (the host clamps wider, 0.2 to 3.0)
++    }
++    for (int e = 0; e < 4; e++) dm_hud_set(e, _hudDx[e], _hudDy[e], _hudK[e]);
++}
++- (void)saveHudLayout {
++    NSMutableDictionary *el = [NSMutableDictionary dictionary];
++    for (int e = 0; e < 4; e++) el[k_hudEditKeys[e]] = @{@"dx": @(_hudDx[e]), @"dy": @(_hudDy[e]), @"scale": @(_hudK[e])};
++    [NSUserDefaults.standardUserDefaults setObject:@{@"elements": el} forKey:k_hud_layout_key];
++}
++
+ // The button editor: a bar at the top (title, the size slider, Done, and a hint), and dragging
+ // the icons. While it is open, touches drag controls instead of pressing them; tapping an icon
+ // selects it (a ring around it, its name in the hint line) and the slider tunes that icon's
+@@ -973,6 +1017,120 @@ static NSString *const k_line_layout_key = @"DmPadLineLayout";
+     [self setNeedsLayout];
+ }
+ 
++// The HUD editor: a bar at the top (title, the panel picker, the size slider, Reset, Done, and a hint), and dragging on the screen to move the selected panel. While it is open, touches drag the selected HUD panel instead of pressing keys; the game keeps running behind it. The text is Chinese: the user asked for the settings panel in Chinese (the rest of the repository is English).
++// The panels are drawn by the game, not by this view, so they cannot be tapped to select them: the picker (a segmented control) selects the panel, the slider tunes that panel's own size, and dragging anywhere on the screen moves it. The drag's y is negated: the screen's y runs down, the layout's y runs up (the layout space is y-up, its origin at the screen's centre, hud_calc.c), so dragging down the screen is a negative dy.
++- (void)buildHudEditBar {
++    _hudEditBar = [[UIView alloc] init];
++    _hudEditBar.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
++    _hudEditBar.layer.cornerRadius = 10;
++    _hudEditBar.hidden = YES;
++    UILabel *title = [[UILabel alloc] init]; title.tag = 311;
++    title.text = @"HUD 设置"; title.textColor = UIColor.whiteColor; title.font = [UIFont boldSystemFontOfSize:15]; title.textAlignment = NSTextAlignmentCenter;
++    [_hudEditBar addSubview:title];
++    _hudPicker = [[UISegmentedControl alloc] initWithItems:@[k_hudEditNames[0], k_hudEditNames[1], k_hudEditNames[2], k_hudEditNames[3]]];
++    _hudPicker.tag = 312;
++    _hudPicker.selectedSegmentIndex = 0;
++    [_hudPicker addTarget:self action:@selector(hudPickerChanged:) forControlEvents:UIControlEventValueChanged];
++    [_hudEditBar addSubview:_hudPicker];
++    UILabel *size = [[UILabel alloc] init]; size.tag = 313;
++    size.text = @"大小"; size.textColor = UIColor.whiteColor; size.font = [UIFont systemFontOfSize:13]; size.textAlignment = NSTextAlignmentRight;
++    [_hudEditBar addSubview:size];
++    _hudSlider = [[UISlider alloc] init];
++    _hudSlider.minimumValue = 0.5; _hudSlider.maximumValue = 2.0; _hudSlider.value = _hudK[0];   // compass is selected by default (openHudSettings)
++    [_hudSlider addTarget:self action:@selector(hudSliderChanged:) forControlEvents:UIControlEventValueChanged];
++    [_hudSlider addTarget:self action:@selector(hudSliderDone:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside];
++    [_hudEditBar addSubview:_hudSlider];
++    UIButton *reset = [UIButton buttonWithType:UIButtonTypeSystem]; reset.tag = 314;
++    [reset setTitle:@"重置" forState:UIControlStateNormal]; reset.titleLabel.font = [UIFont systemFontOfSize:14];
++    [reset addTarget:self action:@selector(hudReset:) forControlEvents:UIControlEventTouchUpInside];
++    [_hudEditBar addSubview:reset];
++    UIButton *done = [UIButton buttonWithType:UIButtonTypeSystem]; done.tag = 315;
++    [done setTitle:@"完成" forState:UIControlStateNormal]; done.titleLabel.font = [UIFont boldSystemFontOfSize:15];
++    [done addTarget:self action:@selector(closeHudSettings) forControlEvents:UIControlEventTouchUpInside];
++    [_hudEditBar addSubview:done];
++    UILabel *hint = [[UILabel alloc] init]; hint.tag = 316;
++    hint.text = @"拖动屏幕可以移动位置"; hint.textColor = UIColor.whiteColor; hint.font = [UIFont systemFontOfSize:12]; hint.textAlignment = NSTextAlignmentCenter;
++    [_hudEditBar addSubview:hint];
++    [self addSubview:_hudEditBar];
++}
++- (void)layoutHudEditBar {   // the bar's three rows (title + picker + Reset + Done; size label + slider; hint), centred at the top
++    if (!_hudEditBar) return;
++    CGFloat w = fmin(self.bounds.size.width * 0.9, 560), h = 92;
++    _hudEditBar.frame = CGRectMake((self.bounds.size.width - w) / 2, self.safeAreaInsets.top + 8, w, h);
++    CGFloat doneW = 48, resetW = 44, pickerW = fmin(200, w * 0.36);
++    UIView *title = [_hudEditBar viewWithTag:311]; title.frame = CGRectMake(12, 8, 80, 24);
++    _hudPicker.frame = CGRectMake(100, 8, pickerW, 24);
++    UIView *reset = [_hudEditBar viewWithTag:314]; reset.frame = CGRectMake(w - doneW - resetW - 24, 8, resetW, 24);
++    UIView *done = [_hudEditBar viewWithTag:315]; done.frame = CGRectMake(w - doneW - 12, 8, doneW, 24);
++    UIView *size = [_hudEditBar viewWithTag:313]; size.frame = CGRectMake(12, 38, 32, 20);
++    _hudSlider.frame = CGRectMake(48, 40, w - 48 - 12, 20);
++    UIView *hint = [_hudEditBar viewWithTag:316]; hint.frame = CGRectMake(0, 66, w, 18);
++}
++- (void)openHudSettings {   // the in-game menu's "HUD 设置": hide the gear (it cannot be tapped now), show the editor
++    if (_padOff || _hudEditing || _editing) return;
++    [self reset];   // release every key and touch first, as the menu does
++    _hudEditing = YES;
++    [self updateControlVisibility];
++    _hudEditBar.hidden = NO;
++    [self hudSelectPanel:0];   // compass is selected by default, so the slider always has a target
++    [self setNeedsLayout];
++}
++- (void)closeHudSettings {   // Done: save the layout and go back to playing
++    if (!_hudEditing) return;
++    _hudEditing = NO;
++    _hudEditTouch = nil;
++    [self saveHudLayout];
++    [self updateControlVisibility];
++    _hudEditBar.hidden = YES;
++    [self setNeedsLayout];
++}
++- (void)hudPickerChanged:(UISegmentedControl *)c { [self hudSelectPanel:(int)c.selectedSegmentIndex]; }   // the picker: the panel the slider tunes
++- (void)hudSelectPanel:(int)e {   // pick a HUD panel: the slider shows its size, the hint its name
++    if (e < 0 || e >= 4) return;
++    _hudSelected = e;
++    _hudPicker.selectedSegmentIndex = e;
++    _hudSlider.value = _hudK[e];
++    [self hudUpdateHint];
++}
++- (void)hudUpdateHint {   // the hint line: the selected panel, its offset in layout points, and the life panel's caveat
++    UILabel *hint = (UILabel *)[_hudEditBar viewWithTag:316];
++    if (!hint) return;
++    NSString *note = _hudSelected == 1 ? @"（面板位置还在确认，改了暂不生效）" : @"";
++    hint.text = [NSString stringWithFormat:@"当前：%@ · 位置 (%+.0f, %+.0f) · 拖动屏幕可以移动位置%@", k_hudEditNames[_hudSelected], _hudDx[_hudSelected], _hudDy[_hudSelected], note];
++}
++- (void)hudSliderChanged:(UISlider *)s {   // the size slider: resize the selected panel only, live
++    _hudK[_hudSelected] = s.value;
++    dm_hud_set(_hudSelected, _hudDx[_hudSelected], _hudDy[_hudSelected], _hudK[_hudSelected]);
++    [self hudUpdateHint];
++}
++- (void)hudSliderDone:(UISlider *)s {   // the slider's touch is up: save the size
++    (void)s;
++    [self saveHudLayout];
++}
++- (void)hudReset:(UIButton *)b {   // Reset: the selected panel back to the game's own place and size
++    (void)b;
++    _hudDx[_hudSelected] = 0; _hudDy[_hudSelected] = 0; _hudK[_hudSelected] = 1;
++    _hudSlider.value = 1;
++    dm_hud_set(_hudSelected, 0, 0, 1);
++    [self saveHudLayout];
++    [self hudUpdateHint];
++}
++- (void)hudEditTouchBegan:(UITouch *)t at:(CGPoint)p {
++    _hudEditTouch = t;
++    _hudEditGrab = p;   // where the finger landed
++    _hudEditBase = CGPointMake(_hudDx[_hudSelected], _hudDy[_hudSelected]);   // the panel's offset at the drag's start
++}
++- (void)hudEditTouchMoved:(UITouch *)t to:(CGPoint)p {
++    if (t != _hudEditTouch) return;
++    // The layout (1280x720) spans the view: a point is 1280 / view width layout points across and 720 / view height up. The y is negated (the screen's y runs down, the layout's runs up).
++    CGFloat sx = 1280.0 / fmax(self.bounds.size.width, 1);
++    CGFloat sy = 720.0 / fmax(self.bounds.size.height, 1);
++    _hudDx[_hudSelected] = fmin(fmax(_hudEditBase.x + (p.x - _hudEditGrab.x) * sx, -640), 640);
++    _hudDy[_hudSelected] = fmin(fmax(_hudEditBase.y - (p.y - _hudEditGrab.y) * sy, -360), 360);
++    dm_hud_set(_hudSelected, _hudDx[_hudSelected], _hudDy[_hudSelected], _hudK[_hudSelected]);
++    [self hudUpdateHint];
++}
++
+ // ---- Physical controllers ----
+ // Each controller with an extended gamepad profile is a player of its own, as on the Mac (front_mac.m): it holds a slot (pad_slots.h: player 1 first, a reconnected controller
+ // gets its player back) and goes to dm_pad_set_player, and hle_hid.c reports player n on its own npad while the slot is held (dm_pad_players). Player 1's controller is ORed
+@@ -1068,7 +1226,7 @@ static BOOL pads_slotted(GCController *gone) {
+ }
+ - (void)updateControlVisibility {
+     _controls.hidden = _padOff;
+-    _menu.hidden = _editing || (_padOff && _layout.onTV);   // the gear stays hidden while the button editor is open
++    _menu.hidden = _editing || _hudEditing || (_padOff && _layout.onTV);   // the gear stays hidden while an editor is open
+     [self syncGlassVisibility];   // the glass hides with the whole touch pad while a controller is in use
+ }
+ - (void)padsChanged:(NSNotification *)note {
+@@ -1087,6 +1245,7 @@ int dm_pad_layout(void) { return g_view ? [g_view padLayout] : 0; }
+ bool dm_pad_layout_offered(int layout) { return layout == 0 || layout == 1 || (layout == 2 && dm_opmode() == 0); }
+ void dm_pad_layout_set(int layout) { [g_view setPadLayout:layout]; }
+ void dm_gamepad_open_pad_settings(void) { dispatch_async(dispatch_get_main_queue(), ^{ [g_view openPadSettings]; }); }   // GameMenu.swift: the in-game menu's "按键设置"
++void dm_gamepad_open_hud_settings(void) { dispatch_async(dispatch_get_main_queue(), ^{ [g_view openHudSettings]; }); }   // GameMenu.swift: the in-game menu's "HUD 设置"
+ void dm_gamepad_pads_read(void) {   // front_ios.m: the quit prompt closed, the game reads every controller as it is now (a button held through it counts again)
+     if (g_merge) { for (GCController *c in GCController.controllers) if (c.extendedGamepad) read_pad(c.extendedGamepad); }
+     else for (int p = 0; p < DM_PLAYERS; p++) if (g_held[p].extendedGamepad) read_pad(g_held[p].extendedGamepad);
+diff --git a/dm/ios/Sources/GameMenu.swift b/dm/ios/Sources/GameMenu.swift
+index c21379e..a18e34b 100644
+--- a/dm/ios/Sources/GameMenu.swift
++++ b/dm/ios/Sources/GameMenu.swift
+@@ -20,17 +20,18 @@ private func gameMenuItems() -> [UIMenuElement] {
+     }
+     let layout = UIMenu(title: "Controller layout", options: .singleSelection, children: layouts)   // a choice's value shows in its submenu: a subtitle would make each row two lines
+     let padSettings = UIAction(title: "按键设置") { _ in dm_gamepad_open_pad_settings() }   // the button editor (DmGamepad.m): the icons' size and where they sit
++    let hudSettings = UIAction(title: "HUD 设置") { _ in dm_gamepad_open_hud_settings() }   // the HUD editor (DmGamepad.m): the HUD panels' size and where they sit
+     var items: [UIMenuElement] = []
+     var placed = false
+     if let m = gameMenuModel {
+         for section in m.sections {
+-            var rows: [UIMenuElement] = section == "Controls" ? [layout, padSettings] : []
++            var rows: [UIMenuElement] = section == "Controls" ? [layout, padSettings, hudSettings] : []
+             if section == "Controls" { placed = true }
+             for s in m.rows(in: section) where (s.kind == "choice" || s.kind == "toggle") && dm_setting_live(s.env, nil) { rows.append(gameMenuRow(m, s)) }
+             if !rows.isEmpty { items.append(UIMenu(options: .displayInline, children: rows)) }
+         }
+     }
+-    if !placed { items.insert(UIMenu(options: .displayInline, children: [layout, padSettings]), at: 0) }
++    if !placed { items.insert(UIMenu(options: .displayInline, children: [layout, padSettings, hudSettings]), at: 0) }
+     items.append(Unmanaged<UIMenu>.fromOpaque(dm_quit_menu()).takeRetainedValue())   // Quit <game>, last and on its own: it opens the quit prompt (front_ios.m)
+     return items
+ }
+-- 
+2.43.0
+
