@@ -1,0 +1,204 @@
+From 54847c6eb75e74ff15bbbd65efbab6d36b18da8a Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Wed, 11 Nov 2026 15:16:10 +0000
+Subject: [PATCH] Pad: the settings panels drag anywhere and stay where left
+ (0116)
+
+Both editor bars (button settings, HUD settings) used to sit
+centred at the top, covering the - / + / menu cluster, so the +
+and - could not be tapped to select them. Each bar now drags by
+its title or blank area (UIPanGestureRecognizer), keeps its place
+in NSUserDefaults DmPadPanelPos as fractions of the view, and opens
+at the left of the screen, low, clear of every control. The layout
+clamps a bar inside the view, so it can never be dragged off and
+lost. A slider, button or the segmented control keeps its own
+touch: the pan only starts on the bar's background, title or hint.
+This 0116 is the draggable settings panels, not the frame-rate
+unlock the number was once reserved for (that was cancelled and
+never written).
+---
+ dm/ios/Sources/DmGamepad.m | 105 +++++++++++++++++++++++++++++++++----
+ 1 file changed, 95 insertions(+), 10 deletions(-)
+
+diff --git a/dm/ios/Sources/DmGamepad.m b/dm/ios/Sources/DmGamepad.m
+index e1b6693..e0459e5 100644
+--- a/dm/ios/Sources/DmGamepad.m
++++ b/dm/ios/Sources/DmGamepad.m
+@@ -147,7 +147,7 @@ void front_ios_quit_poll(void);          // front_ios.m: a controller's buttons
+ int front_ios_quit_blocks_input(void);   // front_ios.m: the quit prompt has the controllers, the game gets none
+ void front_ios_quit_controllers(void);   // front_ios.m: the controllers changed (it reads the Home button setting once)
+ 
+-@interface DmGamepad : UIView
++@interface DmGamepad : UIView <UIGestureRecognizerDelegate>
+ - (void)arrange:(DmLayout)layout;
+ - (BOOL)menuTakes:(CGPoint)p;
+ @end
+@@ -188,6 +188,8 @@ static void pads_start(void);   // Physical controllers, below
+     BOOL _hudEditing;                              // the HUD editor is open: touches drag the selected panel instead of pressing keys
+     UIView *_hudEditBar; UISlider *_hudSlider; UISegmentedControl *_hudPicker;   // the editor's bar: the panel picker, the size slider, hint, Reset and Done
+     UITouch *_hudEditTouch; CGPoint _hudEditGrab, _hudEditBase;   // the drag: where the finger landed and the panel's offset at the drag's start
++    CGPoint _panelPos[2];                          // the two bars' centres as fractions of the view (0 pad, 1 HUD), NSUserDefaults DmPadPanelPos (0116)
++    BOOL _panelDragging[2];                        // a bar is being dragged now: the layout leaves its frame alone (0116)
+     DmPadGeo _geoLine;                             // the geometry with the editor's size and drag offsets applied
+     CALayer *_hint; CATextLayer *_hintText; NSString *_hintWords;   // the 3D layout's right-stick hint: words only, once per launch (see "The right-stick hint")
+     DmMenuButton *_menu;                           // opens the in-game menu (GameMenu.swift)
+@@ -348,6 +350,7 @@ static void glassDiscSetOpacity(CAGradientLayer *disc, CGFloat p) {   // the fal
+         [self loadLineLayout];   // the editor's stored size and drag offsets, or the built-in layout
+         [self loadGlassOpacity];   // the glass effect's strength, 0-100% (0115)
+         [self loadHudLayout];   // the HUD editor's stored move / resize, or the game's own HUD
++        [self loadPanelPos];   // the settings panels' stored places, or the default at the left, low (0116)
+         static dispatch_once_t once;
+         dispatch_once(&once, ^{
+             // each colour carries its own low opacity instead of lowering the whole view's alpha (that would add an off-screen pass for the full-screen layer)
+@@ -946,8 +949,78 @@ static NSString *const k_hud_layout_key = @"DmHudLayout";
+     [NSUserDefaults.standardUserDefaults setObject:@{@"elements": el} forKey:k_hud_layout_key];
+ }
+ 
+-// The button editor: a bar at the top (title, the size slider, the glass slider, Done, and a hint), and dragging
+-// the icons. While it is open, touches drag controls instead of pressing them; tapping an icon
++// The settings panels' places (0116): both editor bars can be dragged anywhere by
++// their title or blank area, and where they are left is kept in NSUserDefaults
++// (DmPadPanelPos, {"pad": [fx, fy], "hud": [fx, fy]}) so it survives a restart.
++// The place is the bar's centre as a fraction of the view, so a rotation or a
++// different screen keeps it in the same relative place; the layout clamps the
++// bar back inside the view, so a panel can never be dragged off and lost. The
++// default is the left of the screen, low: the old top-centre place covered the
++// - / + / menu cluster at the top centre (DmPadGeometry.h: the pills sit midX
++// +/- 52u, the menu button at midX, all level with the top), so the + and -
++// could not be tapped to select them. On an iPhone in landscape (932x430
++// points) the pad bar's default frame is x 40..520, y 195..303 and the HUD
++// bar's x 4..564, y 195..287 (it is 560 wide, so it starts at the left edge):
++// clear of the drop keys at the top corners, the pills and the menu at the
++// top centre, the diamond at the bottom right and the jump / photo buttons
++// left of it, on the Pro Max and on the SE, the 17 Pro Max and the iPad Pro
++// 13 (checked against dm_pad_geo_at). The frames do cross the left stick's
++// ground, but the stick floats, so it is not drawn and no touch starts it
++// while an editor is open; on the iPad they clear it too. A drag starts only
++// background (a title or a hint label): a gesture on a slider, a button or
++// the segmented control is the control's own, so the panel never steals a
++// slider's drag.
++static NSString *const k_panel_pos_key = @"DmPadPanelPos";
++static const CGFloat k_panel_default[2][2] = {{0.30, 0.58}, {0.30, 0.56}};   // pad, HUD: the bars' centre fractions (x, y)
++- (void)loadPanelPos {
++    for (int i = 0; i < 2; i++) _panelPos[i] = CGPointMake(k_panel_default[i][0], k_panel_default[i][1]);   // fresh: the left of the screen, low
++    NSDictionary *d = [NSUserDefaults.standardUserDefaults dictionaryForKey:k_panel_pos_key];
++    if (![d isKindOfClass:[NSDictionary class]]) return;
++    static NSString *const keys[2] = {@"pad", @"hud"};
++    for (int i = 0; i < 2; i++) {
++        NSArray *v = d[keys[i]];
++        if ([v isKindOfClass:[NSArray class]] && v.count == 2 && [v[0] isKindOfClass:[NSNumber class]] && [v[1] isKindOfClass:[NSNumber class]])
++            _panelPos[i] = CGPointMake(fmin(fmax([v[0] doubleValue], 0), 1), fmin(fmax([v[1] doubleValue], 0), 1));
++    }
++}
++- (void)savePanelPos {
++    [NSUserDefaults.standardUserDefaults setObject:@{@"pad": @[@(_panelPos[0].x), @(_panelPos[0].y)], @"hud": @[@(_panelPos[1].x), @(_panelPos[1].y)]} forKey:k_panel_pos_key];
++}
++- (CGPoint)clampPanelCentre:(CGPoint)c size:(CGSize)s {   // a bar's centre, clamped so the whole bar stays inside the view (its Done button stays reachable)
++    CGFloat W = self.bounds.size.width, H = self.bounds.size.height, m = 4;
++    CGFloat loX = s.width / 2 + m, hiX = W - s.width / 2 - m, loY = s.height / 2 + m, hiY = H - s.height / 2 - m;
++    if (hiX < loX) c.x = W / 2; else c.x = fmin(fmax(c.x, loX), hiX);   // a bar wider than the view centres on it
++    if (hiY < loY) c.y = H / 2; else c.y = fmin(fmax(c.y, loY), hiY);
++    return c;
++}
++- (CGPoint)panelCentre:(int)i size:(CGSize)s {   // the bar's centre from its stored fraction, clamped inside the view
++    return [self clampPanelCentre:CGPointMake(_panelPos[i].x * self.bounds.size.width, _panelPos[i].y * self.bounds.size.height) size:s];
++}
++- (void)panelPan:(UIPanGestureRecognizer *)pan {   // drag a settings panel: it follows the finger, and stays where it is left
++    UIView *bar = pan.view;
++    int i = bar == _hudEditBar ? 1 : 0;
++    if (pan.state == UIGestureRecognizerStateBegan || pan.state == UIGestureRecognizerStateChanged) {
++        _panelDragging[i] = YES;
++        CGPoint d = [pan translationInView:self];
++        [pan setTranslation:CGPointZero inView:self];
++        bar.center = [self clampPanelCentre:CGPointMake(bar.center.x + d.x, bar.center.y + d.y) size:bar.bounds.size];
++    } else {
++        _panelDragging[i] = NO;
++        if (pan.state == UIGestureRecognizerStateEnded || pan.state == UIGestureRecognizerStateCancelled) {
++            _panelPos[i] = CGPointMake(fmin(fmax(bar.center.x / fmax(self.bounds.size.width, 1), 0), 1), fmin(fmax(bar.center.y / fmax(self.bounds.size.height, 1), 0), 1));
++            [self savePanelPos];
++        }
++    }
++}
++- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g shouldReceiveTouch:(UITouch *)t {   // a slider, a button or the segmented control keeps its own touch; the bar's background, title and hint start a drag
++    (void)g;
++    return ![t.view isKindOfClass:[UIControl class]];
++}
++
++// The button editor: a bar (title, the size slider, the glass slider, Done, and a hint), and dragging
++// the icons. The bar itself can be dragged anywhere by its title or blank area (0116): it opens at
++// the left of the screen, low, clear of the - / + / menu cluster at the top centre, and stays where
++// it was left. While it is open, touches drag controls instead of pressing them; tapping an icon
+ // selects it (a ring around it, its name in the hint line) and the slider tunes that icon's
+ // own size; the glass slider tunes the Liquid Glass behind every icon, 0-100% (0115), the
+ // game's own setting; the gear is hidden (it cannot be tapped now); the game keeps running behind it.
+@@ -982,8 +1055,11 @@ static NSString *const k_hud_layout_key = @"DmHudLayout";
+     [_glassSlider addTarget:self action:@selector(glassSliderDone:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside];
+     [_editBar addSubview:_glassSlider];
+     UILabel *hint = [[UILabel alloc] init]; hint.tag = 304; hint.numberOfLines = 2;
+-    hint.text = [NSString stringWithFormat:@"拖动图标可以移动位置\n玻璃 %.0f%% 是现在的效果，100%% 最深", k_glassAnchor * 100]; hint.textColor = UIColor.whiteColor; hint.font = [UIFont systemFontOfSize:12]; hint.textAlignment = NSTextAlignmentCenter;
++    hint.text = [NSString stringWithFormat:@"拖动图标可以移动位置 · 拖动面板可以移动面板\n玻璃 %.0f%% 是现在的效果，100%% 最深", k_glassAnchor * 100]; hint.textColor = UIColor.whiteColor; hint.font = [UIFont systemFontOfSize:12]; hint.textAlignment = NSTextAlignmentCenter;
+     [_editBar addSubview:hint];
++    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(panelPan:)];   // the bar drags by its title or blank area (0116); a slider or the Done button keeps its own touch
++    pan.delegate = self;
++    [_editBar addGestureRecognizer:pan];
+     [self addSubview:_editBar];
+     _editHighlight = [CAShapeLayer layer];   // the ring around the selected icon (the slider's target): on top of the icons, hidden until the editor opens
+     _editHighlight.fillColor = [UIColor colorWithWhite:1 alpha:0.08].CGColor;
+@@ -992,10 +1068,13 @@ static NSString *const k_hud_layout_key = @"DmHudLayout";
+     _editHighlight.hidden = YES;
+     [_controls addSublayer:_editHighlight];
+ }
+-- (void)layoutEditBar {   // the bar's rows (title, size label, slider, Done; the glass label and slider), the hint below, centred at the top
++- (void)layoutEditBar {   // the bar's rows (title, size label, slider, Done; the glass label and slider), the hint below, where it was dragged to (or its default at the left, low)
+     if (!_editBar) return;
+     CGFloat w = fmin(self.bounds.size.width * 0.8, 480), h = 108;
+-    _editBar.frame = CGRectMake((self.bounds.size.width - w) / 2, self.safeAreaInsets.top + 8, w, h);
++    if (!_panelDragging[0]) {   // a drag in progress keeps the bar under the finger; the rows below still follow the width
++        CGPoint c = [self panelCentre:0 size:CGSizeMake(w, h)];
++        _editBar.frame = CGRectMake(c.x - w / 2, c.y - h / 2, w, h);
++    }
+     CGFloat x = 12, doneW = 48;
+     UIView *title = [_editBar viewWithTag:301]; title.frame = CGRectMake(x, 8, 80, 24); x += 88;
+     UIView *size = [_editBar viewWithTag:302]; size.frame = CGRectMake(x, 8, 32, 24); x += 36;
+@@ -1046,7 +1125,7 @@ static NSString *const k_hud_layout_key = @"DmHudLayout";
+     _editSelected = e;
+     _editSlider.value = _lineSizes[e];
+     UILabel *hint = (UILabel *)[_editBar viewWithTag:304];
+-    hint.text = [NSString stringWithFormat:@"当前：%@ · 拖动图标可以移动位置\n玻璃 %.0f%% 是现在的效果，100%% 最深", k_lineEditNames[e], k_glassAnchor * 100];
++    hint.text = [NSString stringWithFormat:@"当前：%@ · 拖动图标可以移动位置 · 拖动面板可以移动面板\n玻璃 %.0f%% 是现在的效果，100%% 最深", k_lineEditNames[e], k_glassAnchor * 100];
+     [self layoutEditHighlight];
+ }
+ - (void)layoutEditHighlight {   // the ring around the selected icon while the editor is open
+@@ -1119,7 +1198,7 @@ static NSString *const k_hud_layout_key = @"DmHudLayout";
+     [self setNeedsLayout];
+ }
+ 
+-// The HUD editor: a bar at the top (title, the panel picker, the size slider, Reset, Done, and a hint), and dragging on the screen to move the selected panel. While it is open, touches drag the selected HUD panel instead of pressing keys; the game keeps running behind it. The text is Chinese: the user asked for the settings panel in Chinese (the rest of the repository is English).
++// The HUD editor: a bar (title, the panel picker, the size slider, Reset, Done, and a hint), and dragging on the screen to move the selected panel. The bar itself can be dragged anywhere by its title or blank area (0116): it opens at the left of the screen, low, clear of the - / + / menu cluster at the top centre, and stays where it was left. While it is open, touches drag the selected HUD panel instead of pressing keys; the game keeps running behind it. The text is Chinese: the user asked for the settings panel in Chinese (the rest of the repository is English).
+ // The panels are drawn by the game, not by this view, so they cannot be tapped to select them: the picker (a segmented control) selects the panel, the slider tunes that panel's own size, and dragging anywhere on the screen moves it. The drag's y is negated: the screen's y runs down, the layout's y runs up (the layout space is y-up, its origin at the screen's centre, hud_calc.c), so dragging down the screen is a negative dy.
+ - (void)buildHudEditBar {
+     _hudEditBar = [[UIView alloc] init];
+@@ -1153,12 +1232,18 @@ static NSString *const k_hud_layout_key = @"DmHudLayout";
+     UILabel *hint = [[UILabel alloc] init]; hint.tag = 316;
+     hint.text = @"拖动屏幕可以移动位置"; hint.textColor = UIColor.whiteColor; hint.font = [UIFont systemFontOfSize:12]; hint.textAlignment = NSTextAlignmentCenter;
+     [_hudEditBar addSubview:hint];
++    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(panelPan:)];   // the bar drags by its title or blank area (0116); a slider, the picker or a button keeps its own touch
++    pan.delegate = self;
++    [_hudEditBar addGestureRecognizer:pan];
+     [self addSubview:_hudEditBar];
+ }
+-- (void)layoutHudEditBar {   // the bar's three rows (title + picker + Reset + Done; size label + slider; hint), centred at the top
++- (void)layoutHudEditBar {   // the bar's three rows (title + picker + Reset + Done; size label + slider; hint), where it was dragged to (or its default at the left, low)
+     if (!_hudEditBar) return;
+     CGFloat w = fmin(self.bounds.size.width * 0.9, 560), h = 92;
+-    _hudEditBar.frame = CGRectMake((self.bounds.size.width - w) / 2, self.safeAreaInsets.top + 8, w, h);
++    if (!_panelDragging[1]) {   // a drag in progress keeps the bar under the finger; the rows below still follow the width
++        CGPoint c = [self panelCentre:1 size:CGSizeMake(w, h)];
++        _hudEditBar.frame = CGRectMake(c.x - w / 2, c.y - h / 2, w, h);
++    }
+     CGFloat doneW = 48, resetW = 44, pickerW = fmin(200, w * 0.36);
+     UIView *title = [_hudEditBar viewWithTag:311]; title.frame = CGRectMake(12, 8, 80, 24);
+     _hudPicker.frame = CGRectMake(100, 8, pickerW, 24);
+-- 
+2.43.0
+
