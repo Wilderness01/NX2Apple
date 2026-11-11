@@ -1,0 +1,242 @@
+From 7b80fc2eaa251e7bb06f68fcacf8e884847450d0 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Wed, 11 Nov 2026 12:41:52 +0000
+Subject: [PATCH] Pad: a glass-effect strength slider in the button settings
+ (0115)
+
+---
+ dm/ios/Sources/DmGamepad.m | 119 +++++++++++++++++++++++++++++++++----
+ 1 file changed, 107 insertions(+), 12 deletions(-)
+
+diff --git a/dm/ios/Sources/DmGamepad.m b/dm/ios/Sources/DmGamepad.m
+index f794de8..e1b6693 100644
+--- a/dm/ios/Sources/DmGamepad.m
++++ b/dm/ios/Sources/DmGamepad.m
+@@ -12,7 +12,7 @@
+ //   Touch-down ownership (dm_pad_menu_takes and dm_pad_hit in DmPadGeometry.h): the menu button where it is nearer than a locked key (a view of its own, DmMenuButton), locked keys next (shoulders, − / +, L3 / R3), the jump and photo buttons next, then whichever of the diamond and the left stick has the smallest distance / grab radius (the left half holds the floating stick),
+ //     then in 3D the right stick for a touch in the right third. X, ZR, R, L3, R3 and the D-pad are hidden and disabled: a touch on one of them falls through to the floating stick (left half) or the right stick (right third) instead.
+ //   The player can move single controls in the shell's settings (DM_TOUCH_LAYOUT, one arrangement per layout): the geometry places each only where it fits and keeps the rest where they were.
+-//   The in-game menu's "按键设置" (button settings) opens a panel above the game: tapping an icon selects it, a slider for the selected icon's own size and dragging the icons to move them, saved per icon in NSUserDefaults (DmPadLineLayout) so it survives a restart. See "The line skin" below.
++//   The in-game menu's "按键设置" (button settings) opens a panel above the game: tapping an icon selects it, a slider for the selected icon's own size and dragging the icons to move them, saved per icon in NSUserDefaults (DmPadLineLayout) so it survives a restart; and a slider for the glass effect's strength (0-100%, the game's own setting, NSUserDefaults DmPadGlassOpacity): 70% is the look as shipped, 100% is the deepest the glass gets.
+ //   The in-game menu's "HUD 设置" (HUD settings) opens a panel above the game: picking a HUD panel (指南针 / 生命值 / 金币 / 月亮）, a slider for the selected panel's own size and dragging on the screen to move it, saved per panel in NSUserDefaults (DmHudLayout) so it survives a restart, live through dm_hud_set (hud.c) into the rewriter stub in Pane::Calculate (0113). The life panel has no locked pane name yet, so its settings are stored but change nothing until the name is locked from the V1.3.9 log.
+ //   Everything hugs the edges and corners to leave the picture room; each control is one
+ //   image layer (dm/ios/Sources/PadIcons/pad_line_*.png, the line set, bundled as resources):
+@@ -172,6 +172,8 @@ static void pads_start(void);   // Physical controllers, below
+     CALayer *_jump, *_photo;                       // the extra buttons: jump (B) and photo (D-pad down)
+     UIVisualEffectView *_glassView[G_N];           // iOS 26+: the real Liquid Glass behind each icon (nil below iOS 26)
+     CAGradientLayer *_glassDisc[G_N];              // below iOS 26: a vector glass disc drawn in code (nil on iOS 26+)
++    CGFloat _glassOpacity;                         // the glass effect's strength, 0-1 (70% is the look as shipped, 100% is the deepest), NSUserDefaults DmPadGlassOpacity (0115)
++    CGFloat _glassTint;                            // the white tint's alpha on the real glass now (0 at the anchor and below), so the effect is only rebuilt when it changes (0115)
+     CGPoint _lCentre;                              // the floating left stick's centre: where its touch landed
+     CGFloat _lineScale;                            // the legacy global size (migration default): 0.7 to 3.0, 1 is built-in; the slider no longer changes it
+     CGFloat _lineSizes[E_N];                       // each movable icon's own size, 0.7 to 3.0 (NSUserDefaults DmPadLineLayout "sizes")
+@@ -179,7 +181,7 @@ static void pads_start(void);   // Physical controllers, below
+     CAShapeLayer *_editHighlight;                  // the ring around the selected icon while the editor is open
+     NSMutableDictionary<NSString *, NSValue *> *_lineOffsets;   // the drag offsets, points from each control's built-in centre (NSUserDefaults DmPadLineLayout)
+     BOOL _editing;                                 // the button editor is open: touches drag controls instead of pressing them
+-    UIView *_editBar; UISlider *_editSlider;       // the editor's bar: the size slider, hint and Done
++    UIView *_editBar; UISlider *_editSlider, *_glassSlider;   // the editor's bar: the size slider, the glass slider, hint and Done
+     UITouch *_editTouch; int _editControl; CGPoint _editGrab, _editBase;   // the control being dragged and where its drag started
+     float _hudDx[4], _hudDy[4], _hudK[4];          // the HUD panels' move / resize (layout points, the 1280x720 space, y up, origin at the screen's centre; 1 = the game's size), NSUserDefaults DmHudLayout
+     int _hudSelected;                              // the HUD panel the size slider tunes (0 compass, 1 life, 2 coins, 3 moons; compass by default)
+@@ -265,9 +267,18 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
+ // the button's own circle (the icon layer's frame is the same square grown by 1/fill).
+ // Hidden keys (ZR, R, X, the D-pad, L3 / R3) and the floating stick get no glass.
+ // Every UIGlassEffect reference sits inside if (@available(iOS 26.0, *)): the type exists
+-// only on iOS 26+, so an unguarded reference is a compile error.
++// only on iOS 26+, so an unguarded reference is a compile error. The strength is the
++// player's own setting (0115): the button settings' glass slider, 0-100%. The anchor is
++// the look as shipped (70%), 0 is no glass at all, 100 is the deepest the glass gets:
++// below the anchor the glass fades in to the shipped look, above it a white tint (real
++// glass) or deeper alphas (fallback disc) keep darkening it. The real glass fades as a
++// whole view, the fallback disc scales every alpha on it.
++static const CGFloat k_glassAnchor = 0.70;   // the slider value of the look as shipped
++static const CGFloat k_glassTintMax = 0.38;  // the white tint's alpha at 100% (real glass)
+ static const CGFloat k_glassGradTop = 0.50, k_glassGradBottom = 0.26;
+-static const CGFloat k_glassRimAlpha = 0.90, k_glassHiAlpha = 0.75, k_glassShadeAlpha = 0.27;
++static const CGFloat k_glassGradTopDeep = 0.72, k_glassGradBottomDeep = 0.46;   // the fallback disc at 100%
++static const CGFloat k_glassRimAlpha = 0.90, k_glassHiAlpha = 0.75, k_glassShadeAlpha = 0.27, k_glassShadowAlpha = 0.20;
++static const CGFloat k_glassRimDeep = 1.0, k_glassHiDeep = 0.90, k_glassShadeDeep = 0.45, k_glassShadowDeep = 0.30;
+ static CGPathRef glassCirclePath(CGRect r) { return CGPathCreateWithEllipseInRect(r, NULL); }
+ static void setGlassPath(CAShapeLayer *l, CGPathRef p) { l.path = p; CGPathRelease(p); }
+ static CGPathRef glassArcPath(CGRect r, CGFloat a0, CGFloat a1) {   // an arc of the circle, inset so the stroke sits inside the rim; angles in radians, 270 is the top
+@@ -296,6 +307,20 @@ static void glassDiscLayout(CAGradientLayer *disc, CGRect frame) {   // the disc
+     setGlassPath((CAShapeLayer *)disc.sublayers[1], glassArcPath(b, 195 * M_PI / 180, 345 * M_PI / 180));   // the top highlight
+     setGlassPath((CAShapeLayer *)disc.sublayers[2], glassArcPath(b, 15 * M_PI / 180, 165 * M_PI / 180));   // the bottom shade
+ }
++static void glassDiscSetOpacity(CAGradientLayer *disc, CGFloat p) {   // the fallback disc's strength, 0-100% (0115): at the anchor it is the look as shipped; above the anchor every alpha deepens
++    CGFloat f = p <= k_glassAnchor ? p / k_glassAnchor : 1;   // the fade-in to the look as shipped
++    CGFloat t = p <= k_glassAnchor ? 0 : (p - k_glassAnchor) / (1 - k_glassAnchor);   // the deepening past the anchor
++    CGFloat gradTop = k_glassGradTop * f + (k_glassGradTopDeep - k_glassGradTop) * t;
++    CGFloat gradBottom = k_glassGradBottom * f + (k_glassGradBottomDeep - k_glassGradBottom) * t;
++    CGFloat rim = k_glassRimAlpha * f + (k_glassRimDeep - k_glassRimAlpha) * t;
++    CGFloat hi = k_glassHiAlpha * f + (k_glassHiDeep - k_glassHiAlpha) * t;
++    CGFloat shade = k_glassShadeAlpha * f + (k_glassShadeDeep - k_glassShadeAlpha) * t;
++    disc.colors = @[(id)[UIColor colorWithWhite:1 alpha:gradTop].CGColor, (id)[UIColor colorWithWhite:1 alpha:gradBottom].CGColor];
++    ((CAShapeLayer *)disc.sublayers[0]).strokeColor = [UIColor colorWithWhite:1 alpha:rim].CGColor;   // rim
++    ((CAShapeLayer *)disc.sublayers[1]).strokeColor = [UIColor colorWithWhite:1 alpha:hi].CGColor;   // top highlight
++    ((CAShapeLayer *)disc.sublayers[2]).strokeColor = [UIColor colorWithWhite:0 alpha:shade].CGColor;   // bottom shade
++    disc.shadowOpacity = (float)(k_glassShadowAlpha * f + (k_glassShadowDeep - k_glassShadowAlpha) * t);
++}
+ 
+ - (instancetype)initWithFrame:(CGRect)f {
+     if ((self = [super initWithFrame:f])) {
+@@ -321,6 +346,7 @@ static void glassDiscLayout(CAGradientLayer *disc, CGRect frame) {   // the disc
+         }
+         _owner = [NSMapTable strongToStrongObjectsMapTable]; _faceOf = [NSMapTable strongToStrongObjectsMapTable];
+         [self loadLineLayout];   // the editor's stored size and drag offsets, or the built-in layout
++        [self loadGlassOpacity];   // the glass effect's strength, 0-100% (0115)
+         [self loadHudLayout];   // the HUD editor's stored move / resize, or the game's own HUD
+         static dispatch_once_t once;
+         dispatch_once(&once, ^{
+@@ -369,6 +395,7 @@ static void glassDiscLayout(CAGradientLayer *disc, CGRect frame) {   // the disc
+                 _glassDisc[g] = disc;
+             }
+         }
++        [self applyGlassOpacity];   // the glass follows the stored strength from the first frame (0115)
+         const char *hint = getenv("DM_TOUCH_HINT");   // the shell passes the player's language; empty turns the hint off
+         _hintWords = hint ? [NSString stringWithUTF8String:hint] : @"Right stick: drag here";
+         _hint = [CALayer layer]; _hint.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5].CGColor; _hint.opacity = 0; _hint.hidden = YES;
+@@ -842,6 +869,54 @@ static NSString *const k_line_layout_key = @"DmPadLineLayout";
+     [NSUserDefaults.standardUserDefaults setObject:d forKey:k_line_layout_key];
+ }
+ 
++// The glass effect's strength, 0-100% in the button settings (0115): 0 is no glass at
++// all (the icon alone on the picture), the anchor (70%) is the look as shipped, 100 is
++// the deepest the glass gets. It is the game's own setting, nothing to do with the
++// system's; it survives a restart (NSUserDefaults DmPadGlassOpacity). The real glass
++// (iOS 26+) fades as a whole view up to the anchor, then a white tint deepens it; the
++// fallback disc below iOS 26 scales every alpha up to the anchor, then deepens each one.
++static NSString *const k_glass_opacity_key = @"DmPadGlassOpacity";
++static NSString *const k_glass_opacity_v2_key = @"DmPadGlassOpacityV2";   // the stored value was remapped to the anchored scale (0115)
++- (void)loadGlassOpacity {
++    _glassOpacity = k_glassAnchor;   // fresh: the look as shipped
++    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
++    NSNumber *v = [d objectForKey:k_glass_opacity_key];
++    if (![v isKindOfClass:[NSNumber class]]) return;
++    double stored = fmin(fmax(v.doubleValue, 0), 100);
++    if (![d boolForKey:k_glass_opacity_v2_key]) {
++        // Values saved by the first version (0-100, 100 was the look as shipped) remap
++        // onto the anchored scale, so 100 becomes the anchor and nothing jumps deeper:
++        // the old fade v/100 is the new fade v'/(100 * anchor), so v' = v * anchor.
++        stored = stored * k_glassAnchor;
++        [d setObject:@((NSInteger)lround(stored)) forKey:k_glass_opacity_key];
++        [d setBool:YES forKey:k_glass_opacity_v2_key];
++    }
++    _glassOpacity = stored / 100;
++}
++- (void)saveGlassOpacity {
++    [NSUserDefaults.standardUserDefaults setObject:@((NSInteger)lround(_glassOpacity * 100)) forKey:k_glass_opacity_key];
++}
++- (void)applyGlassOpacity {   // the glass views and discs follow the setting, live from the slider
++    CGFloat p = _glassOpacity;
++    CGFloat fade = p <= k_glassAnchor ? p / k_glassAnchor : 1;   // 0 at no glass, 1 from the anchor up
++    CGFloat tint = p <= k_glassAnchor ? 0 : k_glassTintMax * (p - k_glassAnchor) / (1 - k_glassAnchor);   // the white tint, only past the anchor
++    for (int g = 0; g < G_N; g++) {
++        if (_glassView[g]) {
++            _glassView[g].alpha = fade;
++            if (fabs(tint - _glassTint) > 0.001 && @available(iOS 26.0, *)) {
++                // The tint is part of the effect, so it takes a fresh effect; at the
++                // anchor and below the tint is nil, which is the factory glass exactly.
++                UIGlassEffect *effect = [UIGlassEffect effectWithStyle:UIGlassEffectStyleRegular];
++                effect.interactive = YES;
++                if (tint > 0) effect.tintColor = [UIColor colorWithWhite:1 alpha:tint];
++                _glassView[g].effect = effect;
++            }
++        }
++        if (_glassDisc[g]) glassDiscSetOpacity(_glassDisc[g], p);
++    }
++    _glassTint = tint;
++}
++
+ // The HUD editor's stored layout: NSUserDefaults DmHudLayout, {"elements": {name:
+ // {"dx": NSNumber, "dy": NSNumber, "scale": NSNumber}}}. The offsets are layout
+ // points (the 1280x720 space, y up, the origin at the screen's centre), the scale
+@@ -871,10 +946,11 @@ static NSString *const k_hud_layout_key = @"DmHudLayout";
+     [NSUserDefaults.standardUserDefaults setObject:@{@"elements": el} forKey:k_hud_layout_key];
+ }
+ 
+-// The button editor: a bar at the top (title, the size slider, Done, and a hint), and dragging
++// The button editor: a bar at the top (title, the size slider, the glass slider, Done, and a hint), and dragging
+ // the icons. While it is open, touches drag controls instead of pressing them; tapping an icon
+ // selects it (a ring around it, its name in the hint line) and the slider tunes that icon's
+-// own size; the gear is hidden (it cannot be tapped now); the game keeps running behind it.
++// own size; the glass slider tunes the Liquid Glass behind every icon, 0-100% (0115), the
++// game's own setting; the gear is hidden (it cannot be tapped now); the game keeps running behind it.
+ // The text is Chinese: the user asked for the settings panel in Chinese (the rest of the
+ // repository is English).
+ - (void)buildEditBar {
+@@ -897,8 +973,16 @@ static NSString *const k_hud_layout_key = @"DmHudLayout";
+     [done setTitle:@"完成" forState:UIControlStateNormal]; done.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+     [done addTarget:self action:@selector(closePadSettings) forControlEvents:UIControlEventTouchUpInside];
+     [_editBar addSubview:done];
+-    UILabel *hint = [[UILabel alloc] init]; hint.tag = 304;
+-    hint.text = @"拖动图标可以移动位置"; hint.textColor = UIColor.whiteColor; hint.font = [UIFont systemFontOfSize:12]; hint.textAlignment = NSTextAlignmentCenter;
++    UILabel *glass = [[UILabel alloc] init]; glass.tag = 305;
++    glass.text = @"玻璃"; glass.textColor = UIColor.whiteColor; glass.font = [UIFont systemFontOfSize:13]; glass.textAlignment = NSTextAlignmentRight;
++    [_editBar addSubview:glass];
++    _glassSlider = [[UISlider alloc] init];
++    _glassSlider.minimumValue = 0; _glassSlider.maximumValue = 100; _glassSlider.value = _glassOpacity * 100;   // the glass effect's strength, percent (0115)
++    [_glassSlider addTarget:self action:@selector(glassSliderChanged:) forControlEvents:UIControlEventValueChanged];
++    [_glassSlider addTarget:self action:@selector(glassSliderDone:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside];
++    [_editBar addSubview:_glassSlider];
++    UILabel *hint = [[UILabel alloc] init]; hint.tag = 304; hint.numberOfLines = 2;
++    hint.text = [NSString stringWithFormat:@"拖动图标可以移动位置\n玻璃 %.0f%% 是现在的效果，100%% 最深", k_glassAnchor * 100]; hint.textColor = UIColor.whiteColor; hint.font = [UIFont systemFontOfSize:12]; hint.textAlignment = NSTextAlignmentCenter;
+     [_editBar addSubview:hint];
+     [self addSubview:_editBar];
+     _editHighlight = [CAShapeLayer layer];   // the ring around the selected icon (the slider's target): on top of the icons, hidden until the editor opens
+@@ -908,16 +992,18 @@ static NSString *const k_hud_layout_key = @"DmHudLayout";
+     _editHighlight.hidden = YES;
+     [_controls addSublayer:_editHighlight];
+ }
+-- (void)layoutEditBar {   // the bar's top row (title, size label, slider, Done), the hint below, centred at the top
++- (void)layoutEditBar {   // the bar's rows (title, size label, slider, Done; the glass label and slider), the hint below, centred at the top
+     if (!_editBar) return;
+-    CGFloat w = fmin(self.bounds.size.width * 0.8, 480), h = 62;
++    CGFloat w = fmin(self.bounds.size.width * 0.8, 480), h = 108;
+     _editBar.frame = CGRectMake((self.bounds.size.width - w) / 2, self.safeAreaInsets.top + 8, w, h);
+     CGFloat x = 12, doneW = 48;
+     UIView *title = [_editBar viewWithTag:301]; title.frame = CGRectMake(x, 8, 80, 24); x += 88;
+     UIView *size = [_editBar viewWithTag:302]; size.frame = CGRectMake(x, 8, 32, 24); x += 36;
+     _editSlider.frame = CGRectMake(x, 10, w - x - doneW - 24, 20);
+     UIView *done = [_editBar viewWithTag:303]; done.frame = CGRectMake(w - doneW - 12, 8, doneW, 24);
+-    UIView *hint = [_editBar viewWithTag:304]; hint.frame = CGRectMake(0, 36, w, 18);
++    UIView *glass = [_editBar viewWithTag:305]; glass.frame = CGRectMake(12, 38, 32, 20);
++    _glassSlider.frame = CGRectMake(48, 40, w - 48 - 12, 20);
++    UIView *hint = [_editBar viewWithTag:304]; hint.frame = CGRectMake(0, 66, w, 34);
+ }
+ - (void)openPadSettings {   // the in-game menu's "按键设置": hide the gear (it cannot be tapped now), show the editor
+     if (_padOff || _editing) return;
+@@ -933,6 +1019,7 @@ static NSString *const k_hud_layout_key = @"DmHudLayout";
+     _editing = NO;
+     _editTouch = nil;
+     [self saveLineLayout];
++    [self saveGlassOpacity];
+     [self updateControlVisibility];
+     _editBar.hidden = YES;
+     [self setNeedsLayout];
+@@ -946,12 +1033,20 @@ static NSString *const k_hud_layout_key = @"DmHudLayout";
+     (void)s;
+     [self saveLineLayout];
+ }
++- (void)glassSliderChanged:(UISlider *)s {   // the glass slider: the effect's strength, live
++    _glassOpacity = s.value / 100;
++    [self applyGlassOpacity];
++}
++- (void)glassSliderDone:(UISlider *)s {   // the slider's touch is up: save the strength
++    (void)s;
++    [self saveGlassOpacity];
++}
+ - (void)selectEditControl:(int)e {   // tap an icon in the editor: it becomes the one the slider tunes
+     if (e < 0 || e >= E_N) return;
+     _editSelected = e;
+     _editSlider.value = _lineSizes[e];
+     UILabel *hint = (UILabel *)[_editBar viewWithTag:304];
+-    hint.text = [NSString stringWithFormat:@"当前：%@ · 拖动图标可以移动位置", k_lineEditNames[e]];
++    hint.text = [NSString stringWithFormat:@"当前：%@ · 拖动图标可以移动位置\n玻璃 %.0f%% 是现在的效果，100%% 最深", k_lineEditNames[e], k_glassAnchor * 100];
+     [self layoutEditHighlight];
+ }
+ - (void)layoutEditHighlight {   // the ring around the selected icon while the editor is open
+-- 
+2.43.0
+

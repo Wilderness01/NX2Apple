@@ -1,0 +1,78 @@
+From 27bafba90b5f6461be13b6cd6f0b409e286d0fca Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Wed, 11 Nov 2026 12:35:08 +0000
+Subject: [PATCH] Pad: the button editor's size slider goes to 3.0 (0114)
+
+---
+ dm/ios/Sources/DmGamepad.m | 23 +++++++++++++++--------
+ 1 file changed, 15 insertions(+), 8 deletions(-)
+
+diff --git a/dm/ios/Sources/DmGamepad.m b/dm/ios/Sources/DmGamepad.m
+index b14477b..f794de8 100644
+--- a/dm/ios/Sources/DmGamepad.m
++++ b/dm/ios/Sources/DmGamepad.m
+@@ -173,8 +173,8 @@ static void pads_start(void);   // Physical controllers, below
+     UIVisualEffectView *_glassView[G_N];           // iOS 26+: the real Liquid Glass behind each icon (nil below iOS 26)
+     CAGradientLayer *_glassDisc[G_N];              // below iOS 26: a vector glass disc drawn in code (nil on iOS 26+)
+     CGPoint _lCentre;                              // the floating left stick's centre: where its touch landed
+-    CGFloat _lineScale;                            // the legacy global size (migration default): 0.7 to 1.4, 1 is built-in; the slider no longer changes it
+-    CGFloat _lineSizes[E_N];                       // each movable icon's own size, 0.7 to 1.4 (NSUserDefaults DmPadLineLayout "sizes")
++    CGFloat _lineScale;                            // the legacy global size (migration default): 0.7 to 3.0, 1 is built-in; the slider no longer changes it
++    CGFloat _lineSizes[E_N];                       // each movable icon's own size, 0.7 to 3.0 (NSUserDefaults DmPadLineLayout "sizes")
+     int _editSelected;                             // the movable control the size slider tunes (E_*, A by default)
+     CAShapeLayer *_editHighlight;                  // the ring around the selected icon while the editor is open
+     NSMutableDictionary<NSString *, NSValue *> *_lineOffsets;   // the drag offsets, points from each control's built-in centre (NSUserDefaults DmPadLineLayout)
+@@ -768,17 +768,24 @@ static BOOL g_hintShown;   // once per launch
+     return self.faceR * _lineSizes[b == B_A ? E_A : b == B_B ? E_B : E_Y];
+ }
+ - (CGFloat)lineFaceHitR:(int)b {   // a diamond key's hit radius, likewise (faceAt, the editor)
+-    return self.faceHitR * _lineSizes[b == B_A ? E_A : b == B_B ? E_B : E_Y];
++    (void)self.geo;   // the built-in radius: _geoLine's faceHitR already carries the diamond's biggest size (applyLineAdjustments), so it must not be scaled again here
++    return _geo.faceHitR * _lineSizes[b == B_A ? E_A : b == B_B ? E_B : E_Y];
+ }
+ - (CGFloat)linePillRFor:(int)e { return 20 * self.u * _lineSizes[e]; }   // + / - are circles of 20u radius (DmPadGeometry.h), times their own size
+ - (CGFloat)lineExtraRFor:(int)e { return self.faceR * _lineSizes[e]; }   // jump / photo are the diamond key's size, times their own size
+ - (void)applyLineAdjustments:(DmPadGeo *)g {   // the editor's size and drag offsets, on top of the built-in geometry
+     // The diamond keys share faceR, so it stays built-in here: each key's own radius is
+-    // applied where it is drawn and hit-tested (lineFaceR, lineFaceHitR), and the geometry's
+-    // hit test has room for it (its face test divides by faceR * 1.6, which covers a 1.4x key).
++    // applied where it is drawn and hit-tested (lineFaceR, lineFaceHitR). The geometry's
++    // face test divides by MAX(faceR * 1.6, faceHitR): a 3.0x key's edge sits faceGap +
++    // 3.0 * faceR from the diamond's centre, past the 1.6x divisor, so a touch on it would
++    // fall through to the right stick or the game; the hit radius below is widened to cover
++    // the biggest key's hit circle, so the shared test still routes it to the diamond and
++    // faceAt: then picks the key by its own radius.
+     // The drop keys and the pills have their own slots, so they scale there. The stick, the
+     // knob, the menu and L3 / R3 are not adjustable, so they keep the legacy global size.
+     CGFloat s = _lineScale;
++    CGFloat maxFace = fmax(_lineSizes[E_A], fmax(_lineSizes[E_B], _lineSizes[E_Y]));
++    g->faceHitR = fmax(g->faceHitR, g->faceR * 1.25 * maxFace);   // the diamond's hit radius, so dm_pad_hit's face test covers the biggest key (lineFaceHitR uses the built-in radius, so this is not scaled twice)
+     g->dropR[DM_PAD_ZL] *= _lineSizes[E_ZL]; g->dropR[DM_PAD_L] *= _lineSizes[E_L];
+     g->clickR *= s; g->stickR *= s; g->knobR *= s; g->swapR *= s;
+     for (int i = 0; i < 2; i++) { CGFloat ps = _lineSizes[i == DM_PAD_MINUS ? E_MINUS : E_PLUS]; CGRect r = g->pill[i]; CGFloat w = r.size.width * ps, h = r.size.height * ps; g->pill[i] = CGRectMake(CGRectGetMidX(r) - w / 2, CGRectGetMidY(r) - h / 2, w, h); }
+@@ -813,11 +820,11 @@ static NSString *const k_line_layout_key = @"DmPadLineLayout";
+     NSDictionary *d = [NSUserDefaults.standardUserDefaults dictionaryForKey:k_line_layout_key];
+     if (![d isKindOfClass:[NSDictionary class]]) return;
+     NSNumber *s = d[@"scale"];
+-    if ([s isKindOfClass:[NSNumber class]]) _lineScale = fmin(fmax(s.doubleValue, 0.7), 1.4);   // the slider's range
++    if ([s isKindOfClass:[NSNumber class]]) _lineScale = fmin(fmax(s.doubleValue, 0.7), 3.0);   // the slider's range
+     NSDictionary *z = d[@"sizes"];
+     for (int e = 0; e < E_N; e++) {   // an icon's own size, else the legacy global size (migration), else built-in
+         NSNumber *v = [z isKindOfClass:[NSDictionary class]] ? z[k_lineEditKeys[e]] : nil;
+-        _lineSizes[e] = [v isKindOfClass:[NSNumber class]] ? fmin(fmax(v.doubleValue, 0.7), 1.4) : _lineScale;
++        _lineSizes[e] = [v isKindOfClass:[NSNumber class]] ? fmin(fmax(v.doubleValue, 0.7), 3.0) : _lineScale;
+     }
+     NSDictionary *o = d[@"offsets"];
+     if ([o isKindOfClass:[NSDictionary class]]) for (NSString *name in o) {
+@@ -882,7 +889,7 @@ static NSString *const k_hud_layout_key = @"DmHudLayout";
+     size.text = @"大小"; size.textColor = UIColor.whiteColor; size.font = [UIFont systemFontOfSize:13]; size.textAlignment = NSTextAlignmentRight;
+     [_editBar addSubview:size];
+     _editSlider = [[UISlider alloc] init];
+-    _editSlider.minimumValue = 0.7; _editSlider.maximumValue = 1.4; _editSlider.value = _lineSizes[E_A];   // A is selected by default (openPadSettings)
++    _editSlider.minimumValue = 0.7; _editSlider.maximumValue = 3.0; _editSlider.value = _lineSizes[E_A];   // A is selected by default (openPadSettings)
+     [_editSlider addTarget:self action:@selector(editSliderChanged:) forControlEvents:UIControlEventValueChanged];
+     [_editSlider addTarget:self action:@selector(editSliderDone:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside];
+     [_editBar addSubview:_editSlider];
+-- 
+2.43.0
+
