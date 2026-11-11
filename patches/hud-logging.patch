@@ -1,0 +1,565 @@
+From 34958bbc103b8ed8291b5303c9908283b28e8b42 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Wed, 11 Nov 2026 10:16:11 +0000
+Subject: [PATCH] HUD logging (diagnostic only): scan for Pane::Calculate, log
+ addresses
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Scheme A (hud-investigation.md §6): at the first present, scan the
+loaded main module for nn::ui2d typeinfo strings, the typeinfo objects
+pointing at them, the vtables pointing at those, and every vtable-like
+run — scoring each table's slot-19 function against Pane::Calculate's
+structure (child loop + recursive slot-19 call + matrix-helper call) —
+and log the candidates to Documents/log.txt. Read-only: no mprotect,
+no vtable writes, no behaviour change. Env DM_HUDLOG=1 on, default on.
+Diagnostic only: never enters patches/series.
+---
+ dm/host/hudlog_scan.h | 149 +++++++++++++++++
+ dm/host/uw.c          | 365 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 514 insertions(+)
+ create mode 100644 dm/host/hudlog_scan.h
+
+diff --git a/dm/host/hudlog_scan.h b/dm/host/hudlog_scan.h
+new file mode 100644
+index 0000000..59326bd
+--- /dev/null
++++ b/dm/host/hudlog_scan.h
+@@ -0,0 +1,149 @@
++// hudlog_scan.h — HUD logging (diagnostic only) helpers.
++// Pure AArch64 instruction classification + Pane::Calculate structural
++// scoring + byte search. No platform headers beyond <stddef.h>,
++// <stdint.h>, <string.h>; no logging here — the caller (dm/host/uw.c)
++// owns all logging and all memory access. The same file is compiled
++// into a host test harness (see fix-hudlog-notes.md), so the decoders
++// are checked against the real DmIOS binary before the patch ships.
++// Masks are the debugged ones from hud-investigation.md §3.3 (BL mask
++// 0xFC000000, TBZ imm 14-bit).
++#ifndef DM_HOST_HUDLOG_SCAN_H
++#define DM_HOST_HUDLOG_SCAN_H
++
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Feature bits reported with each score (also logged, so the reader sees WHY).
++#define HUDLOG_F_RECUR_LOOP 0x01u  // ldr #0x98 + blr, inside a backward branch's span
++#define HUDLOG_F_RECUR      0x02u  // ldr #0x98 + blr, no loop evidence
++#define HUDLOG_F_BLCALL     0x04u  // >= 1 bl (matrix-helper call)
++#define HUDLOG_F_PANEFIELDS 0x08u  // loads from +0x30/+0x48/+0x50/+0x58
++#define HUDLOG_F_FLAGCHECK  0x10u  // ldrb / tbz / cbz (changed-flag test)
++#define HUDLOG_F_GOODLEN    0x20u  // ends with ret, 0x40..0x600 bytes long
++#define HUDLOG_MAX_INSNS    200    // most instructions read per function
++
++static inline int hud_is_ret(uint32_t i) { return i == 0xd65f03c0u; }
++static inline int hud_is_bl(uint32_t i) { return (i & 0xfc000000u) == 0x94000000u; }
++static inline int hud_is_b(uint32_t i) { return (i & 0xfc000000u) == 0x14000000u; }
++static inline int hud_is_bcond(uint32_t i) { return (i & 0xff000010u) == 0x54000000u; }
++static inline int hud_is_blr(uint32_t i, unsigned r) { return i == (0xd63f0000u | (r << 5)); }
++static inline int hud_is_ldr_imm(uint32_t i, unsigned *rd, unsigned *rn, unsigned *imm) {
++    if ((i & 0xffc00000u) != 0xf9400000u) return 0;
++    *rd = i & 31u; *rn = (i >> 5) & 31u; *imm = ((i >> 10) & 0xfffu) * 8u; return 1;
++}
++static inline int hud_is_ldr0(uint32_t i) { return (i & 0xfffffc00u) == 0xf9400000u; }
++static inline int hud_is_ldrb_imm(uint32_t i) { return (i & 0xffc00000u) == 0x39400000u; }
++static inline int hud_is_tbz(uint32_t i) { return (i & 0x7e000000u) == 0x36000000u; }
++static inline int hud_is_cbz(uint32_t i) { return (i & 0x7f000000u) == 0x34000000u; }
++
++static inline int32_t hud_sext(uint32_t v, unsigned bits) {
++    if (v & (1u << (bits - 1))) return (int32_t)v - (int32_t)(1u << bits);
++    return (int32_t)v;
++}
++
++// Branch target index (in instructions) relative to the instruction at
++// idx; -1 when the instruction is not a PC-relative branch.
++static inline int hud_branch_target(const uint32_t *code, size_t idx) {
++    uint32_t i = code[idx];
++    if (hud_is_bl(i) || hud_is_b(i)) return (int)idx + hud_sext(i & 0x3ffffffu, 26);
++    if (hud_is_bcond(i)) return (int)idx + hud_sext((i >> 5) & 0x7ffffu, 19);
++    if (hud_is_tbz(i)) return (int)idx + hud_sext((i >> 5) & 0x3fffu, 14);
++    if (hud_is_cbz(i)) return (int)idx + hud_sext((i >> 5) & 0x7ffffu, 19);
++    return -1;
++}
++
++// A word that could start a function: not zero, not all ones, and not in
++// the unallocated 0x0xxxxxxx range (real A64 code essentially never opens
++// with a top nibble of 0). Heuristic only — it filters string/data words
++// out of the vtable-run scan.
++static inline int hud_code_word_ok(uint32_t w) {
++    return w != 0 && w != 0xffffffffu && (w >> 28) != 0;
++}
++
++// Score a candidate Pane::Calculate body: code[0..ninsn) must already be
++// bounds-checked by the caller. The recursive slot-19 call is the
++// defining feature of Calculate: without it the function scores 0, no
++// matter how many of the weaker features it has (a real non-Calculate
++// scores 3 on BLCALL + FLAGCHECK + GOODLEN alone). With the recursion
++// the score is 2..7 (RECUR_LOOP 3 or RECUR 2, plus 1 each for BLCALL,
++// PANEFIELDS, FLAGCHECK, GOODLEN); *feat_out is the feature bitmask,
++// *len_out the instruction count to the first ret (ninsn when no ret
++// was found inside the cap).
++static inline int hud_score_calc(const uint32_t *code, size_t ninsn,
++                                 unsigned *feat_out, unsigned *len_out) {
++    unsigned feat = 0;
++    size_t len = 0, lim;
++    int recur_idx = -1, nbl = 0, has_fields = 0, has_flag = 0;
++    if (ninsn == 0) { *feat_out = 0; *len_out = 0; return 0; }
++    for (size_t i = 0; i < ninsn; i++) {
++        if (hud_is_ret(code[i])) { len = i + 1; break; }
++    }
++    if (len == 0) len = ninsn;   // no ret in cap: suspicious, no GOODLEN
++    else if (len * 4 >= 0x40 && len * 4 <= 0x600) feat |= HUDLOG_F_GOODLEN;
++    lim = len;
++    for (size_t i = 0; i < lim; i++) {
++        uint32_t ins = code[i];
++        unsigned rd = 0, rn = 0, imm = 0;
++        if (hud_is_bl(ins)) nbl++;
++        if (hud_is_ldr_imm(ins, &rd, &rn, &imm)) {
++            if (imm == 0x98) {
++                // vtable load just before? (ldr xRn,[xM] with rd == rn)
++                int vt = 0;
++                size_t b0 = (i >= 2) ? (i - 2) : 0;
++                for (size_t b = b0; b < i; b++)
++                    if (hud_is_ldr0(code[b]) && (code[b] & 31u) == rn) { vt = 1; break; }
++                if (vt) {
++                    for (size_t f = i + 1; f < lim && f <= i + 4; f++)
++                        if (hud_is_blr(code[f], rd)) { if (recur_idx < 0) recur_idx = (int)i; break; }
++                }
++            }
++            if (imm == 0x30 || imm == 0x48 || imm == 0x50 || imm == 0x58) has_fields = 1;
++        }
++        if (hud_is_ldrb_imm(ins) || hud_is_tbz(ins) || hud_is_cbz(ins)) has_flag = 1;
++    }
++    if (nbl >= 1) feat |= HUDLOG_F_BLCALL;
++    if (has_fields) feat |= HUDLOG_F_PANEFIELDS;
++    if (has_flag) feat |= HUDLOG_F_FLAGCHECK;
++    int recur_loop = 0;
++    if (recur_idx >= 0) {
++        for (size_t i = 0; i < lim; i++) {
++            int t = hud_branch_target(code, i);
++            if (t >= 0 && t < (int)i && t <= recur_idx && recur_idx <= (int)i) { recur_loop = 1; break; }
++        }
++        feat |= recur_loop ? HUDLOG_F_RECUR_LOOP : HUDLOG_F_RECUR;
++    }
++    if (recur_idx < 0) {   // no recursive call: not Calculate, whatever else it has
++        *feat_out = feat; *len_out = (unsigned)len;
++        return 0;
++    }
++    int score = (recur_loop ? 3 : (recur_idx >= 0 ? 2 : 0))
++        + ((feat & HUDLOG_F_BLCALL) ? 1 : 0)
++        + ((feat & HUDLOG_F_PANEFIELDS) ? 1 : 0)
++        + ((feat & HUDLOG_F_FLAGCHECK) ? 1 : 0)
++        + ((feat & HUDLOG_F_GOODLEN) ? 1 : 0);
++    *feat_out = feat; *len_out = (unsigned)len;
++    return score;
++}
++
++// First occurrence of the NUL-terminated needle in [hay, hay+n), or NULL.
++static inline const uint8_t *hud_memsearch(const uint8_t *hay, size_t n, const char *needle) {
++    size_t m = strlen(needle);
++    uint8_t first;
++    size_t i;
++    if (m == 0 || m > n) return NULL;
++    first = (uint8_t)needle[0];
++    for (i = 0; i + m <= n; i++) {
++        if (hay[i] == first && memcmp(hay + i, needle, m) == 0) return hay + i;
++    }
++    return NULL;
++}
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/dm/host/uw.c b/dm/host/uw.c
+index 13b273d..64fa918 100644
+--- a/dm/host/uw.c
++++ b/dm/host/uw.c
+@@ -2,6 +2,7 @@
+ // disassembly evidence (DmIOS file offsets) behind every constant and branch.
+ #include "uw.h"
+ #include "dm.h"
++#include "hudlog_scan.h"  // HUD logging (diagnostic only): A64 decoders + Calculate scorer
+ #include "front.h"   // front_display_pixels: the display in pixels, for DM_ASPECT=auto (0099)
+ #include <math.h>
+ #include <mach/mach.h>   // vm_region_64: query a page's real protection before restoring it (0101)
+@@ -684,7 +685,371 @@ static void uw_update_from_size(double w, double h) {
+     }
+ }
+ 
++// --- HUD logging (diagnostic only; Scheme A, hud-investigation.md §6) ---
++// The game HUD (compass / hearts / coins / moons) is drawn by nn::ui2d
++// (Pane/Layout), but Pane::Calculate was never located by static
++// analysis: the binary is stripped, its vtables are filled only at
++// runtime, and pane names live in romfs — not in the code. This build
++// only LOGS: the user runs it once and sends back Documents/log.txt,
++// and the addresses in it are what 0113 will hook.
++// At the first present — after the loader's relocate() has filled the
++// vtables — it scans the loaded main module for:
++//   (a) the nn::ui2d typeinfo name strings,
++//   (b) the typeinfo objects pointing at them,
++//   (c) the vtables pointing at the typeinfo objects, and
++//   (d) every vtable-like run in the module, scoring each table's
++//       slot-19 function against Pane::Calculate's structure
++//       (child loop + recursive slot-19 call + matrix-helper call).
++// READ-ONLY: no mprotect, no vtable writes, no behaviour change. The
++// scan only reads the module's mapped range (the same range
++// uw_scan_hook_calcmatrix already reads) plus the functions it points
++// at. Env: DM_HUDLOG=1 on, default on; "0" disables. Diagnostic-only
++// patch (hud-logging.patch): it never enters patches/series.
++#define HUDLOG(...) LOG("[hudlog] " __VA_ARGS__)
++#define HUDLOG_TOP_N 16        // most candidates kept (sorted by score)
++#define HUDLOG_HEARTBEAT 600   // presents between stability lines
++#define HUDLOG_RUN_MIN 8       // a vtable-like run needs >= 8 pointer slots
++#define HUDLOG_RUN_MAX 1024    // clamp a run's recorded length (slot math stays valid)
++#define HUDLOG_MAX_CANDS 512   // most runs scored per scan (overflow guard)
++#define HUDLOG_MAX_STRHITS 3   // most occurrences followed per string
++#define HUDLOG_MAX_TYPEINFOS 6   // typeinfo names in hudlog_typeinfos
++#define HUDLOG_MAX_T 16        // most typeinfo objects tracked
++
++typedef struct {
++    uintptr_t table;   // vtable address (runtime); 0 when unknown (anchor path)
++    uintptr_t fn;      // slot target (runtime)
++    unsigned slots;    // run length in slots (0 = unknown, anchor path)
++    unsigned slot;     // which slot scored (19 normally)
++    int score;
++    unsigned feat;
++    unsigned len;      // instructions to ret (0 = no ret within cap)
++    uintptr_t table_bases[8];  // distinct tables whose scored slot points at this fn
++    unsigned n_tables;         // ...deduped with an 8-byte tolerance, so a table
++                               // found via both run-start hypotheses (base and
++                               // base+8) counts once; two real tables can never
++                               // be 8 bytes apart
++} hudlog_cand_t;
++
++static struct {
++    uint8_t enabled;   // DM_HUDLOG (default on; "0" disables)
++    uint8_t done;      // one-shot scan finished
++    uint8_t retried;   // empty-scan retry at 600 presents done
++    uint32_t frames;   // presents seen
++    uint32_t runs;     // vtable-like runs found
++    uint32_t examined; // runs scored
++    hudlog_cand_t top[HUDLOG_TOP_N];
++    int top_n;
++    uintptr_t top_vt;  // best table (0 if none)
++    uintptr_t top_fn;  // its slot-19 target (0 if none)
++    int top_score;
++} g_hudlog;
++
++static const char *const hudlog_typeinfos[] = {
++    "N2nn4ui2d4PaneE", "N2nn4ui2d6LayoutE", "N2nn4ui2d8DrawInfoE",
++    "N2nn4ui2d6detail8PaneBaseE", "N2nn4ui2d5GroupE", "N2nn4ui2d7PictureE",
++};
++static const char *const hudlog_hudnames[] = { "CoinCounter", "CompassArea", "MoonNum" };
++
++// Runtime address -> DmIOS file offset. Valid for main's __dmmainx0 text
++// only (DmIOS fileoff = main+off + 0xf4000, hud-investigation.md §8);
++// callers print it only for in-range addresses.
++static uintptr_t hudlog_fileoff(uintptr_t addr) {
++    return (uintptr_t)(addr - g_st.mod_base) + 0xf4000;
++}
++static int hudlog_in_range(uintptr_t addr) {
++    return addr >= g_st.mod_base && addr < g_st.mod_base + g_st.mod_size;
++}
++
++static void hudlog_add_cand(uintptr_t table, uintptr_t fn, unsigned slots, unsigned slot,
++                            int score, unsigned feat, unsigned len) {
++    int at = -1;
++    int i;
++    // A lone GOODLEN / BLCALL / PANEFIELDS / FLAGCHECK bit (score 1)
++    // does not identify Calculate — the recursive call alone scores 2,
++    // so anything below 2 is noise and would crowd the top list.
++    if (score < 2) return;
++    for (i = 0; i < g_hudlog.top_n; i++) {
++        if (g_hudlog.top[i].fn == fn) {
++            // Subclasses that do not override Calculate share the base
++            // implementation: many tables, one fn. Count distinct tables
++            // (8-byte tolerance: base and base+8 are the same table found
++            // via the two run-start hypotheses), keep the best-scoring
++            // table, and re-sort if the score improved.
++            int seen = 0;
++            int k;
++            for (k = 0; k < (int)g_hudlog.top[i].n_tables; k++) {
++                uintptr_t d = (table > g_hudlog.top[i].table_bases[k])
++                    ? (table - g_hudlog.top[i].table_bases[k])
++                    : (g_hudlog.top[i].table_bases[k] - table);
++                if (d <= 8) { seen = 1; break; }
++            }
++            if (!seen && g_hudlog.top[i].n_tables < 8)
++                g_hudlog.top[i].table_bases[g_hudlog.top[i].n_tables++] = table;
++            if (score > g_hudlog.top[i].score) {
++                g_hudlog.top[i].score = score; g_hudlog.top[i].feat = feat;
++                g_hudlog.top[i].len = len; g_hudlog.top[i].table = table;
++                g_hudlog.top[i].slots = slots; g_hudlog.top[i].slot = slot;
++                while (i > 0 && g_hudlog.top[i].score > g_hudlog.top[i - 1].score) {
++                    hudlog_cand_t tmp = g_hudlog.top[i];
++                    g_hudlog.top[i] = g_hudlog.top[i - 1];
++                    g_hudlog.top[i - 1] = tmp;
++                    i--;
++                }
++            }
++            return;
++        }
++        if (at < 0 && score > g_hudlog.top[i].score) at = i;
++    }
++    if (g_hudlog.top_n < HUDLOG_TOP_N) {
++        if (at < 0) at = g_hudlog.top_n;
++        memmove(&g_hudlog.top[at + 1], &g_hudlog.top[at], (size_t)(g_hudlog.top_n - at) * sizeof(hudlog_cand_t));
++        g_hudlog.top_n++;
++    } else {
++        if (at < 0) return;   // worse than the worst kept
++        memmove(&g_hudlog.top[at + 1], &g_hudlog.top[at], (size_t)(HUDLOG_TOP_N - 1 - at) * sizeof(hudlog_cand_t));
++    }
++    g_hudlog.top[at].table = table; g_hudlog.top[at].fn = fn;
++    g_hudlog.top[at].slots = slots; g_hudlog.top[at].slot = slot;
++    g_hudlog.top[at].score = score; g_hudlog.top[at].feat = feat;
++    g_hudlog.top[at].len = len;
++    g_hudlog.top[at].table_bases[0] = table; g_hudlog.top[at].n_tables = 1;
++}
++
++static void hudlog_score_slot(uintptr_t table, unsigned slots, unsigned slot) {
++    uintptr_t fn;
++    size_t avail;
++    unsigned feat = 0, len = 0;
++    int score;
++    if (slot >= 256) return;
++    if (table < g_st.mod_base || table + (uintptr_t)(slot + 1) * 8 > g_st.mod_base + g_st.mod_size) return;
++    fn = *(uintptr_t *)(table + (uintptr_t)slot * 8);
++    if (!hudlog_in_range(fn) || (fn & 3)) return;
++    avail = (size_t)((g_st.mod_base + g_st.mod_size - fn) / 4);
++    if (avail > HUDLOG_MAX_INSNS) avail = HUDLOG_MAX_INSNS;
++    if (avail == 0) return;
++    score = hud_score_calc((const uint32_t *)fn, avail, &feat, &len);
++    if (score > 0) hudlog_add_cand(table, fn, slots, slot, score, feat, len);
++}
++
++static void hudlog_finish_run(uintptr_t start, unsigned len) {
++    g_hudlog.runs++;
++    if (g_hudlog.examined >= HUDLOG_MAX_CANDS) return;
++    g_hudlog.examined++;
++    // The run start is approximate: it may be the table's -1 typeinfo
++    // slot (also a pointer) rather than slot 0, so the table's real
++    // slot 19 is at start+0x98 or at start+0xA0. Score both.
++    if (len >= 20) hudlog_score_slot(start, len, 19);
++    if (len >= 21) hudlog_score_slot(start + 8, len - 1, 19);
++}
++
++static void hudlog_scan(void) {
++    uintptr_t lo = g_st.mod_base, hi = lo + g_st.mod_size;
++    uintptr_t str_addr[HUDLOG_MAX_TYPEINFOS * HUDLOG_MAX_STRHITS];
++    int str_which[HUDLOG_MAX_TYPEINFOS * HUDLOG_MAX_STRHITS];
++    uintptr_t t_addr[HUDLOG_MAX_T];
++    int found_t[HUDLOG_MAX_T] = {0};
++    int n_str = 0, n_t = 0;
++    int i, j;
++    uintptr_t p;
++
++    HUDLOG("scan start: main=%p size=%#x (runtime addresses; DmIOS fileoff = main+off + 0xf4000 for __dmmainx0 text)",
++           (void *)lo, (unsigned)g_st.mod_size);
++
++    // Pass 1: typeinfo name strings + HUD pane names. The HUD names are
++    // expected NOT to be in main (they live only in romfs .bflyt) — a
++    // miss there is normal. A HUD name that IS in main is logged with
++    // every occurrence (up to 3): the bare layout-table entry is usually
++    // not the first hit (e.g. MoonNum first appears inside
++    // "Data_File_MoonNum").
++    for (i = 0; i < (int)(sizeof(hudlog_typeinfos) / sizeof(hudlog_typeinfos[0])); i++) {
++        const uint8_t *cur = (const uint8_t *)lo;
++        int hits = 0;
++        while (hits < HUDLOG_MAX_STRHITS && cur < (const uint8_t *)hi) {
++            const uint8_t *q = hud_memsearch(cur, (size_t)(hi - (uintptr_t)cur), hudlog_typeinfos[i]);
++            if (!q) break;
++            str_addr[n_str] = (uintptr_t)q;
++            str_which[n_str] = i;
++            n_str++;
++            HUDLOG("typeinfo str %-28s at %p (main+%#x fileoff %#x)",
++                   hudlog_typeinfos[i], (void *)q, (unsigned)((uintptr_t)q - lo),
++                   (unsigned)hudlog_fileoff((uintptr_t)q));
++            hits++;
++            cur = q + 1;
++        }
++        if (hits == 0) HUDLOG("[RED] typeinfo str %s NOT FOUND in main", hudlog_typeinfos[i]);
++    }
++    for (i = 0; i < (int)(sizeof(hudlog_hudnames) / sizeof(hudlog_hudnames[0])); i++) {
++        const uint8_t *cur = (const uint8_t *)lo;
++        int hits = 0;
++        while (hits < HUDLOG_MAX_STRHITS && cur < (const uint8_t *)hi) {
++            const uint8_t *q = hud_memsearch(cur, (size_t)(hi - (uintptr_t)cur), hudlog_hudnames[i]);
++            if (!q) break;
++            HUDLOG("hud name %-12s at %p (main+%#x fileoff %#x)", hudlog_hudnames[i], (void *)q,
++                   (unsigned)((uintptr_t)q - lo), (unsigned)hudlog_fileoff((uintptr_t)q));
++            hits++;
++            cur = q + 1;
++        }
++        if (hits == 0)
++            HUDLOG("hud name %s not in main (expected: names live only in romfs .bflyt)", hudlog_hudnames[i]);
++    }
++
++    // Pass 2: one qword pass — find typeinfo objects (qword == a name
++    // string address) and vtable-like runs (score each run's slot 19).
++    for (p = lo; p + 8 <= hi; p += 8) {
++        uintptr_t v = *(uintptr_t *)p;
++        for (j = 0; j < n_str; j++) {
++            if (v == str_addr[j] && n_t < HUDLOG_MAX_T) {
++                uintptr_t t = p - 8;
++                t_addr[n_t++] = t;
++                HUDLOG("typeinfo obj: name %s at %p (main+%#x), obj %p (main+%#x fileoff %#x), obj vtable %p",
++                       hudlog_typeinfos[str_which[j]], (void *)str_addr[j], (unsigned)(str_addr[j] - lo),
++                       (void *)t, (unsigned)(t - lo), (unsigned)hudlog_fileoff(t), (void *)*(uintptr_t *)t);
++                break;
++            }
++        }
++    }
++    {
++        uintptr_t run_start = 0;
++        unsigned run_len = 0;
++        for (p = lo; p + 8 <= hi; p += 8) {
++            uintptr_t v = *(uintptr_t *)p;
++            int ok = uw_is_vtable_entry(v) && (v + 4 <= hi) && hud_code_word_ok(*(const uint32_t *)v);
++            if (ok) {
++                if (run_len == 0) run_start = p;
++                if (run_len < HUDLOG_RUN_MAX) run_len++;
++            } else {
++                if (run_len >= HUDLOG_RUN_MIN) hudlog_finish_run(run_start, run_len);
++                run_len = 0;
++            }
++        }
++        if (run_len >= HUDLOG_RUN_MIN) hudlog_finish_run(run_start, run_len);
++    }
++
++    // Pass 3: one qword pass — vtables pointing at any typeinfo object.
++    for (p = lo; p + 8 <= hi; p += 8) {
++        uintptr_t v = *(uintptr_t *)p;
++        for (j = 0; j < n_t; j++) {
++            uintptr_t t, vt;
++            int off0;
++            uintptr_t s19 = 0, s21 = 0;
++            if (v != t_addr[j] || found_t[j] >= 8) continue;
++            found_t[j]++;
++            t = t_addr[j];
++            vt = p + 8;   // vtable = the qword after the -1 typeinfo slot
++            off0 = (vt >= lo + 16) && *(uintptr_t *)(vt - 16) == 0;
++            if (vt + 22 * 8 <= hi) {
++                s19 = *(uintptr_t *)(vt + 19 * 8);
++                s21 = *(uintptr_t *)(vt + 21 * 8);
++            }
++            HUDLOG("vtable: typeinfo %p (main+%#x) -> table %p (main+%#x fileoff %#x), offset-to-top %s",
++                   (void *)t, (unsigned)(t - lo), (void *)vt, (unsigned)(vt - lo),
++                   (unsigned)hudlog_fileoff(vt), off0 ? "0" : "!=0 (secondary base?)");
++            if (s19 && hudlog_in_range(s19) && s21 && hudlog_in_range(s21))
++                HUDLOG("vtable %p: slot19 %p (main+%#x fileoff %#x), slot21 %p (main+%#x fileoff %#x)",
++                       (void *)vt, (void *)s19, (unsigned)(s19 - lo), (unsigned)hudlog_fileoff(s19),
++                       (void *)s21, (unsigned)(s21 - lo), (unsigned)hudlog_fileoff(s21));
++            else
++                HUDLOG("vtable %p: slot19 %p, slot21 %p (one or both out of main)",
++                       (void *)vt, (void *)s19, (void *)s21);
++            // Hedge the slot-19 assumption: score slots 16..24 of this
++            // (known ui2d) table as well.
++            for (unsigned s = 16; s <= 24; s++) hudlog_score_slot(vt, 0, s);
++            break;
++        }
++    }
++    for (j = 0; j < n_t; j++)
++        if (found_t[j] == 0)
++            HUDLOG("[RED] no vtable found pointing at typeinfo %p (main+%#x)",
++                   (void *)t_addr[j], (unsigned)(t_addr[j] - lo));
++
++    // Hedge the slot-19 assumption for the best run-scan candidates too:
++    // score slots 16..24 of the top 8 tables. The run start may be the
++    // table's -1 typeinfo slot, so try the table at run_start and at
++    // run_start+8. Anchor-path entries (slots == 0) are skipped: their
++    // slots 16..24 were already scored in pass 3. Snapshot first:
++    // scoring mutates the top list, so iterating it directly would be wrong.
++    {
++        uintptr_t top_base[16];
++        unsigned top_slots[16];
++        int n_base = 0;
++        for (i = 0; i < g_hudlog.top_n && i < 8; i++) {
++            if (g_hudlog.top[i].table == 0 || g_hudlog.top[i].slots == 0) continue;
++            top_base[n_base] = g_hudlog.top[i].table;
++            top_slots[n_base] = g_hudlog.top[i].slots;
++            n_base++;
++            top_base[n_base] = g_hudlog.top[i].table + 8;
++            top_slots[n_base] = g_hudlog.top[i].slots - 1;
++            n_base++;
++        }
++        for (i = 0; i < n_base; i++) {
++            for (unsigned s = 16; s <= 24; s++) {
++                if (s == 19) continue;
++                hudlog_score_slot(top_base[i], top_slots[i], s);
++            }
++        }
++    }
++
++    if (g_hudlog.top_n > 0) {
++        g_hudlog.top_vt = g_hudlog.top[0].table;
++        g_hudlog.top_fn = g_hudlog.top[0].fn;
++        g_hudlog.top_score = g_hudlog.top[0].score;
++    }
++    HUDLOG("scan done: %u runs, %u examined, %d candidates, best score %d",
++           g_hudlog.runs, g_hudlog.examined, g_hudlog.top_n, g_hudlog.top_score);
++    for (i = 0; i < g_hudlog.top_n; i++) {
++        hudlog_cand_t *c = &g_hudlog.top[i];
++        HUDLOG("candidate #%d: score %d feat %#x len %u insns, slot %u fn %p (main+%#x fileoff %#x), table %p (main+%#x, %u slots, shared by %u tables)",
++               i, c->score, c->feat, c->len, c->slot, (void *)c->fn,
++               (unsigned)(c->fn - lo), (unsigned)hudlog_fileoff(c->fn),
++               (void *)c->table, (unsigned)(c->table - lo), c->slots, c->n_tables);
++    }
++    if (g_hudlog.top_n == 0)
++        HUDLOG("[RED] scan found no Calculate candidates at all — see the [RED] lines above for which stage came up empty");
++}
++
++static void hudlog_frame(void) {
++    if (g_hudlog.frames == 0) {
++        const char *e = getenv("DM_HUDLOG");
++        g_hudlog.enabled = !(e && *e == '0');
++        if (!g_hudlog.enabled) return;
++    }
++    g_hudlog.frames++;
++    if (!g_hudlog.done) {
++        if (!g_st.mod_base || !g_st.mod_size) {
++            HUDLOG("[RED] scan skipped: main module not registered");
++            g_hudlog.done = 1;
++            return;
++        }
++        hudlog_scan();
++        g_hudlog.done = 1;
++        return;
++    }
++    if (g_hudlog.frames % HUDLOG_HEARTBEAT != 0) return;
++    if (!g_hudlog.retried && g_hudlog.top_n == 0 && g_hudlog.runs == 0) {
++        // Utterly empty first scan (no strings at all): retry once in case
++        // the module was not fully mapped at the first present.
++        g_hudlog.retried = 1;
++        g_hudlog.done = 0;
++        HUDLOG("retry: first scan found nothing, scanning once more");
++        return;
++    }
++    if (g_hudlog.top_vt) {
++        uintptr_t cur = *(uintptr_t *)(g_hudlog.top_vt + 19 * 8);
++        if (cur != g_hudlog.top_fn)
++            HUDLOG("[RED] heartbeat frames=%u: top slot19 changed %p -> %p",
++                   g_hudlog.frames, (void *)g_hudlog.top_fn, (void *)cur);
++        else
++            HUDLOG("heartbeat frames=%u: scan stable, %u runs, top score %d fn %p (main+%#x fileoff %#x)",
++                   g_hudlog.frames, g_hudlog.runs, g_hudlog.top_score,
++                   (void *)g_hudlog.top_fn, (unsigned)(g_hudlog.top_fn - g_st.mod_base),
++                   (unsigned)hudlog_fileoff(g_hudlog.top_fn));
++    } else {
++        HUDLOG("heartbeat frames=%u: no candidates (%u runs)", g_hudlog.frames, g_hudlog.runs);
++    }
++}
++
+ void uw_frame_hook(double w, double h) {
++    hudlog_frame();   // diagnostic only (DM_HUDLOG; default on): read-only scan, first present
+     // Vtable hook, deferred to the first present (0099): uw_init runs during module loading, before the loader's relocate() (loader.c), which
+     // rebases the game's vtables (DT_RELR / R_AARCH64_RELATIVE) and would overwrite the trampoline with the original pointer — the hook
+     // would be silently lost while g_st.hooked still said installed. By the first present the game is relocated and running, so the slot
+-- 
+2.43.0
+
