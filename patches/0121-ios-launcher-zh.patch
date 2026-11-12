@@ -1,4 +1,4 @@
-From 62687f7082c2006f47e53fc3569d392b11d55bde Mon Sep 17 00:00:00 2001
+From b15edaa888c8816c476e6db42b7210f4fcb265a4 Mon Sep 17 00:00:00 2001
 From: seedds <seedds@gmail.com>
 Date: Thu, 12 Nov 2026 15:18:26 +0000
 Subject: [PATCH] 0121: the single-game iOS launcher in Chinese (V1.3.15)
@@ -6,10 +6,10 @@ Subject: [PATCH] 0121: the single-game iOS launcher in Chinese (V1.3.15)
 The DmIOS launcher renders launcher.json rows verbatim, and launcher.json carries English only (dm/games/settings.py). The Mac launcher and the iOS shell translate each row at display time through the fork's l10n table (frontend/l10n/*.json), keyed launch.set.<ENV>, launch.set.<ENV>.note, launch.opt.<ENV>.<value> and launch.section.<Name>; a key the table does not have keeps the English. The DmIOS app does not bundle that table, so LauncherText.swift carries the Chinese strings itself (as \u{...} escapes: the engine writes Chinese as escapes, never as characters), generated from frontend/l10n/zh.json, and translates rows, section headings and the launcher's own chrome strings at display time, falling back to English for a row this build does not know. The model keeps the English section names, so GameMenu.swift's "Controls" match and the shared Mac window are unaffected. iPad (4:3) has no launch.opt key in zh.json; it is added here as iPad (4:3).
 ---
  dm/ios/Sources/GameMenu.swift     |  10 +-
- dm/ios/Sources/Launcher.swift     |  48 ++++-----
+ dm/ios/Sources/Launcher.swift     |  53 +++++-----
  dm/ios/Sources/LauncherRow.swift  |   2 +-
  dm/ios/Sources/LauncherText.swift | 155 ++++++++++++++++++++++++++++++
- 4 files changed, 186 insertions(+), 29 deletions(-)
+ 4 files changed, 188 insertions(+), 32 deletions(-)
  create mode 100644 dm/ios/Sources/LauncherText.swift
 
 diff --git a/dm/ios/Sources/GameMenu.swift b/dm/ios/Sources/GameMenu.swift
@@ -52,7 +52,7 @@ index c21379e..eafa4b0 100644
 +    return UIMenu(title: s.label, subtitle: fixed ? "\(current), \(LauncherText.text("ui.setInEnvTxtInline", "set in env.txt"))" : nil, options: .singleSelection, children: actions)
  }
 diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
-index 61f1639..9633827 100644
+index 61f1639..6c836f5 100644
 --- a/dm/ios/Sources/Launcher.swift
 +++ b/dm/ios/Sources/Launcher.swift
 @@ -24,32 +24,32 @@ private struct GameDataSection: View {
@@ -162,12 +162,12 @@ index 61f1639..9633827 100644
                          .font(.callout).foregroundStyle(.secondary)
                      playButton
                  }
-@@ -179,16 +179,16 @@ private struct LauncherView: View {
+@@ -179,29 +179,28 @@ private struct LauncherView: View {
                      ForEach(m.sections, id: \.self) { section in
                          let rows = m.rows(in: section)
                          if !rows.isEmpty {
 -                            Section(section) {
-+                            Section(LauncherText.sectionName(section)) {
++                            Section(header: Text(LauncherText.sectionName(section))) {
                                  ForEach(rows) { SettingRow(s: $0, m: m) }
                              }
                          }
@@ -180,9 +180,16 @@ index 61f1639..9633827 100644
 -                        Text("Brings back all settings this game was tested with.")
 +                        Text(LauncherText.text("ui.resetDefaultsNote", "Brings back all settings this game was tested with."))
                      }
-                     Section("HUD") {
+-                    Section("HUD") {
++                    Section(header: Text("HUD"),
++                            footer: Text(hud.anyManual ? "已有手动 HUD 设置，优先于自动贴边。" : "预览游戏画面里的金币、月亮、生命和指南针：拖动改位置，调大小，隐藏后游戏里也不显示。默认自动贴边。")) {
                          Button("HUD 设置") { showingHud = true }
-@@ -201,7 +201,7 @@ private struct LauncherView: View {
+                             // The sheet sits on the button, not on the Section: SwiftUI hands a Section's modifiers to every row, so one tap presented a picker per row and they invalidated each other (LNPANDY/NX2Apple#315).
+                             .sheet(isPresented: $showingHud) { HudEditorView(settings: hud) }
+-                    } footer: {
+-                        Text(hud.anyManual ? "已有手动 HUD 设置，优先于自动贴边。" : "预览游戏画面里的金币、月亮、生命和指南针：拖动改位置，调大小，隐藏后游戏里也不显示。默认自动贴边。")
+                     }
+                     GameDataSection()
                      CloudSavesSection()
                      Section {
                          HStack {
@@ -191,7 +198,7 @@ index 61f1639..9633827 100644
                              Spacer()
                              Text(ByteCountFormatter.string(fromByteCount: Int64(memory), countStyle: .memory)).monospacedDigit().foregroundStyle(.secondary)
                          }
-@@ -222,7 +222,7 @@ private struct LauncherView: View {
+@@ -222,7 +221,7 @@ private struct LauncherView: View {
      }
  
      @ViewBuilder var playButton: some View {
@@ -200,7 +207,7 @@ index 61f1639..9633827 100644
          if #available(iOS 26.0, *) { button.buttonStyle(.glassProminent) } else { button.buttonStyle(.borderedProminent) }
      }
  
-@@ -241,7 +241,9 @@ public func dmShowLauncher(_ viewController: UnsafeMutableRawPointer, _ done: @c
+@@ -241,7 +240,9 @@ public func dmShowLauncher(_ viewController: UnsafeMutableRawPointer, _ done: @c
      let dir = getenv("DM_APP_DM").map { URL(fileURLWithPath: String(cString: $0)) } ?? Bundle.main.resourceURL?.appendingPathComponent("dm")
      guard let url = dir?.appendingPathComponent("launcher.json"), let data = try? Data(contentsOf: url) else { return false }
      guard let file = try? JSONDecoder().decode(SettingsFile.self, from: data), !file.settings.isEmpty else { fputs("[RED] launcher: dm/launcher.json cannot be read; starting the game\n", stderr); return false }
