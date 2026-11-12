@@ -1,4 +1,4 @@
-From 7b80fc2eaa251e7bb06f68fcacf8e884847450d0 Mon Sep 17 00:00:00 2001
+From 9387e80facf9e1b3eeb0a38da1478f793528f5a7 Mon Sep 17 00:00:00 2001
 From: seedds <seedds@gmail.com>
 Date: Wed, 11 Nov 2026 12:41:52 +0000
 Subject: [PATCH] Pad: a glass-effect strength slider in the button settings
@@ -9,7 +9,7 @@ Subject: [PATCH] Pad: a glass-effect strength slider in the button settings
  1 file changed, 107 insertions(+), 12 deletions(-)
 
 diff --git a/dm/ios/Sources/DmGamepad.m b/dm/ios/Sources/DmGamepad.m
-index f794de8..e1b6693 100644
+index ad01379..dd71af1 100644
 --- a/dm/ios/Sources/DmGamepad.m
 +++ b/dm/ios/Sources/DmGamepad.m
 @@ -12,7 +12,7 @@
@@ -18,10 +18,10 @@ index f794de8..e1b6693 100644
  //   The player can move single controls in the shell's settings (DM_TOUCH_LAYOUT, one arrangement per layout): the geometry places each only where it fits and keeps the rest where they were.
 -//   The in-game menu's "按键设置" (button settings) opens a panel above the game: tapping an icon selects it, a slider for the selected icon's own size and dragging the icons to move them, saved per icon in NSUserDefaults (DmPadLineLayout) so it survives a restart. See "The line skin" below.
 +//   The in-game menu's "按键设置" (button settings) opens a panel above the game: tapping an icon selects it, a slider for the selected icon's own size and dragging the icons to move them, saved per icon in NSUserDefaults (DmPadLineLayout) so it survives a restart; and a slider for the glass effect's strength (0-100%, the game's own setting, NSUserDefaults DmPadGlassOpacity): 70% is the look as shipped, 100% is the deepest the glass gets.
- //   The in-game menu's "HUD 设置" (HUD settings) opens a panel above the game: picking a HUD panel (指南针 / 生命值 / 金币 / 月亮）, a slider for the selected panel's own size and dragging on the screen to move it, saved per panel in NSUserDefaults (DmHudLayout) so it survives a restart, live through dm_hud_set (hud.c) into the rewriter stub in Pane::Calculate (0113). The life panel has no locked pane name yet, so its settings are stored but change nothing until the name is locked from the V1.3.9 log.
  //   Everything hugs the edges and corners to leave the picture room; each control is one
  //   image layer (dm/ios/Sources/PadIcons/pad_line_*.png, the line set, bundled as resources):
-@@ -172,6 +172,8 @@ static void pads_start(void);   // Physical controllers, below
+ //   the artwork never changes on press (no pressed state), only the left stick's knob moves,
+@@ -168,6 +168,8 @@ static void pads_start(void);   // Physical controllers, below
      CALayer *_jump, *_photo;                       // the extra buttons: jump (B) and photo (D-pad down)
      UIVisualEffectView *_glassView[G_N];           // iOS 26+: the real Liquid Glass behind each icon (nil below iOS 26)
      CAGradientLayer *_glassDisc[G_N];              // below iOS 26: a vector glass disc drawn in code (nil on iOS 26+)
@@ -30,16 +30,16 @@ index f794de8..e1b6693 100644
      CGPoint _lCentre;                              // the floating left stick's centre: where its touch landed
      CGFloat _lineScale;                            // the legacy global size (migration default): 0.7 to 3.0, 1 is built-in; the slider no longer changes it
      CGFloat _lineSizes[E_N];                       // each movable icon's own size, 0.7 to 3.0 (NSUserDefaults DmPadLineLayout "sizes")
-@@ -179,7 +181,7 @@ static void pads_start(void);   // Physical controllers, below
+@@ -175,7 +177,7 @@ static void pads_start(void);   // Physical controllers, below
      CAShapeLayer *_editHighlight;                  // the ring around the selected icon while the editor is open
      NSMutableDictionary<NSString *, NSValue *> *_lineOffsets;   // the drag offsets, points from each control's built-in centre (NSUserDefaults DmPadLineLayout)
      BOOL _editing;                                 // the button editor is open: touches drag controls instead of pressing them
 -    UIView *_editBar; UISlider *_editSlider;       // the editor's bar: the size slider, hint and Done
 +    UIView *_editBar; UISlider *_editSlider, *_glassSlider;   // the editor's bar: the size slider, the glass slider, hint and Done
      UITouch *_editTouch; int _editControl; CGPoint _editGrab, _editBase;   // the control being dragged and where its drag started
-     float _hudDx[4], _hudDy[4], _hudK[4];          // the HUD panels' move / resize (layout points, the 1280x720 space, y up, origin at the screen's centre; 1 = the game's size), NSUserDefaults DmHudLayout
-     int _hudSelected;                              // the HUD panel the size slider tunes (0 compass, 1 life, 2 coins, 3 moons; compass by default)
-@@ -265,9 +267,18 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
+     DmPadGeo _geoLine;                             // the geometry with the editor's size and drag offsets applied
+     CALayer *_hint; CATextLayer *_hintText; NSString *_hintWords;   // the 3D layout's right-stick hint: words only, once per launch (see "The right-stick hint")
+@@ -256,9 +258,18 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }
  // the button's own circle (the icon layer's frame is the same square grown by 1/fill).
  // Hidden keys (ZR, R, X, the D-pad, L3 / R3) and the floating stick get no glass.
  // Every UIGlassEffect reference sits inside if (@available(iOS 26.0, *)): the type exists
@@ -60,7 +60,7 @@ index f794de8..e1b6693 100644
  static CGPathRef glassCirclePath(CGRect r) { return CGPathCreateWithEllipseInRect(r, NULL); }
  static void setGlassPath(CAShapeLayer *l, CGPathRef p) { l.path = p; CGPathRelease(p); }
  static CGPathRef glassArcPath(CGRect r, CGFloat a0, CGFloat a1) {   // an arc of the circle, inset so the stroke sits inside the rim; angles in radians, 270 is the top
-@@ -296,6 +307,20 @@ static void glassDiscLayout(CAGradientLayer *disc, CGRect frame) {   // the disc
+@@ -287,6 +298,20 @@ static void glassDiscLayout(CAGradientLayer *disc, CGRect frame) {   // the disc
      setGlassPath((CAShapeLayer *)disc.sublayers[1], glassArcPath(b, 195 * M_PI / 180, 345 * M_PI / 180));   // the top highlight
      setGlassPath((CAShapeLayer *)disc.sublayers[2], glassArcPath(b, 15 * M_PI / 180, 165 * M_PI / 180));   // the bottom shade
  }
@@ -81,15 +81,15 @@ index f794de8..e1b6693 100644
  
  - (instancetype)initWithFrame:(CGRect)f {
      if ((self = [super initWithFrame:f])) {
-@@ -321,6 +346,7 @@ static void glassDiscLayout(CAGradientLayer *disc, CGRect frame) {   // the disc
+@@ -312,6 +337,7 @@ static void glassDiscLayout(CAGradientLayer *disc, CGRect frame) {   // the disc
          }
          _owner = [NSMapTable strongToStrongObjectsMapTable]; _faceOf = [NSMapTable strongToStrongObjectsMapTable];
          [self loadLineLayout];   // the editor's stored size and drag offsets, or the built-in layout
 +        [self loadGlassOpacity];   // the glass effect's strength, 0-100% (0115)
-         [self loadHudLayout];   // the HUD editor's stored move / resize, or the game's own HUD
          static dispatch_once_t once;
          dispatch_once(&once, ^{
-@@ -369,6 +395,7 @@ static void glassDiscLayout(CAGradientLayer *disc, CGRect frame) {   // the disc
+             // each colour carries its own low opacity instead of lowering the whole view's alpha (that would add an off-screen pass for the full-screen layer)
+@@ -358,6 +384,7 @@ static void glassDiscLayout(CAGradientLayer *disc, CGRect frame) {   // the disc
                  _glassDisc[g] = disc;
              }
          }
@@ -97,10 +97,11 @@ index f794de8..e1b6693 100644
          const char *hint = getenv("DM_TOUCH_HINT");   // the shell passes the player's language; empty turns the hint off
          _hintWords = hint ? [NSString stringWithUTF8String:hint] : @"Right stick: drag here";
          _hint = [CALayer layer]; _hint.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5].CGColor; _hint.opacity = 0; _hint.hidden = YES;
-@@ -842,6 +869,54 @@ static NSString *const k_line_layout_key = @"DmPadLineLayout";
+@@ -827,10 +854,59 @@ static NSString *const k_line_layout_key = @"DmPadLineLayout";
      [NSUserDefaults.standardUserDefaults setObject:d forKey:k_line_layout_key];
  }
  
+-// The button editor: a bar at the top (title, the size slider, Done, and a hint), and dragging
 +// The glass effect's strength, 0-100% in the button settings (0115): 0 is no glass at
 +// all (the icon alone on the picture), the anchor (70%) is the look as shipped, 100 is
 +// the deepest the glass gets. It is the game's own setting, nothing to do with the
@@ -149,14 +150,6 @@ index f794de8..e1b6693 100644
 +    _glassTint = tint;
 +}
 +
- // The HUD editor's stored layout: NSUserDefaults DmHudLayout, {"elements": {name:
- // {"dx": NSNumber, "dy": NSNumber, "scale": NSNumber}}}. The offsets are layout
- // points (the 1280x720 space, y up, the origin at the screen's centre), the scale
-@@ -871,10 +946,11 @@ static NSString *const k_hud_layout_key = @"DmHudLayout";
-     [NSUserDefaults.standardUserDefaults setObject:@{@"elements": el} forKey:k_hud_layout_key];
- }
- 
--// The button editor: a bar at the top (title, the size slider, Done, and a hint), and dragging
 +// The button editor: a bar at the top (title, the size slider, the glass slider, Done, and a hint), and dragging
  // the icons. While it is open, touches drag controls instead of pressing them; tapping an icon
  // selects it (a ring around it, its name in the hint line) and the slider tunes that icon's
@@ -166,7 +159,7 @@ index f794de8..e1b6693 100644
  // The text is Chinese: the user asked for the settings panel in Chinese (the rest of the
  // repository is English).
  - (void)buildEditBar {
-@@ -897,8 +973,16 @@ static NSString *const k_hud_layout_key = @"DmHudLayout";
+@@ -853,8 +929,16 @@ static NSString *const k_line_layout_key = @"DmPadLineLayout";
      [done setTitle:@"完成" forState:UIControlStateNormal]; done.titleLabel.font = [UIFont boldSystemFontOfSize:15];
      [done addTarget:self action:@selector(closePadSettings) forControlEvents:UIControlEventTouchUpInside];
      [_editBar addSubview:done];
@@ -185,7 +178,7 @@ index f794de8..e1b6693 100644
      [_editBar addSubview:hint];
      [self addSubview:_editBar];
      _editHighlight = [CAShapeLayer layer];   // the ring around the selected icon (the slider's target): on top of the icons, hidden until the editor opens
-@@ -908,16 +992,18 @@ static NSString *const k_hud_layout_key = @"DmHudLayout";
+@@ -864,16 +948,18 @@ static NSString *const k_line_layout_key = @"DmPadLineLayout";
      _editHighlight.hidden = YES;
      [_controls addSublayer:_editHighlight];
  }
@@ -207,7 +200,7 @@ index f794de8..e1b6693 100644
  }
  - (void)openPadSettings {   // the in-game menu's "按键设置": hide the gear (it cannot be tapped now), show the editor
      if (_padOff || _editing) return;
-@@ -933,6 +1019,7 @@ static NSString *const k_hud_layout_key = @"DmHudLayout";
+@@ -889,6 +975,7 @@ static NSString *const k_line_layout_key = @"DmPadLineLayout";
      _editing = NO;
      _editTouch = nil;
      [self saveLineLayout];
@@ -215,7 +208,7 @@ index f794de8..e1b6693 100644
      [self updateControlVisibility];
      _editBar.hidden = YES;
      [self setNeedsLayout];
-@@ -946,12 +1033,20 @@ static NSString *const k_hud_layout_key = @"DmHudLayout";
+@@ -902,12 +989,20 @@ static NSString *const k_line_layout_key = @"DmPadLineLayout";
      (void)s;
      [self saveLineLayout];
  }
