@@ -76,3 +76,5 @@
 0115-ios-pad-glass-opacity.patch
 0116-ios-pad-draggable-settings.patch
 0117-ios-pad-menu-button-adjustable.patch
+0118-ios-hud-edge-anchor.patch
+0119-ios-hud-launcher-editor.patch

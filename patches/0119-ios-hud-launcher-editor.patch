@@ -1,0 +1,1103 @@
+From 0a51acc783fdacecd8f03a4338c81a55924e9439 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Thu, 12 Nov 2026 11:49:28 +0000
+Subject: [PATCH] HUD: the launcher HUD editor -- move, resize, hide the four
+ widgets, manual wins over the auto edge (0119)
+
+---
+ dm/games/0100000000010000/hud_edge.c | 248 +++++++++++++++----
+ dm/games/0100000000010000/patches.py | 113 ++++++---
+ dm/host/Makefile                     |   2 +-
+ dm/host/hud_manual.c                 | 104 ++++++++
+ dm/host/hud_manual.h                 |  18 ++
+ dm/host/uw.c                         |   2 +
+ dm/ios/Sources/HudEditor.swift       | 348 +++++++++++++++++++++++++++
+ dm/ios/Sources/Launcher.swift        |  15 +-
+ 8 files changed, 764 insertions(+), 86 deletions(-)
+ create mode 100644 dm/host/hud_manual.c
+ create mode 100644 dm/host/hud_manual.h
+ create mode 100644 dm/ios/Sources/HudEditor.swift
+
+diff --git a/dm/games/0100000000010000/hud_edge.c b/dm/games/0100000000010000/hud_edge.c
+index e1a0e5b..af3ac8f 100644
+--- a/dm/games/0100000000010000/hud_edge.c
++++ b/dm/games/0100000000010000/hud_edge.c
+@@ -1,25 +1,48 @@
+-// hud_edge.c -- Super Mario Odyssey HUD edge anchor (0118).
++// hud_edge.c -- Super Mario Odyssey HUD edge anchor + launcher manual settings (0118 + 0119).
+ //
+ // The game's HUD (coins, moons, compass, lives) is laid out for a 1280x720
+ // (16:9) screen, so on a wider screen (iPhone 19.5:9) it sits inset from the
+ // edges, and on a narrower screen (iPhone Duo 1.43:1, iPad 4:3) it would be
+-// cut off at the edges. This hook pushes the HUD to the screen edges,
+-// automatically adapting to the screen aspect: the left widgets (coins, moons)
+-// move left on a wider screen and right on a narrower one; the right widgets
+-// (compass, lives) move right on a wider screen and left on a narrower one.
++// cut off at the edges. By default this hook pushes the HUD to the screen
++// edges, automatically adapting to the screen aspect (0118): the left widgets
++// (coins, moons) move left on a wider screen and right on a narrower one; the
++// right widgets (compass, lives) move right on a wider screen and left on a
++// narrower one. A manual setting made in the launcher's HUD editor (0119)
++// overrides the automatic edge anchor for that element: it is moved, resized
++// and hidden exactly as the player set it, and it stays put when the screen
++// aspect changes, while elements with no manual setting keep following the
++// aspect. A hidden element is moved off-screen, so it is not drawn.
+ //
+-// The offset comes from the screen aspect the host already writes into the
+-// frame-step state page (loader.c dm_fps_state_apply, state +0x58: the ratio
+-// r; the iOS front end resolves DM_SCREEN_ASPECT "auto" to the window's aspect
+-// before the host writes the state page, so r is the resolved aspect by the
+-// time the game runs; 0 means 16:9). The offset is:
++// The automatic offset comes from the screen aspect the host already writes
++// into the frame-step state page (loader.c dm_fps_state_apply, state +0x58:
++// the ratio r; the iOS front end resolves DM_SCREEN_ASPECT "auto" to the
++// window's aspect before the host writes the state page, so r is the resolved
++// aspect by the time the game runs; 0 means 16:9). The offset is:
+ //     edge = 640 * (r / 1.7777778 - 1)
+ // iPhone 19.5:9 (r=2.167): +140 per side (push out). iPhone Duo 1.43:1
+ // (r=1.429): -126 per side (pull in). iPad 4:3 (r=1.333): -160 per side
+ // (pull in). 16:9 (r=0): 0. The sign is uniform: a left widget takes
+ // dx = -edge, a right widget dx = +edge, so a wider screen pushes both
+-// outward and a narrower screen pulls both inward. No user setting, no drag,
+-// no resize, no settings UI.
++// outward and a narrower screen pulls both inward.
++//
++// The manual settings come from the launcher, through the host, in the
++// frame-step state page at +0x200 (hud_manual.c, written by
++// dm_hud_manual_frame_tick once per present; the launcher sets the
++// DM_HUD_COMPASS / DM_HUD_LIFE / DM_HUD_COINS / DM_HUD_MOONS environment
++// variables from the player's editor choices before the game starts):
++//   +0x200: 12 floats, per element (dx, dy, k): compass, lives, coins,
++//     moons. dx / dy are layout points (the 1280x720 space), absolute from
++//     the game's own layout position -- NOT added to the automatic edge
++//     offset, so a manual element stays put when the aspect changes. A drag
++//     down the screen is a negative dy (the layout is y-up); the launcher
++//     negates its y-down drag when it writes the value. k is the element's
++//     size, 0.6 to 1.8 (the editor's slider), 1 is the game's own size.
++//   +0x230: u32 manual mask (bit i: element i has a manual setting).
++//   +0x234: u32 hidden mask (bit i: element i is hidden).
++// The state page starts zeroed, so an unwritten block reads as no manual
++// setting and nothing hidden, and a zero / non-number k reads as 1.
++// A manual setting is per element and independent: moving the coins does not
++// move the moons, and hiding one element leaves the others alone.
+ //
+ // The hook runs from the same two rewriter cuts as the old 0113
+ // (Pane::Calculate main+0x909494: the entry cut at +0x20 and the +0x13c cut
+@@ -33,18 +56,26 @@
+ // it never reads a pane name and never decides a match.
+ //
+ // A moved pane's original matrix is stored in a small table (state +0x300,
+-// eight 120-byte entries, two per element -- two layout instances can match
++// eight 128-byte entries, two per element -- two layout instances can match
+ // the same element) and the modified matrix is always re-derived from that
+ // original, so a fixed offset never accumulates into a drift, and a game
+ // recompute (an animation, a count change, a layout reload) is followed by
+-// re-storing the original. The offset itself is also stored per entry, so an
+-// aspect change re-applies instead of being ignored.
++// re-storing the original. The offset, size and hidden flag the modified
++// matrix was computed from are also stored per entry, so a settings change
++// or an aspect change re-applies instead of being ignored, and a manual
++// element is not re-derived from the automatic offset.
+ //
+-// What this patch does NOT do (deliberately): no HUD settings UI, no
+-// user-set entry point, no user-saved offsets, no drag/resize, no map-camera widen, no
++// What this patch does NOT do (deliberately): no map-camera widen, no
+ // settings/map code, no guide-text hiding, no root stretch. The camera icon
+ // in the top-right is NOT a HUD element -- it is the photo button (a
+ // virtual pad button, positioned by DmGamepad), so it is never matched.
++// The dots under the moon counter move with the moons element: they are part
++// of the counter's layout (the 'Counter' group), so the launcher's moons
++// element draws them with the moon icon and number, and moving the moons
++// element carries them. The white bar under the counts is drawn with the
++// coins element in the launcher; its own pane is not matched by name, so
++// whether it follows the coins in the game depends on its parent, which the
++// available logs do not show -- it may stay where the game put it.
+ //
+ // Compiled with: aarch64-linux-gnu-gcc -O2 -ffreestanding -fno-builtin
+ //   -fno-stack-protector -fno-jump-tables -fno-asynchronous-unwind-tables -c
+@@ -54,7 +85,9 @@
+ // dropped into the rewriter's patch area verbatim:
+ //   x0 = the pane (nn::ui2d::Pane *), x1 = the aspect (state + 0x58: a float,
+ //   the screen's width / height; 0 = 16:9), x2 = the edge table (state +
+-//   0x300: eight 120-byte entries, two per HUD element).
++//   0x300: eight 128-byte entries, two per HUD element), x3 = the manual
++//   settings (state + 0x200: 12 floats, a u32 manual mask, a u32 hidden
++//   mask; a NULL pointer reads as no manual setting).
+ //   Element order: 0 compass (right), 1 lives (right), 2 coins (left),
+ //   3 moons (left). The state page starts zeroed, so a table entry with
+ //   pane == 0 is unused.
+@@ -63,9 +96,19 @@ typedef unsigned int u32;
+ typedef unsigned long uintptr_t;
+ 
+ #define HUD_EDGE_N 4
+-#define HUD_EDGE_ENTRY 120         // bytes per table entry
++#define HUD_EDGE_ENTRY 128         // bytes per table entry
+ #define HUD_EDGE_SLOTS_PER_ELEM 2  // table slots per HUD element: two layout instances can match the same element
+ 
++// The manual settings block (state +0x200), as the host writes it.
++#define HUD_MANUAL_FLOATS 12       // dx, dy, k per element (4 elements)
++#define HUD_MANUAL_MASK_OFF 48     // byte offset of the manual mask (+0x230)
++#define HUD_HIDDEN_MASK_OFF 52     // byte offset of the hidden mask (+0x234)
++
++// A hidden element is pushed this far off-screen (0113 hid its guide text
++// the same way: a pane already past 5000 is off-screen). The layout is at
++// most 1560 wide, so +10000 is safely outside it whatever the aspect.
++#define HUD_HIDE_DX 10000.0f
++
+ // The pane names, as little-endian u32s (no string literal: a literal would
+ // sit in .rodata and the code would load its address with an adrp, a
+ // relocation, and the embedded words carry no literal pool).
+@@ -105,6 +148,62 @@ static inline __attribute__((always_inline)) int hud_edge_words_eq(const u32 *nw
+     return 1;
+ }
+ 
++// A manual size outside [0.6, 1.8], or not a number, is the editor's bug, not
++// a request: fall back to 1 (no resize). A zero scale is not a request either
++// (the state page starts zeroed, so an unwritten k reads as 0 and must mean
++// identity, never a collapse). The NaN test is k != k (a NaN is not equal to
++// itself); a negative scale would mirror the widget, which nobody asked for.
++// (The launcher's slider only writes 0.6 to 1.8; the host clamps too; this is
++// the third clamp, so a wild environment variable can never collapse a widget.)
++static inline __attribute__((always_inline)) float hud_edge_clamp_k(float k) {
++    if (k == 0.0f || k != k) return 1.0f;
++    if (k < 0.6f) return 0.6f;
++    if (k > 1.8f) return 1.8f;
++    return k;
++}
++
++// A manual offset outside the layout is the editor's bug, not a request:
++// clamp it, so a wild environment variable can never throw a widget off the
++// screen (hiding is the only way off-screen, and it is explicit).
++static inline __attribute__((always_inline)) float hud_edge_clamp_off(float v, float lim) {
++    if (v != v) return 0.0f;
++    if (v > lim) return lim;
++    if (v < -lim) return -lim;
++    return v;
++}
++
++// Scale orig about the pane's centre, then move by (dx, dy) in layout units,
++// into mod. sx scales the x row, sy the y row (a HUD widget passes
++// sx == sy == k). The centre is the pane's middle passed through its own
++// matrix. The middle is found from the pane's origin (the byte at +0x5b,
++// confirmed by disassembly of the local matrix helper at main+0x9096d0: bits
++// 4-5 the horizontal origin, 1 left, 2 right; bits 6-7 the vertical origin,
++// 1 top, 2 bottom; 0 is the centre either way) and its size at +0x50 /
++// +0x54: the centre is the origin plus half the size towards the middle
++// (the layout is y-up, the origin at the parent's centre, so a top origin's
++// centre is half the height below it, a left origin's half the width to its
++// right). A pane with no usable size scales about its translation (its
++// origin), which is the same thing for a point-sized pane. The third row
++// (depth) is left alone: this is a 2D widget, and scaling its depth would
++// change its draw order. (From the old hud_calc.c, unchanged.)
++static inline __attribute__((always_inline)) void hud_edge_xform(const float *orig, float *mod, float dx, float dy,
++                      float sx, float sy, float w, float h, unsigned char origin) {
++    float cx, cy;
++    if (w > 0.0f && w < 100000.0f && h > 0.0f && h < 100000.0f) {
++        float ox = ((origin >> 4) & 3) == 1 ? w * 0.5f : ((origin >> 4) & 3) == 2 ? -w * 0.5f : 0.0f;
++        float oy = ((origin >> 6) & 3) == 1 ? -h * 0.5f : ((origin >> 6) & 3) == 2 ? h * 0.5f : 0.0f;
++        cx = orig[0] * ox + orig[1] * oy + orig[3];
++        cy = orig[4] * ox + orig[5] * oy + orig[7];
++    } else {
++        cx = orig[3];
++        cy = orig[7];
++    }
++    for (int i = 0; i < 3; i++) { mod[i] = orig[i] * sx; mod[4 + i] = orig[4 + i] * sy; }
++    mod[3] = cx + (orig[3] - cx) * sx + dx;
++    mod[7] = cy + (orig[7] - cy) * sy + dy;
++    for (int i = 8; i < 12; i++) mod[i] = orig[i];
++}
++
+ // The guards every subtree walk below applies (same as the old v7 guards,
+ // because a layout's child list can go stale while the game unloads it):
+ //  (a) a popped pane is checked for NULL / alignment before it is read;
+@@ -185,12 +284,14 @@ static inline __attribute__((always_inline)) int hud_edge_parent_is(void *pane,
+     return 1;
+ }
+ 
+-void hud_edge(void *pane, const float *aspect_ptr, void *table) {
++void hud_edge(void *pane, const float *aspect_ptr, void *table, const float *params) {
+     if (!pane || !aspect_ptr || !table) return;
+     // The edge offset, from the screen aspect the host wrote into the state
+     // page (state +0x58; 0 = 16:9, unwritten). Valid aspects are 1.3 to 2.2
+     // (the range loader.c accepts); anything else is 16:9. The offset is
+     // clamped so a wild aspect can never throw a widget off the screen.
++    // A manual setting or a hide still applies when the edge is 0 (16:9),
++    // so the early return below is only the no-manual no-hide no-edge case.
+     float aspect = *aspect_ptr;
+     float edge = 0.0f;
+     if (aspect >= 1.3f && aspect <= 2.2f) {
+@@ -198,7 +299,18 @@ void hud_edge(void *pane, const float *aspect_ptr, void *table) {
+         if (edge > 200.0f) edge = 200.0f;
+         if (edge < -200.0f) edge = -200.0f;
+     }
+-    if (edge == 0.0f) return;   // 16:9, or an unwritten aspect: nothing to do
++
++    // The manual settings (state +0x200; a NULL params pointer, or an
++    // unwritten block, reads as no manual setting and nothing hidden).
++    u32 manual_mask = 0, hidden_mask = 0;
++    if (params) {
++        const u32 *pu = (const u32 *)params;
++        manual_mask = pu[HUD_MANUAL_MASK_OFF / 4];
++        hidden_mask = pu[HUD_HIDDEN_MASK_OFF / 4];
++    }
++    // 16:9 with no manual setting and nothing hidden: nothing to do for any
++    // element (the 0118 early return, kept so the common case costs nothing).
++    if (edge == 0.0f && manual_mask == 0 && hidden_mask == 0) return;
+ 
+     // Flags bit 7 is set by Pane::Calculate's epilogue, so it tells whether
+     // this pane has ever calculated. On a pane's very first frame its matrix
+@@ -237,34 +349,69 @@ void hud_edge(void *pane, const float *aspect_ptr, void *table) {
+     }
+     if (idx < 0) return;   // not a HUD element: leave it alone
+ 
+-    // Left widgets (coins, moons) take dx = -edge; right widgets (compass,
+-    // lives) take dx = +edge. A wider screen (edge > 0) pushes both outward
+-    // to the edges; a narrower screen (edge < 0) pulls both inward so they
+-    // stay visible and at the edges. dy is always 0 and the scale is always
+-    // 1: this patch only translates, never resizes.
+-    float dx = (idx <= 1) ? edge : -edge;
++    // What this element should be, this frame. Priority: hidden first, then
++    // manual, then the automatic edge anchor (0118). A manual setting is an
++    // absolute offset from the game's own layout position -- it replaces the
++    // automatic offset, it is not added to it, so a manual element stays put
++    // when the aspect changes. A hidden element is pushed off-screen; its
++    // manual offset and size do not matter while it is hidden, and it comes
++    // back to its manual (or automatic) place when it is shown again.
++    int manual = (manual_mask >> idx) & 1u;
++    int hidden = (hidden_mask >> idx) & 1u;
++    float tdx = 0.0f, tdy = 0.0f, tk = 1.0f;
++    if (!hidden && manual && params) {
++        tdx = hud_edge_clamp_off(params[idx * 3 + 0], 640.0f);
++        tdy = hud_edge_clamp_off(params[idx * 3 + 1], 360.0f);
++        tk = hud_edge_clamp_k(params[idx * 3 + 2]);
++    } else if (!hidden) {
++        // Automatic: left widgets (coins, moons) take dx = -edge; right
++        // widgets (compass, lives) take dx = +edge. A wider screen
++        // (edge > 0) pushes both outward to the edges; a narrower screen
++        // (edge < 0) pulls both inward so they stay visible and at the
++        // edges. dy is always 0 and the scale is always 1: this patch only
++        // translates, never resizes.
++        tdx = (idx <= 1) ? edge : -edge;
++    }
++    // A manual or automatic identity (16:9, no move, no resize, not hidden)
++    // is nothing to do: skip the table entirely, so a no-op element never
++    // takes a slot and never marks its children dirty.
++    if (!hidden && tdx == 0.0f && tdy == 0.0f && tk == 1.0f) return;
+ 
+     // The per-element entry: the pane, its original matrix (as the game
+-    // computed it), the modified matrix (the original + this translation),
+-    // and the offset the modified matrix was computed from. Two slots per
+-    // element (idx and idx + HUD_EDGE_N): two layout instances can match the
+-    // same element, and one slot per element cannot hold both.
++    // computed it), the modified matrix (the original + this transform),
++    // and the transform the modified matrix was computed from. Two slots
++    // per element (idx and idx + HUD_EDGE_N): two layout instances can
++    // match the same element, and one slot per element cannot hold both.
++    // The stored transform is compared against the target below, so a
++    // settings change or an aspect change re-applies instead of being
++    // ignored, and a manual element is not re-derived from the automatic
++    // offset.
+     char *ent = 0;
+     for (int s = 0; s < HUD_EDGE_SLOTS_PER_ELEM; s++) {
+         char *e = (char *)table + (idx + s * HUD_EDGE_N) * HUD_EDGE_ENTRY;
+         if (*(uintptr_t *)(e + 0) == (uintptr_t)pane) { ent = e; break; }
+-        if (!ent && *(u32 *)(e + 112) == 0) ent = e;   // first free slot
++        if (!ent && *(u32 *)(e + 124) == 0) ent = e;   // first free slot
+     }
+     if (!ent) ent = (char *)table + idx * HUD_EDGE_ENTRY;   // both taken: reclaim the first (a reload)
+     uintptr_t *e_pane = (uintptr_t *)(ent + 0);
+     float *e_orig = (float *)(ent + 8);
+     float *e_mod = (float *)(ent + 56);
+     float *e_dx = (float *)(ent + 104);
++    float *e_dy = (float *)(ent + 108);
++    float *e_k = (float *)(ent + 112);
++    u32 *e_hidden = (u32 *)(ent + 116);
+     if (*e_pane != (uintptr_t)pane) {   // first sighting, or the layout reloaded
+         *e_pane = (uintptr_t)pane;
+-        *(u32 *)(ent + 108) = (u32)idx;
+-        *(u32 *)(ent + 112) = 1u;
+-        *e_dx = 1e30f;   // sentinel: force a recompute below (the stored offset is stale)
++        *(u32 *)(ent + 120) = (u32)idx;
++        *(u32 *)(ent + 124) = 1u;
++        *e_dx = 1e30f;   // sentinel: force a recompute below (the stored transform is stale).
++        // e_dy / e_k / e_hidden need no sentinel: the early return below
++        // tests e_dx first (&& short-circuits), so a stale e_dx alone forces
++        // the recompute that writes all four. (Writing them here as adjacent
++        // stores would let the compiler merge them into one 64-bit store of
++        // a constant it loads from .rodata -- a relocation the embedded
++        // words must not carry. The single 1e30f store is the 0118 pattern,
++        // which compiles to movz/movk, relocation-free.)
+         for (int i = 0; i < 12; i++) { e_orig[i] = 0.0f; e_mod[i] = 0.0f; }
+     }
+ 
+@@ -272,7 +419,7 @@ void hud_edge(void *pane, const float *aspect_ptr, void *table) {
+     // current matrix against the stored modified one: if they differ, the
+     // game wrote a new original (an animation, a count change, a layout
+     // reload), so the stored original follows it. If they are the same, the
+-    // game left our modified matrix alone, and only an offset change needs
++    // game left our modified matrix alone, and only a transform change needs
+     // a recompute.
+     const float *g = (const float *)pane + 0x70 / 4;
+     int recomputed = 0;
+@@ -282,15 +429,30 @@ void hud_edge(void *pane, const float *aspect_ptr, void *table) {
+         for (int i = 0; i < 12; i++) if (cur[i] != mod[i]) { recomputed = 1; break; }
+     }
+     if (recomputed) for (int i = 0; i < 12; i++) e_orig[i] = g[i];
+-    if (!recomputed && *e_dx == dx) return;   // already correct: nothing to do
++    if (!recomputed && *e_dx == tdx && *e_dy == tdy && *e_k == tk && *e_hidden == (u32)hidden) return;   // already correct: nothing to do
+ 
+-    // The modified matrix is the original plus this translation (scale 1, so
+-    // the origin/pivot does not matter: a pure translation adds to the
+-    // translation slots only). Never accumulated: it is always re-derived
+-    // from the stored original, so a fixed offset cannot drift.
++    // The modified matrix is always re-derived from the stored original, so
++    // a fixed offset cannot drift. Hidden: the original pushed off-screen
++    // (the translation only; the size does not matter off-screen).
++    // Manual: scaled about the pane's centre, then moved by (tdx, tdy).
++    // Automatic: the original plus this translation (scale 1, so the
++    // origin/pivot does not matter: a pure translation adds to the
++    // translation slots only).
+     for (int i = 0; i < 12; i++) e_mod[i] = e_orig[i];
+-    e_mod[3] += dx;
+-    *e_dx = dx;
++    if (hidden) {
++        e_mod[3] += HUD_HIDE_DX;
++    } else if (manual) {
++        float w = *(const float *)((const char *)pane + 0x50);
++        float h = *(const float *)((const char *)pane + 0x54);
++        unsigned char origin = *(const unsigned char *)((const char *)pane + 0x5b);
++        hud_edge_xform(e_orig, e_mod, tdx, tdy, tk, tk, w, h, origin);
++    } else {
++        e_mod[3] += tdx;
++    }
++    *e_dx = tdx;
++    *e_dy = tdy;
++    *e_k = tk;
++    *e_hidden = (u32)hidden;
+ 
+     // Write the modified matrix back to the pane. Its children are
+     // calculated after this hook, so they inherit the moved parent -- but
+diff --git a/dm/games/0100000000010000/patches.py b/dm/games/0100000000010000/patches.py
+index e8b6432..5121748 100644
+--- a/dm/games/0100000000010000/patches.py
++++ b/dm/games/0100000000010000/patches.py
+@@ -17,44 +17,74 @@ BUILD_141 = 'b424be150a8e7d78701cbe7a439d9ebf'   # main 1.4.1 (game.tsv v393216)
+ #   aspect ratio r, written there by dm_fps_state_apply in loader.c -- 0 when the
+ #   screen is 16:9, the window's aspect otherwise, so "auto" already resolves to
+ #   the real aspect before the hook runs), x2 = table (state page + 0x300, eight
+-#   120-byte entries, two per HUD element). No log buffer: nothing is logged.
++#   128-byte entries, two per HUD element), x3 = the manual params (a pointer to
++#   state page + 0x200, written there by dm_host's hud_manual.c from the launcher's
++#   DM_HUD_* environment variables: 12 floats -- dx, dy, k per element in the
++#   order below -- at +0x200..+0x230, a u32 manual mask at +0x230 and a u32 hidden
++#   mask at +0x234). No log buffer: nothing is logged.
+ # Element order: 0 compass, 1 life, 2 coins, 3 moons.
+ # What it does, per pane: it matches the four HUD elements by pane NAME only
+ # ('PicStrap' = compass, 'Life' = lives, 'TxtCounterSh' / 'TxtCounter' = coins,
+-# 'Counter' / 'TxtTotalShine' = moons, 'TxtLife' = lives) and translates each by a
+-# FIXED horizontal offset computed from the aspect at runtime:
+-#   edge = 640 * (aspect / 1.7777778 - 1), clamped to [-200, +200] UI px.
+-#   aspect 2.167 (iPhone 19.5:9): edge +140 -- coins/moons move LEFT (-140),
+-#     compass/lives move RIGHT (+140), to the screen edges.
+-#   aspect 1.429 (iPhone Duo 1.43:1): edge -126 -- the HUD is laid out for 16:9,
+-#     so on the narrower screen it would be cut off; coins/moons move RIGHT (+126),
+-#     compass/lives move LEFT (-126), pulled in to the edges.
+-#   aspect 1.333 (iPad 4:3): edge -160 -- coins/moons +160, compass/lives -160.
+-#   aspect 1.778 (16:9) or 0: edge 0, a no-op. The dy is always 0 and the scale
+-#   is never touched: translation only, never a resize. See hud_edge.c for the
+-#   layouts and the design (orig/mod table, no-drift, game-recompute follow,
+-#   the dirty flag so a moved container carries its children, the bounded
+-#   mark-dirty walk).
++# 'Counter' / 'TxtTotalShine' = moons, 'TxtLife' = lives) and, per element, applies
++# the HIGHEST-priority transform that applies:
++#   hidden (the hidden-mask bit) first: the pane is pushed +10000 off-screen, so
++#     it is not rendered (0113 hid its guide text the same way). A hidden element
++#     stays hidden whatever the aspect or the manual setting says.
++#   a manual setting (the manual-mask bit) second: the launcher's setting, an
++#     ABSOLUTE offset (dx, dy) and scale (k) from the game's base layout, so it
++#     replaces the auto-edge offset instead of adding to it, and the element
++#     keeps its position when the aspect changes. k scales the pane about its
++#     centre (the 0113 hud_calc math), so a resize never drifts the pane.
++#   the auto edge anchor third (0118): a FIXED horizontal offset computed from
++#     the aspect at runtime:
++#       edge = 640 * (aspect / 1.7777778 - 1), clamped to [-200, +200] UI px.
++#       aspect 2.167 (iPhone 19.5:9): edge +140 -- coins/moons move LEFT (-140),
++#         compass/lives move RIGHT (+140), to the screen edges.
++#       aspect 1.429 (iPhone Duo 1.43:1): edge -126 -- the HUD is laid out for 16:9,
++#         so on the narrower screen it would be cut off; coins/moons move RIGHT (+126),
++#         compass/lives move LEFT (-126), pulled in to the edges.
++#       aspect 1.333 (iPad 4:3): edge -160 -- coins/moons +160, compass/lives -160.
++#       aspect 1.778 (16:9) or 0: edge 0, a no-op. The dy is always 0 and the scale
++#       is never touched: translation only, never a resize. See hud_edge.c for the
++#       layouts and the design (orig/mod table, no-drift, game-recompute follow,
++#       the dirty flag so a moved container carries its children, the bounded
++#       mark-dirty walk). The table stores the APPLIED transform (dx/dy/k/hidden)
++#       per entry, and a frame only rewrites a pane when the target transform
++#       differs -- so a settings change or an aspect change re-applies, and an
++#       unchanged frame is a no-op.
+ HUD_EDGE_WORDS = (
+-    "f100003ffa401844fa401804540010a0bd400020528cccc172a7f4c11e2700211e2120105400004ad65f03c0529999a172a801811e2700211e212010"
+-    "54000049d65f03c05291c7211e2e100272a7fc611e27002152a884011e2118001e2700211e2238001e2108001e20200854000da07940b00136380d61"
+-    "b940b801528d2a0372aa6c636b03003f54001260528d298372acacc36b03003f54000c00528f0a8372a98e836b03003f54001261b940bc0151595821"
+-    "7119a42154000b41f9400c01b40000c1b940b823528d298172acacc16b01007f54000a609101e04752800023f94000e1eb00003f540014e011001064"
+-    "b94070e5531c6c814b040021531d70218b21c044f861c841eb01001f3400138554001380b94070817100003f9a8410e7aa0703e2529e594172ae2921"
+-    "910020e44f000401528000251e270022aa0403e1f8038440290d94e3bd0068e2910040213c9f00213d800821eb02003f54ffff819101c003d2800001"
+-    "b8616866b8616845910010216b0500df54000e81f100c03f54ffff41bd4068e11e20202054000f60d11003ffd2800001bc616881bc21684191001021"
+-    "f100c03f54ffff81bd4044e1d2800001bd0068e01e202820bd0044e0bc616840bc21686091001021f100c03f54ffff81528000625280000352800001"
+-    "d29fffe5f90003e0390023e2d503201fb4000060f240081f540001a07100fc7f7a40d8245400010d51000421937c7c20f8606be017fffff73942f001"
+-    "34fff5e1d65f03c0911003ffd65f03c0f940140291008004f100005ffa42108454fffe00f240085ffa45004054fffda9937c7c26910023ea52800407"
+-    "d29fffeb38666949d1002046eb0000c854000220eb06001f54000062f103fd1f540001a97940a0487100fc3f937c7c2c5100052d321c01087900a048"
+-    "110004637a40d9245400008011000421f82c6be6382c694df9400442710004e754fffa40f100005ffa42108454fff9e0f240085ffa4b004054fff989"
+-    "17ffffe4b940bc03528e4e8172ae0c216b01007f54fff9e13943000134000521d65f03c0528f0a8372a86e836b03003f540004e1b940bc03528eade1"
+-    "72ae8dc16b01007f54fff861b940c001528e4ca372ad0a636b03003f54000201b940c40135fff781d2801e07528000431e2140008b07004717ffff67"
+-    "d2800001d503201fbc616861bc21688191001021f100c03f54ffff8117ffff8b528e4ca36b03003f54fffe20d65f03c0d65f03c054ffed21aa0403e7"
+-    "910020e49100e0e217ffff75aa0203e75280000317ffff52528de86372adcea36b03003f54000101b940bc01515c98217115d02154fff341d2802d07"
+-    "5280006317ffffde528f0a8372aa8e836b03003f54fff261b940bc03528e8de172ad8c216b01007f54fff1c1b940c003528d0a6172adcd216b01007f"
+-    "54fff121b940c4017101943f54fff0c1f9400c01b4fffd61b940b824528de86372adcea36b03009f54fffcc1b940bc21515c98217115d02154fffc41"
+-    "d65f03c0"
++    "f100003ffa4018441a9f17e4f100001f1a9f17e52a05008635000fe6bd400020528cccc172a7f4c11e2700211e21201054000b6a0f00040052800024"
++    "b4000c03294604687100011f7a4008845400006034000e21528000087940b00436380dc4b940b804528d2a0572aa6c656b05009f54000c80528d2985"
++    "72acacc56b05009f54001a20528f0a8772a98e876b07009f54001a01b940bc04515958847119a48454000ba1f9400c04b4000084b940b8846b05009f"
++    "54000b0053017d0853017c215280002712000029520001246a08009f54000a40b40027e30b0704e493407c84bc6478611e21202054001aa152a88401"
++    "1e2700201e2020305400274c52b884011e2700201e202030540026c41e2020281a9f17e691000484d37ef485bc6478641e24208054002b4152a87681"
++    "1e2700201e2020905400252c52b876811e2700201e202090540024a48b050063bd4004631e2020681e231460540029e15293334172a7e3211e270020"
++    "1e202070540016e4528cccc172a7fcc11e2700201e2020705400164c340005261e2020881e2e10001e200460540004a1d65f03c0529999a172a80181"
++    "1e2700211e212010540000a90f00040052800024b5fff443d65f03c05291c7211e2e100272a7fc611e27002152a884011e2118001e2700211e223800"
++    "1e2108001e2020081a9f17e4b5fff2a354000120528000015280000817ffff97b940bc05528e4e8472ae0c246b0400bf54001080d65f03c034000c49"
++    "0f0004041e2e10031e204081531960e3d37904e58b050045f863c844eb00009f5400234011080063b9407ca48b234041f863c842eb02001f34002244"
++    "54002240b9407c227100005f9a8110a5aa0503e2910020a4529e5943aa0403e14f00040072ae2923f80384401e27006252800023290f0ca7bd0068a2"
++    "910040213c9f00203d800820eb01005f54ffff819101c003d2800001b8616867b8616846910010216b0600ff54001681f100c03f54ffff41bd4068a0"
++    "1e21200054000161bd406ca01e24200054000101bd4070a01e232000540000a1b94074a16b09003f54001e00d503201fd11003ffd2800001bc616880"
++    "bc21684091001021f100c03f54ffff8134000f49bd4044a05288000172a8c3811e2700221e222800bd0044a0d2800001b90074a92d0d10a1bd0070a3"
++    "bc616840bc21686091001021f100c03f54ffff81910003e4528000625280000352800001d29fffe6f90003e0390023e2b4000060f240081f540006c0"
++    "7100fc7f7a40d8245400062d51000421937c7c20f860688017fffff7710004ff5400044d1e2020081e2140011a9f17e10f0004041e2e100334fff361"
++    "d65f03c03942f00434ffe784d65f03c0528f0a8572a86e856b05009f540017c1b940bc05528eade472ae8dc46b0400bf54fff121b940c004528e4ca5"
++    "72ad0a656b05009f54000d61b940c40435fff04453027d0853027c215280004717ffff2a3943000434001464d65f03c01e2020081e2040011a9f17e1"
++    "17ffffdf0f0004015280002617ffff341e20400317ffff77911003ffd65f03c0f940140291008005f100005ffa4210a454fff8e0f240085ffa460040"
++    "54fff889937c7c27910023eb52800408d29fffec3867696ad1002047eb0000e954000240eb07001f54000062f103fd3f540001c97940a0497100fc3f"
++    "937c7c2d910003ef321c01297900a0495100054e110004637a40d9445400008011000421f82d69e7382d696ef94004427100050854fff500f100005f"
++    "fa4210a454fff4a0f240085ffa4c004054fff44917ffffe3360005e8bd4050001e202018540006ccbd4014a5bd4024a29100404791004081d2800006"
++    "bc6668801e230800bc266840bc6668201e230800bc2668e0910010c6f10030df54ffff01bd4014a6d2800406bd4024a01e2538c61e2238001f0314c5"
++    "1f0308021e2128a51e242842bd0044a5bd0054a2bc666880bc266840910010c6f100c0df54ffff8117ffff6bd2800001d503201fbc616860bc216880"
++    "91001021f100c03f54ffff8117ffff55528e4ca56b05009f54fff2c0d65f03c0bd4044a01e212800bd0044a017ffff5b34ffee89d65f03c01e204004"
++    "17fffedb1e20400117fffecc528a000172a8f8611e2700221e2220105400004417ffffc6bd4054051e2020b85400004c17ffffc21e2220b054000044"
++    "17ffffbf39416c01d3441426710004df540005000f000406710008df540000611e2c10061e26880653067c217100043f540003a00f0004007100083f"
++    "540000611e2c10001e2008a02d4114b12d42c0a7bd401ca21e2508051f0616251e220802bd4024a01f1008c21e2728a51e20284217ffffa50f000404"
++    "17fffeae1e2e100317fffebb54ffde61aa0103e5910020a49100e0a217fffeff5280000717fffe84d65f03c01e2c10001e2088a017ffffe71e2c1006"
++    "1e26080617ffffdc528de86572adcea56b05009f54000121b940bc04515c98847115d08454ffd92153037d0853037c215280006717fffe71528f0a85"
++    "72aa8e856b05009f54ffd821b940bc05528e8de472ad8c246b0400bf54ffd781b940c005528d0a6472adcd246b0400bf54ffd6e1b940c4047101949f"
++    "54ffd681f9400c04b4fffd44b940b887528de86572adcea56b0500ff54fffca1b940bc84515c98847115d08454fffc21d65f03c0"
+ )
+ 
+ # The HUD edge-anchor hook (0118): Pane::Calculate (main+0x909494, the vtable's
+@@ -82,10 +112,11 @@ HUD_EDGE_WORDS = (
+ # (set just before it), x1 / x2 are still live (they are copied to x21 / x20 after
+ # the site), x3 is live (the force flag, used later), and x8 is dead (the load
+ # itself writes it) -- so the entry stub saves x1, x2, x3 and x8 (x8 only so the
+-# save is a pair), calls hud_edge, restores them, re-executes the load, and returns
+-# to site+4. The stub does NOT set x3 (hud_edge takes no log buffer); x3 is saved
+-# only because the bl may clobber it. No runtime __TEXT write anywhere: the cuts
+-# are the rewriter's load-time replacements, the duo_anchor pattern.
++# save is a pair), sets x1/x2/x3 for hud_edge (aspect, table, manual params), calls
++# hud_edge, restores x1/x2/x3 (the force flag) and x8, re-executes the load, and
++# returns to site+4. The +0x13c stub does NOT save x3 (x0-x7 are dead there); it
++# only sets it. No runtime __TEXT write anywhere: the cuts are the rewriter's
++# load-time replacements, the duo_anchor pattern.
+ def _hud_edge_frame_step(ctx):
+     here, emit, fs_site, fs_put, FS_STATE_OFF = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state
+     hud_code = here()
+@@ -100,6 +131,7 @@ def _hud_edge_frame_step(ctx):
+     emit(0xaa1303e0)                          # mov x0, x19 (the pane)
+     emit(ADRP(1, here(), FS_STATE_OFF)); emit(ADDI(1, 1, 0x58))    # x1 = state + 0x58 (the aspect, loader.c)
+     emit(ADRP(2, here(), FS_STATE_OFF)); emit(ADDI(2, 2, 0x300))   # x2 = state + 0x300 (table)
++    emit(ADRP(3, here(), FS_STATE_OFF)); emit(ADDI(3, 3, 0x200))   # x3 = state + 0x200 (the manual params, hud_manual.c)
+     emit(B(here(), hud_code) | 0x80000000)    # bl hud_edge
+     emit(LDP_POST(8, 9, 31, 16))              # ldp x8, x9, [sp], #0x10 (restore the flags)
+     emit(0x320003f6)                          # orr w22, wzr, #0x1 (the replaced instruction)
+@@ -117,6 +149,7 @@ def _hud_edge_frame_step(ctx):
+     emit(0xaa1303e0)                          # mov x0, x19 (the pane)
+     emit(ADRP(1, here(), FS_STATE_OFF)); emit(ADDI(1, 1, 0x58))    # x1 = state + 0x58 (the aspect, loader.c)
+     emit(ADRP(2, here(), FS_STATE_OFF)); emit(ADDI(2, 2, 0x300))   # x2 = state + 0x300 (table)
++    emit(ADRP(3, here(), FS_STATE_OFF)); emit(ADDI(3, 3, 0x200))   # x3 = state + 0x200 (the manual params, hud_manual.c)
+     emit(B(here(), hud_code) | 0x80000000)    # bl hud_edge
+     emit(LDP_POST(3, 8, 31, 16))              # ldp x3, x8, [sp], #0x10
+     emit(LDP_POST(1, 2, 31, 16))              # ldp x1, x2, [sp], #0x10
+@@ -127,7 +160,7 @@ def _hud_edge_frame_step(ctx):
+ FRAME_STEP = {BUILD_141: _hud_edge_frame_step}
+ 
+ BINDING = [
+-    {'what': "HUD edge anchor, v1 (hud_edge.c: entry + 0x13c cuts, compass 'PicStrap', lives 'Life'/'TxtLife', coins 'TxtCounterSh'/'TxtCounter', moons 'Counter'/'TxtTotalShine', matched by pane name only, a fixed signed horizontal offset from the screen aspect -- iPhone 19.5:9 +140 out, iPhone Duo 1.43:1 -126 in, iPad 4:3 -160 in, 16:9 0 -- translation only, a dirty flag so a moved container carries its children, an orig/mod table so a fixed offset never drifts, no settings UI, no user state)", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
+-     'why': "Pane::Calculate and the pane layout are this build's nn::ui2d code, found by the HUDLOG diagnostic run (log-17) and confirmed by disassembly of DmIOS; the edge offset comes from the screen aspect the loader already writes to state page + 0x58 (log-28). This replaces the cancelled draggable HUD (0113): it has no user-adjustable state, no settings UI, and its only tree walk is the bounded flag-only mark-dirty, so the 0113 crash class (a name/match walk reading a pane through a bad pointer) is structurally absent.",
++    {'what': "HUD edge anchor, v2 (hud_edge.c: entry + 0x13c cuts, compass 'PicStrap', lives 'Life'/'TxtLife', coins 'TxtCounterSh'/'TxtCounter', moons 'Counter'/'TxtTotalShine', matched by pane name only; the auto edge offset from the screen aspect -- iPhone 19.5:9 +140 out, iPhone Duo 1.43:1 -126 in, iPad 4:3 -160 in, 16:9 0 -- plus the launcher's manual overrides from the DM_HUD_* environment variables (hud_manual.c, state page +0x200), which win over the auto edge, and a hide that pushes the pane off-screen; a dirty flag so a moved container carries its children, an orig/mod table with the applied transform so a fixed offset never drifts, no settings UI in the game itself)", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
++     'why': "Pane::Calculate and the pane layout are this build's nn::ui2d code, found by the HUDLOG diagnostic run (log-17) and confirmed by disassembly of DmIOS; the edge offset comes from the screen aspect the loader already writes to state page + 0x58 (log-28). The manual settings come from the launcher's HUD editor (HudEditor.swift) through the same environment-variable channel the launcher already uses for its other settings (DM_SCREEN_ASPECT), so the game reads nothing new: the host copies them to state page +0x200 once per present. This replaces the cancelled draggable HUD (0113): it keeps no user-adjustable state in the game, reuses the 0118 pane-name hook, and its only tree walk is the bounded flag-only mark-dirty, so the 0113 crash class (a name/match walk reading a pane through a bad pointer) is structurally absent.",
+      'blocked': 'the stubs have no function-matched form yet'},
+ ]
+diff --git a/dm/host/Makefile b/dm/host/Makefile
+index 928ad55..cd4c27b 100644
+--- a/dm/host/Makefile
++++ b/dm/host/Makefile
+@@ -20,7 +20,7 @@ GAME_H = gen/$(GAME)/game_profile.h
+ include ../mac/min_os.mk
+ CFLAGS=-O1 -g -Wall -Wno-unused-function -mmacosx-version-min=$(MACOS_MIN)
+ # Service-layer takeover hle_*.c files are included by wildcard: adding a file does not touch this line (avoids merge conflicts)
+-SRC=main.c loader.c uw.c hle.c crash.c probe.c thread.c save_sync.c memstat.m haptics_apple.m $(sort $(wildcard hle_*.c)) front_mac.m controllers_mac.m web_apple.m entry.S
++SRC=main.c loader.c uw.c hud_manual.c hle.c crash.c probe.c thread.c save_sync.c memstat.m haptics_apple.m $(sort $(wildcard hle_*.c)) front_mac.m controllers_mac.m web_apple.m entry.S
+ # NVN null device + nn::vi + the Vulkan layer (dm/gfx/)
+ # Sources under dm/gfx, dm/gfx/nvn, dm/gfx/tex, dm/gfx/vk and dm/gfx/gl are included by wildcard (tests/ and metal/ do not go into the host): adding a file does not touch this line
+ GFX=$(sort $(wildcard ../gfx/*.c ../gfx/nvn/*.c ../gfx/nvn/*.m ../gfx/nvn/*.S ../gfx/tex/*.c ../gfx/tex/*.m ../gfx/vk/*.m ../gfx/gl/*.m))
+diff --git a/dm/host/hud_manual.c b/dm/host/hud_manual.c
+new file mode 100644
+index 0000000..fc5fec8
+--- /dev/null
++++ b/dm/host/hud_manual.c
+@@ -0,0 +1,104 @@
++// hud_manual.c -- the launcher HUD editor's host side (0119, V1.3.14). The
++// launcher's HUD editor (HudEditor.swift) writes the four DM_HUD_* environment
++// variables before the game starts; this file copies them into the frame step
++// state page (state +0x200), where the rewriter's hud_edge stub reads them every
++// frame. Nothing here writes game code: the stub is a load-time rewriter cut
++// (patches.py), and this file only writes the state page's data.
++#include "hud_manual.h"
++#include "dm.h"    // LOG
++#include "hle.h"   // dm_fps_state
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++
++// The HUD block in the frame step state page (patches.py, hud_edge.c):
++//   +0x200: 12 floats, per element (dx, dy, k): compass, lives, coins, moons
++//   +0x230: u32 manual mask, one bit per element (the launcher set it)
++//   +0x234: u32 hidden mask, one bit per element (the launcher hid it)
++//   +0x300: the HUD table (8 x 128 bytes, two per element, hud_edge's working copy)
++// The block fits the frame step state's reserved 0x4000 bytes; loader.c's own
++// fields end below +0x200, so there is no overlap. (0113 used the same +0x200
++// block for its own params; that block is free now that 0113 is deleted.)
++#define HUD_MANUAL_PARAMS_OFF  0x200
++#define HUD_MANUAL_MASK_OFF    (HUD_MANUAL_PARAMS_OFF + 48)
++#define HUD_MANUAL_HIDDEN_OFF  (HUD_MANUAL_PARAMS_OFF + 52)
++
++#define HUD_LOG(...) LOG("[hud] " __VA_ARGS__)
++
++// The four environment variables the launcher's HUD editor writes (HudEditor.swift):
++//   DM_HUD_COMPASS / DM_HUD_LIFE / DM_HUD_COINS / DM_HUD_MOONS
++// Each is "dx,dy,k,hidden" (dx, dy in layout points, 1280x720 space; k the size
++// multiplier; hidden 1 to hide the element). Unset (or unparseable) means the
++// element has no manual setting: it keeps the auto edge anchor (0118).
++static const char *const g_hud_env[DM_HUD_N] = {
++    "DM_HUD_COMPASS", "DM_HUD_LIFE", "DM_HUD_COINS", "DM_HUD_MOONS",
++};
++
++static float g_hud_dx[DM_HUD_N], g_hud_dy[DM_HUD_N], g_hud_k[DM_HUD_N] = {1, 1, 1, 1};   // as last written to the state page
++static uint32_t g_hud_manual, g_hud_hidden;   // the masks, as written to the state page
++static int g_hud_started;                     // the first write (or the no-settings line) has been logged
++
++static float hud_clamp_k(float k) { if (!(k > 0)) return 1; return fminf(fmaxf(k, 0.6f), 1.8f); }
++static float hud_clamp_dx(float dx) { return fminf(fmaxf(dx, -640.0f), 640.0f); }
++static float hud_clamp_dy(float dy) { return fminf(fmaxf(dy, -360.0f), 360.0f); }
++
++// Parse one "dx,dy,k,hidden" value. Returns 1 and fills dx/dy/k/hidden when the
++// string parses fully (four comma-separated fields, nothing trailing); 0 when the
++// variable is unset or malformed (then the element keeps the auto edge anchor).
++static int hud_parse(const char *s, float *dx, float *dy, float *k, int *hidden) {
++    if (!s || !*s) return 0;
++    char *end;
++    float v0 = strtof(s, &end); if (end == s || *end != ',') return 0; s = end + 1;
++    float v1 = strtof(s, &end); if (end == s || *end != ',') return 0; s = end + 1;
++    float v2 = strtof(s, &end); if (end == s || *end != ',') return 0; s = end + 1;
++    long v3 = strtol(s, &end, 10); if (end == s || *end != '\0') return 0;
++    *dx = hud_clamp_dx(v0); *dy = hud_clamp_dy(v1); *k = hud_clamp_k(v2); *hidden = v3 != 0;
++    return 1;
++}
++
++void dm_hud_manual_frame_tick(void) {
++    uint8_t *st = dm_fps_state;
++    if (!st) return;
++    float dx[DM_HUD_N], dy[DM_HUD_N], k[DM_HUD_N];
++    uint32_t manual = 0, hidden = 0;
++    for (int i = 0; i < DM_HUD_N; i++) {
++        int hid = 0;
++        if (hud_parse(getenv(g_hud_env[i]), &dx[i], &dy[i], &k[i], &hid)) {
++            manual |= 1u << i;
++            if (hid) hidden |= 1u << i;
++        } else {
++            dx[i] = 0; dy[i] = 0; k[i] = 1;   // unset: the stub never reads these (no manual bit)
++        }
++    }
++    // Write only when something changed. The state page is the stub's input, and
++    // rewriting it every present would be a needless write.
++    int changed = manual != g_hud_manual || hidden != g_hud_hidden;
++    if (!changed) {
++        for (int i = 0; i < DM_HUD_N; i++) {
++            if ((manual & (1u << i)) && (dx[i] != g_hud_dx[i] || dy[i] != g_hud_dy[i] || k[i] != g_hud_k[i])) { changed = 1; break; }
++        }
++    }
++    if (!changed) {
++        if (!g_hud_started) {   // log once even when nothing is set, so the log shows the channel was checked
++            HUD_LOG("HUD manual: no DM_HUD_* set, auto edge anchor only");
++            g_hud_started = 1;
++        }
++        return;
++    }
++    memcpy(g_hud_dx, dx, sizeof dx); memcpy(g_hud_dy, dy, sizeof dy); memcpy(g_hud_k, k, sizeof k);
++    g_hud_manual = manual; g_hud_hidden = hidden;
++    float params[12];
++    for (int i = 0; i < DM_HUD_N; i++) { params[i*3] = dx[i]; params[i*3+1] = dy[i]; params[i*3+2] = k[i]; }
++    memcpy(st + HUD_MANUAL_PARAMS_OFF, params, sizeof params);
++    memcpy(st + HUD_MANUAL_MASK_OFF, &manual, 4);
++    memcpy(st + HUD_MANUAL_HIDDEN_OFF, &hidden, 4);
++    if (!g_hud_started) {
++        HUD_LOG("HUD manual: state page at %p, manual mask %#x, hidden mask %#x", (void *)st, manual, hidden);
++        for (int i = 0; i < DM_HUD_N; i++) {
++            if (manual & (1u << i)) HUD_LOG("HUD manual: element %d dx %.0f dy %.0f k %.2f hidden %d", i, dx[i], dy[i], k[i], (hidden >> i) & 1u);
++        }
++        g_hud_started = 1;
++    } else {
++        HUD_LOG("HUD manual: settings changed, manual mask %#x, hidden mask %#x", manual, hidden);
++    }
++}
+diff --git a/dm/host/hud_manual.h b/dm/host/hud_manual.h
+new file mode 100644
+index 0000000..7622b40
+--- /dev/null
++++ b/dm/host/hud_manual.h
+@@ -0,0 +1,18 @@
++// hud_manual.h (0119) -- the launcher HUD editor's host side. The launcher's
++// HUD editor (HudEditor.swift, in the iOS launcher) writes the four DM_HUD_*
++// environment variables before the game starts; hud_manual.c copies them into
++// the frame step state page (state +0x200), where the rewriter's hud_edge stub
++// reads them every frame. Element order: 0 compass, 1 lives, 2 coins, 3 moons.
++// (0113's hud.h / hud.c did the same job for its own editor; they were deleted
++// with 0113. This file is the new, smaller host side: env vars in, state page
++// out, no per-frame game calls, no log drain.)
++#ifndef DM_HUD_MANUAL_H
++#define DM_HUD_MANUAL_H
++
++#define DM_HUD_N 4   // compass, lives, coins, moons
++
++// Copy the launcher's DM_HUD_* settings into the frame step state page (called
++// once per present from uw_frame_hook; writes only when something changed).
++void dm_hud_manual_frame_tick(void);
++
++#endif
+diff --git a/dm/host/uw.c b/dm/host/uw.c
+index 13b273d..13cc37d 100644
+--- a/dm/host/uw.c
++++ b/dm/host/uw.c
+@@ -2,6 +2,7 @@
+ // disassembly evidence (DmIOS file offsets) behind every constant and branch.
+ #include "uw.h"
+ #include "dm.h"
++#include "hud_manual.h"   // dm_hud_manual_frame_tick: the launcher HUD editor's settings, into the state page
+ #include "front.h"   // front_display_pixels: the display in pixels, for DM_ASPECT=auto (0099)
+ #include <math.h>
+ #include <mach/mach.h>   // vm_region_64: query a page's real protection before restoring it (0101)
+@@ -732,6 +733,7 @@ void uw_frame_hook(double w, double h) {
+     }
+     uw_update_from_size(w, h);
+     uw_direct_write();
++    dm_hud_manual_frame_tick();   // (0119) the launcher HUD editor's settings into the state page (+0x200); a no-op write when unchanged
+ }
+ 
+ float uw_effective_aspect(float in) {
+diff --git a/dm/ios/Sources/HudEditor.swift b/dm/ios/Sources/HudEditor.swift
+new file mode 100644
+index 0000000..5c6a974
+--- /dev/null
++++ b/dm/ios/Sources/HudEditor.swift
+@@ -0,0 +1,348 @@
++// HudEditor.swift -- the launcher HUD editor (0119, V1.3.14). The settings screen
++// shows a game preview (the forest scene, the four HUD elements, the menu/map
++// hints) at the device's screen shape, and each element can be dragged, resized
++// (60%-180%) or hidden. A manual setting wins over the auto edge anchor (0118);
++// an element with no manual setting keeps the auto edge. Hidden in the editor
++// means hidden in the game. The settings are kept in UserDefaults and, when the
++// game starts, written to the DM_HUD_* environment variables (HudSettings).
++// The game reads them through the host (dm/host/hud_manual.c -> state page
++// +0x200 -> hud_edge.c). The four preview shapes are iPhone 19.5:9, iPhone Duo
++// 1.43:1, iPad 4:3 and 16:9; the default is the device's own shape.
++import SwiftUI
++import Foundation
++
++// One element's manual setting: an offset (dx, dy) in layout points (1280x720
++// space, y up, from the game's base layout position), a size multiplier k, and
++// whether the element is hidden. Encoded as "dx,dy,k,hidden" (dx, dy whole
++// points, k two decimals, hidden 1 / 0): the same string the host parses from
++// the DM_HUD_* environment variable, so the launcher and the host agree.
++struct HudElementSetting: Equatable {
++    var dx, dy, k: Double
++    var hidden: Bool
++    var encoded: String { "\(Int(dx.rounded())),\(Int(dy.rounded())),\(String(format: "%.2f", k)),\(hidden ? 1 : 0)" }
++    static func decode(_ s: String) -> HudElementSetting? {
++        let p = s.split(separator: ",")
++        guard p.count == 4, let dx = Double(p[0]), let dy = Double(p[1]), let k = Double(p[2]), let h = Int(p[3]) else { return nil }
++        return HudElementSetting(dx: dx, dy: dy, k: k, hidden: h != 0)
++    }
++}
++
++// The four HUD elements, in the game's order (hud_edge.c, hud_manual.c, patches.py).
++// The coins group ("金币") is the moons element's fallback: when no separate moons
++// setting exists, the moons element follows the coins group's setting, so the top
++// cluster (coin icon, moon icon, the white bar) moves as one unit -- the grouping
++// the player picked (the white part on top is the coins group, the dots below it
++// are the moons group). In the game the moon counter (icon, number, dots) is one
++// pane group (Counter), so it moves as one unit; the coin icon is a separate unit.
++enum HudElement: Int, CaseIterable, Identifiable {
++    case compass = 0, lives, coins, moons
++    var id: Int { rawValue }
++    var env: String {
++        switch self { case .compass: return "DM_HUD_COMPASS"; case .lives: return "DM_HUD_LIFE"; case .coins: return "DM_HUD_COINS"; case .moons: return "DM_HUD_MOONS" }
++    }
++    var name: String {
++        switch self { case .compass: return "指南针"; case .lives: return "生命"; case .coins: return "金币"; case .moons: return "月亮" }
++    }
++    var key: String { "DmHudManual.\(rawValue)" }   // UserDefaults key, one per element
++    // The element's centre in the 16:9 layout (1280x720, y down here for the
++    // preview; the game layout is y up, and the dy sign is flipped on encode).
++    // Approximate: log-28 gives the matrices, not the translations; the mockup's
++    // layout is the reference. Coins and moons are left, lives and compass right.
++    var base: CGPoint {
++        switch self { case .coins: return CGPoint(x: 170, y: 62); case .moons: return CGPoint(x: 370, y: 95); case .lives: return CGPoint(x: 1160, y: 110); case .compass: return CGPoint(x: 1200, y: 95) }
++    }
++    var isLeft: Bool { self == .coins || self == .moons }   // the auto edge moves left elements left, right elements right
++}
++
++// The four preview shapes. The default is the device's own shape.
++enum HudAspect: CaseIterable, Identifiable {
++    case phone, duo, pad, wide
++    var id: Self { self }
++    var name: String {
++        switch self { case .phone: return "iPhone 19.5:9"; case .duo: return "iPhone Duo 1.43:1"; case .pad: return "iPad 4:3"; case .wide: return "16:9" }
++    }
++    var ratio: Double {
++        switch self { case .phone: return 2.167; case .duo: return 1.429; case .pad: return 1.333; case .wide: return 1.778 }
++    }
++    // The layout size for the shape (loader.c dm_fps_state_apply's rule: wider
++    // than 16:9 keeps the height (720) and widens; taller keeps the width (1280)
++    // and grows taller).
++    var layout: CGSize {
++        if ratio > 1.78 { return CGSize(width: 720 * ratio, height: 720) }
++        if ratio < 1.77 { return CGSize(width: 1280, height: 1280 / ratio) }
++        return CGSize(width: 1280, height: 720)
++    }
++    static func device() -> HudAspect {
++        let s = UIScreen.main.bounds.size
++        let r = max(s.width, s.height) / max(1, min(s.width, s.height))
++        // The closest of the four shapes (the phone is 2.167, the Duo 1.429, the iPad 1.333, 16:9 is 1.778).
++        return [phone, duo, pad, wide].min(by: { abs($0.ratio - r) < abs($1.ratio - r) }) ?? .phone
++    }
++}
++
++final class HudSettings: ObservableObject {
++    // One setting per element; a missing key means "no manual setting" (auto edge).
++    @Published private(set) var values: [HudElement: HudElementSetting] = [:]
++    private let defaults: UserDefaults
++    init(defaults: UserDefaults = .standard) {
++        self.defaults = defaults
++        for e in HudElement.allCases {
++            if let s = (defaults.string(forKey: e.key)).flatMap(HudElementSetting.decode) { values[e] = s }
++        }
++    }
++    // The setting that actually applies to an element (the moons element falls
++    // back to the coins group's setting when it has no setting of its own).
++    func effective(_ e: HudElement) -> HudElementSetting? {
++        if e == .moons { return values[.moons] ?? values[.coins] }
++        return values[e]
++    }
++    func isManual(_ e: HudElement) -> Bool { effective(e) != nil }
++    func set(_ e: HudElement, _ s: HudElementSetting?) {
++        if let s { values[e] = s; defaults.set(s.encoded, forKey: e.key) }
++        else { values.removeValue(forKey: e); defaults.removeObject(forKey: e.key) }
++    }
++    func resetAll() { for e in HudElement.allCases { set(e, nil) } }
++    var anyManual: Bool { HudElement.allCases.contains { effective($0) != nil } }
++    // The auto edge offset for an aspect (hud_edge.c's formula): 640 * (aspect /
++    // 1.7777778 - 1), clamped to [-200, +200]. Left elements move by -edge, right
++    // elements by +edge; the dy is always 0 and the scale is never touched.
++    static func autoEdgeDx(_ e: HudElement, _ aspect: Double) -> Double {
++        guard aspect > 0, aspect >= 1.3, aspect <= 2.2 else { return 0 }
++        let edge = max(-200, min(200, 640 * (aspect / 1.7777778 - 1)))
++        return e.isLeft ? -edge : edge
++    }
++    // Before the game starts: every element with a manual setting goes into the
++    // environment (the host copies it to the state page); an element with no
++    // manual setting is unset, so the game keeps its auto edge anchor. A hidden
++    // element's hidden flag (1) is in the same string.
++    func applyToEnvironment() {
++        for e in HudElement.allCases {
++            if let s = effective(e) {
++                setenv(e.env, s.encoded, 1)
++                fputs("launcher: \(e.env)=\(s.encoded) (HUD editor)\n", stderr)
++            } else {
++                unsetenv(e.env)
++            }
++        }
++    }
++}
++
++// The preview of one HUD element, drawn to look like the game: the coin is a white
++// ring with a dark bar, the moon a white hexagon with a dark ring and a dot, the
++// lives a heart and a number, the compass a dial with the menu / map hints.
++private struct HudElementPreview: View {
++    let el: HudElement
++    let k: Double
++    var body: some View {
++        Group {
++            switch el {
++            case .coins:
++                VStack(spacing: 4 * k) {
++                    HStack(spacing: 6 * k) {
++                        ZStack {
++                            Circle().stroke(Color.white, lineWidth: 5 * k).frame(width: 34 * k, height: 34 * k)
++                            Circle().stroke(Color.white.opacity(0.85), lineWidth: 1.5 * k).frame(width: 24 * k, height: 24 * k)
++                            Rectangle().fill(Color.black.opacity(0.55)).frame(width: 3 * k, height: 26 * k)
++                        }
++                        Text("0896").font(.system(size: 22 * k, weight: .bold, design: .rounded)).foregroundStyle(.white)
++                    }
++                    Rectangle().fill(Color.white).frame(width: 150 * k, height: 5 * k).cornerRadius(2.5 * k)
++                }
++            case .moons:
++                VStack(spacing: 6 * k) {
++                    HStack(spacing: 6 * k) {
++                        ZStack {
++                            Hexagon().fill(Color.white).frame(width: 34 * k, height: 34 * k)
++                            Circle().stroke(Color.black.opacity(0.55), lineWidth: 2.5 * k).frame(width: 20 * k, height: 20 * k)
++                            Circle().fill(Color.black.opacity(0.55)).frame(width: 6 * k, height: 6 * k)
++                        }
++                        Text("020").font(.system(size: 22 * k, weight: .bold, design: .rounded)).foregroundStyle(.white)
++                    }
++                    VStack(spacing: 4 * k) {
++                        HStack(spacing: 5 * k) { ForEach(0..<6) { i in MoonDot(filled: i < 2, color: .blue) } }
++                        HStack(spacing: 5 * k) { ForEach(0..<6) { i in MoonDot(filled: false, color: .pink) } }
++                    }
++                }
++            case .lives:
++                HStack(spacing: 5 * k) {
++                    Text("♥").font(.system(size: 22 * k)).foregroundStyle(.red)
++                    Text("3").font(.system(size: 22 * k, weight: .bold, design: .rounded)).foregroundStyle(.white)
++                }
++            case .compass:
++                VStack(spacing: 4 * k) {
++                    ZStack {
++                        Circle().stroke(Color.white.opacity(0.9), lineWidth: 2.5 * k).frame(width: 56 * k, height: 56 * k)
++                        Text("N").font(.system(size: 14 * k, weight: .bold)).foregroundStyle(.white)
++                        Circle().fill(Color.red).frame(width: 6 * k, height: 6 * k).offset(y: -16 * k)
++                    }
++                    Text("+ 菜单").font(.system(size: 13 * k, weight: .semibold)).foregroundStyle(.white)
++                    Text("− 地图").font(.system(size: 13 * k, weight: .semibold)).foregroundStyle(.white)
++                }
++            }
++        }
++    }
++}
++
++private struct MoonDot: View {
++    let filled: Bool
++    let color: Color
++    var body: some View {
++        Group {
++            if filled { Circle().fill(color) }
++            else { Circle().stroke(Color.white.opacity(0.7), lineWidth: 1.5) }
++        }
++        .frame(width: 10, height: 10)
++    }
++}
++
++private struct Hexagon: Shape {
++    func path(in rect: CGRect) -> Path {
++        var p = Path()
++        for i in 0..<6 {
++            let a = CGFloat(i) * .pi / 3 - .pi / 2
++            let pt = CGPoint(x: rect.midX + rect.width / 2 * cos(a), y: rect.midY + rect.height / 2 * sin(a))
++            if i == 0 { p.move(to: pt) } else { p.addLine(to: pt) }
++        }
++        p.closeSubpath()
++        return p
++    }
++}
++
++struct HudEditorView: View {
++    @ObservedObject var settings: HudSettings
++    @State private var aspect: HudAspect = .device()
++    @State private var selected: HudElement = .coins
++    @State private var dragOffset = CGSize.zero   // the in-progress drag, in preview points
++    @Environment(\.dismiss) private var dismiss
++
++    // The preview's layout (points) for the chosen aspect, and the scale from
++    // layout points to preview points (uniform: the preview's shape is the layout's).
++    private func layoutPoint(_ el: HudElement, preview: CGSize, layout: CGSize) -> CGPoint {
++        let s = effectiveSetting(el)
++        let dx: Double
++        let dy: Double   // preview y is down; the game's dy is up, so the sign flips on display
++        if let s {
++            dx = s.dx; dy = -s.dy
++        } else {
++            dx = HudSettings.autoEdgeDx(el, aspect.ratio); dy = 0
++        }
++        let x = (el.base.x + CGFloat(dx)) / layout.width * preview.width
++        let y = (el.base.y + CGFloat(dy)) / layout.height * preview.height
++        return CGPoint(x: x, y: y)
++    }
++    private func effectiveSetting(_ el: HudElement) -> HudElementSetting? { settings.effective(el) }
++    private func dragScale(preview: CGSize, layout: CGSize) -> Double { Double(layout.width / max(1, preview.width)) }   // preview points -> layout points
++
++    var body: some View {
++        NavigationStack {
++            ScrollView {
++                VStack(alignment: .leading, spacing: 16) {
++                    // The preview, at the chosen shape. The background is a forest
++                    // gradient in the official art's colours (the game screenshot is
++                    // not bundled with the app); the HUD sits on it as in the game.
++                    GeometryReader { geo in
++                        let layout = aspect.layout
++                        ZStack {
++                            LinearGradient(colors: [Color(red: 0.16, green: 0.42, blue: 0.24), Color(red: 0.35, green: 0.62, blue: 0.30), Color(red: 0.55, green: 0.75, blue: 0.38)],
++                                           startPoint: .topLeading, endPoint: .bottomTrailing)
++                            // A soft sky light, upper right, so the white HUD reads as it does on the bright art.
++                            RadialGradient(colors: [Color.white.opacity(0.28), Color.clear], center: .topTrailing, startRadius: 10, endRadius: geo.size.width * 0.7)
++                            Text("M").font(.system(size: 90, weight: .black)).foregroundStyle(.white.opacity(0.25))
++                            ForEach(HudElement.allCases) { el in
++                                let s = effectiveSetting(el)
++                                HudElementPreview(el: el, k: s?.k ?? 1)
++                                    .opacity(s?.hidden == true ? 0.25 : 1)
++                                    .overlay {
++                                        if selected == el {
++                                            RoundedRectangle(cornerRadius: 8).stroke(Color.yellow, lineWidth: 2)
++                                                .padding(-6)
++                                        }
++                                    }
++                                    .position(layoutPoint(el, preview: geo.size, layout: layout))
++                                    .offset(el == selected ? dragOffset : .zero)
++                                    .onTapGesture { selected = el }
++                                    .gesture(
++                                        DragGesture().onChanged { v in
++                                            selected = el; dragOffset = v.translation
++                                        }.onEnded { v in
++                                            // The drag (preview points, y down) into layout points (y up): dx as-is, dy negated.
++                                            // Start from the EFFECTIVE setting (a moons element following the coins group starts there, not at 0).
++                                            let sc = dragScale(preview: geo.size, layout: layout)
++                                            var cur = settings.effective(el) ?? HudElementSetting(dx: 0, dy: 0, k: 1, hidden: false)
++                                            cur.dx += Double(v.translation.width) * sc
++                                            cur.dy -= Double(v.translation.height) * sc
++                                            settings.set(el, cur)
++                                            dragOffset = .zero
++                                        }
++                                    )
++                            }
++                            if let s = effectiveSetting(selected), s.hidden {
++                                Text("游戏内不显示").font(.caption.weight(.semibold)).foregroundStyle(.white)
++                                    .padding(.horizontal, 8).padding(.vertical, 4)
++                                    .background(Color.black.opacity(0.6)).cornerRadius(6)
++                                    .position(x: geo.size.width / 2, y: geo.size.height - 24)
++                            }
++                        }
++                        .clipShape(RoundedRectangle(cornerRadius: 12))
++                    }
++                    .aspectRatio(aspect.ratio, contentMode: .fit)
++                    .frame(maxWidth: .infinity)
++
++                    // The four shapes: the preview's default is the edge anchor for that shape.
++                    Picker("预览比例", selection: $aspect) {
++                        ForEach(HudAspect.allCases) { Text($0.name).tag($0) }
++                    }
++                    .pickerStyle(.segmented)
++
++                    // The element list: tap to select; a manual element is marked 手动, a hidden one 已隐藏.
++                    VStack(spacing: 0) {
++                        ForEach(HudElement.allCases) { el in
++                            HStack {
++                                Text(el.name).font(.headline)
++                                Spacer()
++                                if effectiveSetting(el)?.hidden == true { Text("已隐藏").font(.caption).foregroundStyle(.secondary) }
++                                else if settings.isManual(el) { Text("手动").font(.caption).foregroundStyle(.orange) }
++                                else { Text("自动贴边").font(.caption).foregroundStyle(.secondary) }
++                            }
++                            .contentShape(Rectangle())
++                            .onTapGesture { selected = el }
++                            .padding(.vertical, 8)
++                            Divider()
++                        }
++                    }
++                    .padding(.horizontal, 4)
++
++                    // The selected element's controls.
++                    Group {
++                        VStack(alignment: .leading, spacing: 8) {
++                            Text("大小").font(.headline)
++                            let k = Binding(get: { effectiveSetting(selected)?.k ?? 1 }, set: { v in
++                                var cur = settings.effective(selected) ?? HudElementSetting(dx: 0, dy: 0, k: 1, hidden: false)
++                                cur.k = v; settings.set(selected, cur)
++                            })
++                            Slider(value: k, in: 0.6...1.8, step: 0.05)
++                            HStack { Text("60%"); Spacer(); Text("\(Int((effectiveSetting(selected)?.k ?? 1) * 100))%").monospacedDigit(); Spacer(); Text("180%") }
++                                .font(.caption).foregroundStyle(.secondary)
++                        }
++                        Toggle("隐藏（游戏内不显示）", isOn: Binding(get: { effectiveSetting(selected)?.hidden ?? false }, set: { v in
++                            var cur = settings.effective(selected) ?? HudElementSetting(dx: 0, dy: 0, k: 1, hidden: false)
++                            cur.hidden = v; settings.set(selected, cur)
++                        }))
++                        if settings.isManual(selected) {
++                            Button("恢复自动贴边") { settings.set(selected, nil) }
++                        }
++                        Button("全部恢复自动贴边", role: .destructive) { settings.resetAll() }
++                            .disabled(!settings.anyManual)
++                        if settings.anyManual {
++                            Text("手动设置优先于自动贴边；没有手动设置的继续自动贴边。").font(.caption).foregroundStyle(.secondary)
++                        }
++                    }
++                }
++                .padding()
++            }
++            .navigationTitle("HUD 设置")
++            .navigationBarTitleDisplayMode(.inline)
++            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("完成") { dismiss() } } }
++        }
++    }
++}
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index 011a893..61f1639 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -153,6 +153,8 @@ private struct DocumentPicker: UIViewControllerRepresentable {
+ 
+ private struct LauncherView: View {
+     @ObservedObject var m: LauncherModel
++    @ObservedObject var hud: HudSettings   // the HUD editor's settings (HudEditor.swift)
++    @State private var showingHud = false
+     let play: () -> Void
+     @State private var memory = os_proc_available_memory()
+ 
+@@ -188,6 +190,13 @@ private struct LauncherView: View {
+                     } footer: {
+                         Text("Brings back all settings this game was tested with.")
+                     }
++                    Section("HUD") {
++                        Button("HUD 设置") { showingHud = true }
++                            // The sheet sits on the button, not on the Section: SwiftUI hands a Section's modifiers to every row, so one tap presented a picker per row and they invalidated each other (LNPANDY/NX2Apple#315).
++                            .sheet(isPresented: $showingHud) { HudEditorView(settings: hud) }
++                    } footer: {
++                        Text(hud.anyManual ? "已有手动 HUD 设置，优先于自动贴边。" : "预览游戏画面里的金币、月亮、生命和指南针：拖动改位置，调大小，隐藏后游戏里也不显示。默认自动贴边。")
++                    }
+                     GameDataSection()
+                     CloudSavesSection()
+                     Section {
+@@ -234,13 +243,15 @@ public func dmShowLauncher(_ viewController: UnsafeMutableRawPointer, _ done: @c
+     guard let file = try? JSONDecoder().decode(SettingsFile.self, from: data), !file.settings.isEmpty else { fputs("[RED] launcher: dm/launcher.json cannot be read; starting the game\n", stderr); return false }
+     let model = LauncherModel(file.settings)
+     gameMenuModel = model   // the in-game menu shows and saves the same choices (GameMenu.swift)
+-    if ProcessInfo.processInfo.environment["DM_LAUNCHER"] == "0" { fputs("launcher: off (DM_LAUNCHER=0)\n", stderr); model.applySaved(); return false }
++    let hud = HudSettings()   // the HUD editor's settings (HudEditor.swift); its applyToEnvironment() goes in both start paths below
++    if ProcessInfo.processInfo.environment["DM_LAUNCHER"] == "0" { fputs("launcher: off (DM_LAUNCHER=0)\n", stderr); model.applySaved(); hud.applyToEnvironment(); return false }
+     let parent = Unmanaged<UIViewController>.fromOpaque(viewController).takeUnretainedValue()
+     var host: UIViewController?
+-    let view = LauncherView(m: model) {
++    let view = LauncherView(m: model, hud: hud) {
+         guard let h = host else { return }
+         host = nil
+         model.apply()
++        hud.applyToEnvironment()
+         h.dismiss(animated: false) { done() }
+     }
+     let h = DmHostingController(rootView: view)
+-- 
+2.43.0
+

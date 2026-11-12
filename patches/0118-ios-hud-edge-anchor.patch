@@ -1,0 +1,472 @@
+From 3f2a0a7dfda79908dff292e503d0a96e67ca9901 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Thu, 12 Nov 2026 11:10:53 +0000
+Subject: [PATCH] 0118 (V1.3.14): HUD edge anchor -- the four HUD widgets move
+ to the screen edges from the aspect
+
+Automatic, no user input, no settings UI. Pane::Calculate is hooked twice
+(entry + 0x13c) and hud_edge translates the four HUD elements by a fixed
+signed horizontal offset from the screen aspect (loader.c state + 0x58):
+edge = 640 * (aspect / 1.7777778 - 1), clamped to [-200, +200] UI px.
+iPhone 19.5:9 (+140: coins/moons left, compass/lives right), iPhone Duo
+1.43:1 (-126, pulled in), iPad 4:3 (-160, pulled in), 16:9 (0, no-op).
+Matched by pane name only; the only tree walk is the bounded flag-only
+mark-dirty, so the 0113 crash class is structurally absent. Replaces the
+cancelled draggable HUD (0113).
+---
+ dm/games/0100000000010000/hud_edge.c | 302 +++++++++++++++++++++++++++
+ dm/games/0100000000010000/patches.py | 133 ++++++++++++
+ 2 files changed, 435 insertions(+)
+ create mode 100644 dm/games/0100000000010000/hud_edge.c
+ create mode 100644 dm/games/0100000000010000/patches.py
+
+diff --git a/dm/games/0100000000010000/hud_edge.c b/dm/games/0100000000010000/hud_edge.c
+new file mode 100644
+index 0000000..e1a0e5b
+--- /dev/null
++++ b/dm/games/0100000000010000/hud_edge.c
+@@ -0,0 +1,302 @@
++// hud_edge.c -- Super Mario Odyssey HUD edge anchor (0118).
++//
++// The game's HUD (coins, moons, compass, lives) is laid out for a 1280x720
++// (16:9) screen, so on a wider screen (iPhone 19.5:9) it sits inset from the
++// edges, and on a narrower screen (iPhone Duo 1.43:1, iPad 4:3) it would be
++// cut off at the edges. This hook pushes the HUD to the screen edges,
++// automatically adapting to the screen aspect: the left widgets (coins, moons)
++// move left on a wider screen and right on a narrower one; the right widgets
++// (compass, lives) move right on a wider screen and left on a narrower one.
++//
++// The offset comes from the screen aspect the host already writes into the
++// frame-step state page (loader.c dm_fps_state_apply, state +0x58: the ratio
++// r; the iOS front end resolves DM_SCREEN_ASPECT "auto" to the window's aspect
++// before the host writes the state page, so r is the resolved aspect by the
++// time the game runs; 0 means 16:9). The offset is:
++//     edge = 640 * (r / 1.7777778 - 1)
++// iPhone 19.5:9 (r=2.167): +140 per side (push out). iPhone Duo 1.43:1
++// (r=1.429): -126 per side (pull in). iPad 4:3 (r=1.333): -160 per side
++// (pull in). 16:9 (r=0): 0. The sign is uniform: a left widget takes
++// dx = -edge, a right widget dx = +edge, so a wider screen pushes both
++// outward and a narrower screen pulls both inward. No user setting, no drag,
++// no resize, no settings UI.
++//
++// The hook runs from the same two rewriter cuts as the old 0113
++// (Pane::Calculate main+0x909494: the entry cut at +0x20 and the +0x13c cut
++// at +0x13c), because one cut misses static panes (see the old hud_calc.c
++// header: the skip path over the +0x13c site). It matches the four HUD
++// widgets by pane name only -- no subtree walk, no tree search, no
++// guide/root classification, no camera widening, no log. The only walk is the
++// dirty-mark for a moved container's children (hud_edge_mark_dirty), which
++// only sets a flag and uses the v8 single struct-array (no second base
++// register, so the log-27 sdepth/x18 fault class is structurally absent);
++// it never reads a pane name and never decides a match.
++//
++// A moved pane's original matrix is stored in a small table (state +0x300,
++// eight 120-byte entries, two per element -- two layout instances can match
++// the same element) and the modified matrix is always re-derived from that
++// original, so a fixed offset never accumulates into a drift, and a game
++// recompute (an animation, a count change, a layout reload) is followed by
++// re-storing the original. The offset itself is also stored per entry, so an
++// aspect change re-applies instead of being ignored.
++//
++// What this patch does NOT do (deliberately): no HUD settings UI, no
++// user-set entry point, no user-saved offsets, no drag/resize, no map-camera widen, no
++// settings/map code, no guide-text hiding, no root stretch. The camera icon
++// in the top-right is NOT a HUD element -- it is the photo button (a
++// virtual pad button, positioned by DmGamepad), so it is never matched.
++//
++// Compiled with: aarch64-linux-gnu-gcc -O2 -ffreestanding -fno-builtin
++//   -fno-stack-protector -fno-jump-tables -fno-asynchronous-unwind-tables -c
++// (same flags as the old hud_calc.c). The function takes everything through
++// its arguments -- no static data, no literal pool, no external calls -- so
++// the emitted words are position-independent and relocation-free and can be
++// dropped into the rewriter's patch area verbatim:
++//   x0 = the pane (nn::ui2d::Pane *), x1 = the aspect (state + 0x58: a float,
++//   the screen's width / height; 0 = 16:9), x2 = the edge table (state +
++//   0x300: eight 120-byte entries, two per HUD element).
++//   Element order: 0 compass (right), 1 lives (right), 2 coins (left),
++//   3 moons (left). The state page starts zeroed, so a table entry with
++//   pane == 0 is unused.
++
++typedef unsigned int u32;
++typedef unsigned long uintptr_t;
++
++#define HUD_EDGE_N 4
++#define HUD_EDGE_ENTRY 120         // bytes per table entry
++#define HUD_EDGE_SLOTS_PER_ELEM 2  // table slots per HUD element: two layout instances can match the same element
++
++// The pane names, as little-endian u32s (no string literal: a literal would
++// sit in .rodata and the code would load its address with an adrp, a
++// relocation, and the embedded words carry no literal pool).
++// "PicStrap": "PicS", "trap" (8 letters, the 9th byte is the NUL).
++#define HUD_E_STRAP0 0x53636950u
++#define HUD_E_STRAP1 0x70617274u
++// "Counter": "Coun", "ter\0".
++#define HUD_E_COUNTER0 0x6e756f43u
++#define HUD_E_COUNTER1 0x00726574u
++// "TxtTotalShine": "TxtT", "otal", "Shin", "e\0".
++#define HUD_E_TSHINE0 0x54747854u
++#define HUD_E_TSHINE1 0x6c61746fu
++#define HUD_E_TSHINE2 0x6e696853u
++#define HUD_E_TSHINE3 0x00000065u
++// "TxtCounterSh": "TxtC", "ount", "erSh", 0 (12 bytes, the fourth word is the NUL word).
++#define HUD_E_TCSH0 0x43747854u
++#define HUD_E_TCSH1 0x746e756fu
++#define HUD_E_TCSH2 0x68537265u
++#define HUD_E_TCSH3 0x00000000u
++// "TxtCounter": "TxtC", "ount", "er\0".
++#define HUD_E_TC0 0x43747854u
++#define HUD_E_TC1 0x746e756fu
++#define HUD_E_TC2 0x00007265u
++// "TxtLife": "TxtL", "ife\0".
++#define HUD_E_TLIFE0 0x4c747854u
++#define HUD_E_TLIFE1 0x00656669u
++// "Life" ("Life" as one word; the 5th byte is the NUL).
++#define HUD_E_LIFE0 0x6566694cu
++
++// Bounded compare of a pane name's words against the given words (n words,
++// the rest of the name unchecked). Same as the old hud_words_eq.
++static inline __attribute__((always_inline)) int hud_edge_words_eq(const u32 *nw, u32 a, u32 b, u32 c, u32 d, int n) {
++    if (n >= 1 && nw[0] != a) return 0;
++    if (n >= 2 && nw[1] != b) return 0;
++    if (n >= 3 && nw[2] != c) return 0;
++    if (n >= 4 && nw[3] != d) return 0;
++    return 1;
++}
++
++// The guards every subtree walk below applies (same as the old v7 guards,
++// because a layout's child list can go stale while the game unloads it):
++//  (a) a popped pane is checked for NULL / alignment before it is read;
++//  (b) a list node is checked (non-NULL, 8-byte aligned, >= 0x10000) before
++//      child = node - 8 is computed from it;
++//  (c) a child that is the pane itself, or lies inside the pane's own
++//      first 0x100 bytes, is never treated as a pane.
++static inline __attribute__((always_inline)) int hud_edge_node_ok(void *node) {
++    uintptr_t v = (uintptr_t)node;
++    return v != 0 && (v & 7u) == 0 && v >= 0x10000;
++}
++
++static inline __attribute__((always_inline)) int hud_edge_child_self(void *p, void *child) {
++    if (child == p) return 1;
++    if ((uintptr_t)child <= (uintptr_t)p) return 0;
++    return (uintptr_t)child - (uintptr_t)p < 0x100;
++}
++
++// The DFS stack: ONE array of {pane, depth} entries (the v8 fix for the
++// log-27 crash: the old v7 kept two parallel arrays, and the second array's
++// separate base register was the faulting access). Co-locating pane and depth
++// in one entry leaves a single array base, so there is no second base
++// register to lose.
++typedef struct { void *pane; unsigned char depth; } hud_edge_stack_ent;
++
++// Mark every descendant of a pane dirty (flags bit 4 at +0x58), so the game
++// recomputes their global matrices from this pane's (just-modified) matrix.
++// This is the ONLY subtree walk in this patch, and it only sets a flag: it
++// never reads a pane name and never decides a match. The parent-changed flag
++// the game passes to children is 0 on the skip path, so without this a static
++// container's children never recompute and never follow it. The flag is the
++// game's own signal (Pane::Calculate sets it when a parent changed and
++// clears it on recompute), so the game's next Calculate on each descendant
++// recomputes from the moved parent. Bounded (64 visits, 32 children per
++// pane, depth 3); the pane itself is never marked (marking it would make
++// the game recompute and wipe the hook's edit). Only called when the hook
++// actually writes a new matrix, never on the already-correct early return.
++static inline __attribute__((always_inline)) void hud_edge_mark_dirty(void *pane) {
++    if (!pane) return;
++    hud_edge_stack_ent st[64];
++    int sp = 0, visits = 0;
++    st[sp].pane = pane;
++    st[sp].depth = 3;
++    sp++;
++    while (sp > 0 && visits < 64) {
++        sp--;
++        void *p = st[sp].pane;
++        if (!p || ((uintptr_t)p & 7u)) continue;   // (a) never read a popped NULL / unaligned pane
++        unsigned char depth = st[sp].depth;
++        void *head = (char *)p + 0x20;
++        void *node = *(void **)((const char *)p + 0x28);
++        for (int i = 0; i < 32; i++) {
++            if (!node || node == head) break;
++            if (!hud_edge_node_ok(node)) break;     // (b) never follow a bad node
++            void *child = (char *)node - 8;
++            if (hud_edge_child_self(p, child)) { node = *(void **)((const char *)child + 0x10); continue; } // (c) skip the self child, keep its siblings
++            visits++;
++            *(unsigned short *)((char *)child + 0x58) |= 0x10u;   // flags bit 4: dirty, recompute from the parent
++            if (depth > 0 && sp < 64) {
++                st[sp].pane = child;
++                st[sp].depth = depth - 1;
++                sp++;
++            }
++            node = *(void **)((const char *)child + 0x10);
++        }
++    }
++}
++
++// Is the given pane's parent named by these words (exact, n words)? The
++// parent is read once, directly -- no walk. A NULL parent is never the
++// container, so a parentless pane takes the fallback.
++static inline __attribute__((always_inline)) int hud_edge_parent_is(void *pane, u32 a, u32 b, int n) {
++    void *parent = *(void **)((const char *)pane + 0x18);
++    if (!parent) return 0;
++    const u32 *pnw = (const u32 *)((const char *)parent + 0xb8);
++    if (n >= 1 && pnw[0] != a) return 0;
++    if (n >= 2 && pnw[1] != b) return 0;
++    return 1;
++}
++
++void hud_edge(void *pane, const float *aspect_ptr, void *table) {
++    if (!pane || !aspect_ptr || !table) return;
++    // The edge offset, from the screen aspect the host wrote into the state
++    // page (state +0x58; 0 = 16:9, unwritten). Valid aspects are 1.3 to 2.2
++    // (the range loader.c accepts); anything else is 16:9. The offset is
++    // clamped so a wild aspect can never throw a widget off the screen.
++    float aspect = *aspect_ptr;
++    float edge = 0.0f;
++    if (aspect >= 1.3f && aspect <= 2.2f) {
++        edge = 640.0f * (aspect / 1.7777778f - 1.0f);
++        if (edge > 200.0f) edge = 200.0f;
++        if (edge < -200.0f) edge = -200.0f;
++    }
++    if (edge == 0.0f) return;   // 16:9, or an unwritten aspect: nothing to do
++
++    // Flags bit 7 is set by Pane::Calculate's epilogue, so it tells whether
++    // this pane has ever calculated. On a pane's very first frame its matrix
++    // is still zero; skip it (the +0x13c cut catches it after the game
++    // computes it, and the entry cut catches it from the next frame on).
++    unsigned short pflags = *(const unsigned short *)((const char *)pane + 0x58);
++    if (!(pflags & 0x80u)) return;
++
++    const char *name = (const char *)pane + 0xb8;
++    const u32 *nw = (const u32 *)name;
++
++    // Which HUD element is this pane, by name only (no subtree walk).
++    // Moons: the counter group itself, a pane named 'Counter'; a bare
++    // 'TxtTotalShine' is the fallback for a layout with no 'Counter' group,
++    // and only when its parent is not a 'Counter' (the group's own number
++    // follows the group; matching both would move it twice). Life: the
++    // 'Life' container, or a bare 'TxtLife' whose parent is NOT named
++    // 'Life'. Coins: 'TxtCounterSh' and its sibling 'TxtCounter', both
++    // matched by name, so both take the same offset and no twin-write walk
++    // is needed. Compass: 'PicStrap', the right strip (the dial itself is
++    // not a Pane, so the strip is the compass; moving the strip moves the
++    // whole right-hand cluster together). The old v1 actor names
++    // (CompassArea / CoinCounter / MoonNum) are NOT matched: they are actor
++    // / state-machine names, not pane names, and matching them never fired.
++    int idx = -1;
++    if (nw[0] == HUD_E_STRAP0 && nw[1] == HUD_E_STRAP1 && name[8] == 0) idx = 0;
++    else if (nw[0] == HUD_E_LIFE0 && name[4] == 0) idx = 1;
++    else if (hud_edge_words_eq(nw, HUD_E_TLIFE0, HUD_E_TLIFE1, 0, 0, 2)) {
++        if (!hud_edge_parent_is(pane, HUD_E_LIFE0, 0, 1)) idx = 1;
++    }
++    else if (hud_edge_words_eq(nw, HUD_E_TCSH0, HUD_E_TCSH1, HUD_E_TCSH2, HUD_E_TCSH3, 4)) idx = 2;
++    else if (hud_edge_words_eq(nw, HUD_E_TC0, HUD_E_TC1, HUD_E_TC2, 0, 3)) idx = 2;
++    else if (hud_edge_words_eq(nw, HUD_E_COUNTER0, HUD_E_COUNTER1, 0, 0, 2)) idx = 3;
++    else if (hud_edge_words_eq(nw, HUD_E_TSHINE0, HUD_E_TSHINE1, HUD_E_TSHINE2, HUD_E_TSHINE3, 4)) {
++        if (!hud_edge_parent_is(pane, HUD_E_COUNTER0, HUD_E_COUNTER1, 2)) idx = 3;
++    }
++    if (idx < 0) return;   // not a HUD element: leave it alone
++
++    // Left widgets (coins, moons) take dx = -edge; right widgets (compass,
++    // lives) take dx = +edge. A wider screen (edge > 0) pushes both outward
++    // to the edges; a narrower screen (edge < 0) pulls both inward so they
++    // stay visible and at the edges. dy is always 0 and the scale is always
++    // 1: this patch only translates, never resizes.
++    float dx = (idx <= 1) ? edge : -edge;
++
++    // The per-element entry: the pane, its original matrix (as the game
++    // computed it), the modified matrix (the original + this translation),
++    // and the offset the modified matrix was computed from. Two slots per
++    // element (idx and idx + HUD_EDGE_N): two layout instances can match the
++    // same element, and one slot per element cannot hold both.
++    char *ent = 0;
++    for (int s = 0; s < HUD_EDGE_SLOTS_PER_ELEM; s++) {
++        char *e = (char *)table + (idx + s * HUD_EDGE_N) * HUD_EDGE_ENTRY;
++        if (*(uintptr_t *)(e + 0) == (uintptr_t)pane) { ent = e; break; }
++        if (!ent && *(u32 *)(e + 112) == 0) ent = e;   // first free slot
++    }
++    if (!ent) ent = (char *)table + idx * HUD_EDGE_ENTRY;   // both taken: reclaim the first (a reload)
++    uintptr_t *e_pane = (uintptr_t *)(ent + 0);
++    float *e_orig = (float *)(ent + 8);
++    float *e_mod = (float *)(ent + 56);
++    float *e_dx = (float *)(ent + 104);
++    if (*e_pane != (uintptr_t)pane) {   // first sighting, or the layout reloaded
++        *e_pane = (uintptr_t)pane;
++        *(u32 *)(ent + 108) = (u32)idx;
++        *(u32 *)(ent + 112) = 1u;
++        *e_dx = 1e30f;   // sentinel: force a recompute below (the stored offset is stale)
++        for (int i = 0; i < 12; i++) { e_orig[i] = 0.0f; e_mod[i] = 0.0f; }
++    }
++
++    // Did the game recompute the matrix since the last frame? Compare the
++    // current matrix against the stored modified one: if they differ, the
++    // game wrote a new original (an animation, a count change, a layout
++    // reload), so the stored original follows it. If they are the same, the
++    // game left our modified matrix alone, and only an offset change needs
++    // a recompute.
++    const float *g = (const float *)pane + 0x70 / 4;
++    int recomputed = 0;
++    {
++        const u32 *cur = (const u32 *)g;
++        u32 *mod = (u32 *)e_mod;
++        for (int i = 0; i < 12; i++) if (cur[i] != mod[i]) { recomputed = 1; break; }
++    }
++    if (recomputed) for (int i = 0; i < 12; i++) e_orig[i] = g[i];
++    if (!recomputed && *e_dx == dx) return;   // already correct: nothing to do
++
++    // The modified matrix is the original plus this translation (scale 1, so
++    // the origin/pivot does not matter: a pure translation adds to the
++    // translation slots only). Never accumulated: it is always re-derived
++    // from the stored original, so a fixed offset cannot drift.
++    for (int i = 0; i < 12; i++) e_mod[i] = e_orig[i];
++    e_mod[3] += dx;
++    *e_dx = dx;
++
++    // Write the modified matrix back to the pane. Its children are
++    // calculated after this hook, so they inherit the moved parent -- but
++    // only if the game recomputes them: mark the descendants dirty and the
++    // game recomputes them from this modified matrix on the same frame.
++    float *dst = (float *)pane + 0x70 / 4;
++    for (int i = 0; i < 12; i++) dst[i] = e_mod[i];
++    hud_edge_mark_dirty(pane);
++}
+diff --git a/dm/games/0100000000010000/patches.py b/dm/games/0100000000010000/patches.py
+new file mode 100644
+index 0000000..e8b6432
+--- /dev/null
++++ b/dm/games/0100000000010000/patches.py
+@@ -0,0 +1,133 @@
++# Super Mario Odyssey (0100000000010000): the rewriter's patches of this game's own builds.
++# dm/tools/patch_nso.py loads every profile's patches.py and applies those of a module's
++# NSO build ID; CUTS, OBS and FRAME_STEP as described there ("Registered patches").
++# Only FRAME_STEP is used here: the HUD edge-anchor hook (0118). There are no word
++# cuts and no observation gates.
++from nso_asm import ADDI, ADRP, B, LDP_POST, STP_PRE
++
++BUILD_141 = 'b424be150a8e7d78701cbe7a439d9ebf'   # main 1.4.1 (game.tsv v393216)
++
++# hud_edge, compiled from hud_edge.c (hud_edge at +0) with
++# aarch64-none-linux-gnu-gcc -O2 -ffreestanding -fno-builtin -fno-stack-protector
++# -fno-jump-tables -fno-asynchronous-unwind-tables -c -- the same flags 0113's
++# hud_calc used. The function takes everything through its arguments (no static
++# data, no literal pool, no external calls), so these words are position-independent
++# and relocation-free and can be dropped into the rewriter's patch area verbatim:
++#   x0 = the pane, x1 = the aspect (a pointer to state page + 0x58: the screen
++#   aspect ratio r, written there by dm_fps_state_apply in loader.c -- 0 when the
++#   screen is 16:9, the window's aspect otherwise, so "auto" already resolves to
++#   the real aspect before the hook runs), x2 = table (state page + 0x300, eight
++#   120-byte entries, two per HUD element). No log buffer: nothing is logged.
++# Element order: 0 compass, 1 life, 2 coins, 3 moons.
++# What it does, per pane: it matches the four HUD elements by pane NAME only
++# ('PicStrap' = compass, 'Life' = lives, 'TxtCounterSh' / 'TxtCounter' = coins,
++# 'Counter' / 'TxtTotalShine' = moons, 'TxtLife' = lives) and translates each by a
++# FIXED horizontal offset computed from the aspect at runtime:
++#   edge = 640 * (aspect / 1.7777778 - 1), clamped to [-200, +200] UI px.
++#   aspect 2.167 (iPhone 19.5:9): edge +140 -- coins/moons move LEFT (-140),
++#     compass/lives move RIGHT (+140), to the screen edges.
++#   aspect 1.429 (iPhone Duo 1.43:1): edge -126 -- the HUD is laid out for 16:9,
++#     so on the narrower screen it would be cut off; coins/moons move RIGHT (+126),
++#     compass/lives move LEFT (-126), pulled in to the edges.
++#   aspect 1.333 (iPad 4:3): edge -160 -- coins/moons +160, compass/lives -160.
++#   aspect 1.778 (16:9) or 0: edge 0, a no-op. The dy is always 0 and the scale
++#   is never touched: translation only, never a resize. See hud_edge.c for the
++#   layouts and the design (orig/mod table, no-drift, game-recompute follow,
++#   the dirty flag so a moved container carries its children, the bounded
++#   mark-dirty walk).
++HUD_EDGE_WORDS = (
++    "f100003ffa401844fa401804540010a0bd400020528cccc172a7f4c11e2700211e2120105400004ad65f03c0529999a172a801811e2700211e212010"
++    "54000049d65f03c05291c7211e2e100272a7fc611e27002152a884011e2118001e2700211e2238001e2108001e20200854000da07940b00136380d61"
++    "b940b801528d2a0372aa6c636b03003f54001260528d298372acacc36b03003f54000c00528f0a8372a98e836b03003f54001261b940bc0151595821"
++    "7119a42154000b41f9400c01b40000c1b940b823528d298172acacc16b01007f54000a609101e04752800023f94000e1eb00003f540014e011001064"
++    "b94070e5531c6c814b040021531d70218b21c044f861c841eb01001f3400138554001380b94070817100003f9a8410e7aa0703e2529e594172ae2921"
++    "910020e44f000401528000251e270022aa0403e1f8038440290d94e3bd0068e2910040213c9f00213d800821eb02003f54ffff819101c003d2800001"
++    "b8616866b8616845910010216b0500df54000e81f100c03f54ffff41bd4068e11e20202054000f60d11003ffd2800001bc616881bc21684191001021"
++    "f100c03f54ffff81bd4044e1d2800001bd0068e01e202820bd0044e0bc616840bc21686091001021f100c03f54ffff81528000625280000352800001"
++    "d29fffe5f90003e0390023e2d503201fb4000060f240081f540001a07100fc7f7a40d8245400010d51000421937c7c20f8606be017fffff73942f001"
++    "34fff5e1d65f03c0911003ffd65f03c0f940140291008004f100005ffa42108454fffe00f240085ffa45004054fffda9937c7c26910023ea52800407"
++    "d29fffeb38666949d1002046eb0000c854000220eb06001f54000062f103fd1f540001a97940a0487100fc3f937c7c2c5100052d321c01087900a048"
++    "110004637a40d9245400008011000421f82c6be6382c694df9400442710004e754fffa40f100005ffa42108454fff9e0f240085ffa4b004054fff989"
++    "17ffffe4b940bc03528e4e8172ae0c216b01007f54fff9e13943000134000521d65f03c0528f0a8372a86e836b03003f540004e1b940bc03528eade1"
++    "72ae8dc16b01007f54fff861b940c001528e4ca372ad0a636b03003f54000201b940c40135fff781d2801e07528000431e2140008b07004717ffff67"
++    "d2800001d503201fbc616861bc21688191001021f100c03f54ffff8117ffff8b528e4ca36b03003f54fffe20d65f03c0d65f03c054ffed21aa0403e7"
++    "910020e49100e0e217ffff75aa0203e75280000317ffff52528de86372adcea36b03003f54000101b940bc01515c98217115d02154fff341d2802d07"
++    "5280006317ffffde528f0a8372aa8e836b03003f54fff261b940bc03528e8de172ad8c216b01007f54fff1c1b940c003528d0a6172adcd216b01007f"
++    "54fff121b940c4017101943f54fff0c1f9400c01b4fffd61b940b824528de86372adcea36b03009f54fffcc1b940bc21515c98217115d02154fffc41"
++    "d65f03c0"
++)
++
++# The HUD edge-anchor hook (0118): Pane::Calculate (main+0x909494, the vtable's
++# slot 19) recomputes every pane's global matrix and then its children's. TWO cuts
++# call the same hud_edge, because one cut misses static panes: the +0x13c cut
++# (main+0x9095d0), where all paths converge after the pane's own global matrix is
++# final and before both child loops; and the entry cut (main+0x9094b4), replacing
++# the first instruction after the prologue, so a pane whose Calculate takes the
++# skip path (neither the parent changed nor this pane is dirty: 0x9fd528
++# `tbz w10, #0, 0x9096c8` jumps over the +0x13c site) is still hooked on every
++# Calculate call. Moving a container carries its children because hud_edge marks
++# a moved pane's descendants dirty: a static parent passes w22 = 0 to its
++# children, so without the dirty flag they would never recompute from the moved
++# parent. The four HUD widgets (compass 'PicStrap', lives 'Life'/'TxtLife', coins
++# 'TxtCounterSh'/'TxtCounter', moons 'Counter'/'TxtTotalShine') are the only panes
++# matched; everything else is untouched, and the photo button (a DmGamepad virtual
++# pad button, not a pane) is never moved by this hook.
++# The instruction at the +0x13c site is `orr w22, wzr, #0x1` (w22 = 1, the flag the
++# children's Calculate calls take); x19 is the pane, x20 the DrawInfo, x21 the first
++# argument. w8 / w9 (the flags, read at the entry and used just after the site) are
++# live past it, so the +0x13c stub saves and restores x8 / x9; x0-x7 and x10-x18 are
++# dead there, the vector registers are reloaded after it, and x30 is restored from
++# the stack by the function's own epilogue, so the stub's bl is safe. At the entry
++# site the instruction is `ldrh w8, [x19, #0x58]` (the flags load); x19 is the pane
++# (set just before it), x1 / x2 are still live (they are copied to x21 / x20 after
++# the site), x3 is live (the force flag, used later), and x8 is dead (the load
++# itself writes it) -- so the entry stub saves x1, x2, x3 and x8 (x8 only so the
++# save is a pair), calls hud_edge, restores them, re-executes the load, and returns
++# to site+4. The stub does NOT set x3 (hud_edge takes no log buffer); x3 is saved
++# only because the bl may clobber it. No runtime __TEXT write anywhere: the cuts
++# are the rewriter's load-time replacements, the duo_anchor pattern.
++def _hud_edge_frame_step(ctx):
++    here, emit, fs_site, fs_put, FS_STATE_OFF = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state
++    hud_code = here()
++    hx = ''.join(HUD_EDGE_WORDS)
++    for i in range(0, len(hx), 8):
++        emit(int(hx[i:i + 8], 16))
++    # The +0x13c cut: `orr w22, wzr, #0x1` at Pane::Calculate+0x13c (main+ offsets:
++    # fs_site/fs_put/B take IMG offsets, not DmIOS file offsets, which are +0xf4000).
++    fs_site(0x9095d0, 'f6030032')
++    start = here()
++    emit(STP_PRE(8, 9, 31, -16))              # stp x8, x9, [sp, #-0x10]! (the live flags)
++    emit(0xaa1303e0)                          # mov x0, x19 (the pane)
++    emit(ADRP(1, here(), FS_STATE_OFF)); emit(ADDI(1, 1, 0x58))    # x1 = state + 0x58 (the aspect, loader.c)
++    emit(ADRP(2, here(), FS_STATE_OFF)); emit(ADDI(2, 2, 0x300))   # x2 = state + 0x300 (table)
++    emit(B(here(), hud_code) | 0x80000000)    # bl hud_edge
++    emit(LDP_POST(8, 9, 31, 16))              # ldp x8, x9, [sp], #0x10 (restore the flags)
++    emit(0x320003f6)                          # orr w22, wzr, #0x1 (the replaced instruction)
++    emit(B(here(), 0x9095d4))                 # back to the hook site + 4
++    fs_put(0x9095d0, [B(0x9095d0, start)], 'Pane::Calculate: the four HUD widgets (coins/moons left, compass/lives right) translated by a fixed edge offset from the screen aspect (hud_edge.c)')
++    # The entry cut: `ldrh w8, [x19, #0x58]` at Pane::Calculate+0x20, the first
++    # instruction after the prologue (x19 is the pane already; x1 / x2 are copied to
++    # x21 / x20 just after the site, x3 is the force flag, x8 is dead -- the load
++    # itself writes it). It runs hud_edge before any of the flag paths, so a static
++    # pane (the skip path over the +0x13c site) is hooked on every Calculate call.
++    fs_site(0x9094b4, '68b24079')
++    estart = here()
++    emit(STP_PRE(1, 2, 31, -16))              # stp x1, x2, [sp, #-0x10]! (live: copied after the site)
++    emit(STP_PRE(3, 8, 31, -16))              # stp x3, x8, [sp, #-0x10]! (x3 live: the force flag; x8 dead, saved as a pair)
++    emit(0xaa1303e0)                          # mov x0, x19 (the pane)
++    emit(ADRP(1, here(), FS_STATE_OFF)); emit(ADDI(1, 1, 0x58))    # x1 = state + 0x58 (the aspect, loader.c)
++    emit(ADRP(2, here(), FS_STATE_OFF)); emit(ADDI(2, 2, 0x300))   # x2 = state + 0x300 (table)
++    emit(B(here(), hud_code) | 0x80000000)    # bl hud_edge
++    emit(LDP_POST(3, 8, 31, 16))              # ldp x3, x8, [sp], #0x10
++    emit(LDP_POST(1, 2, 31, 16))              # ldp x1, x2, [sp], #0x10
++    emit(0x7940b268)                          # ldrh w8, [x19, #0x58] (the replaced instruction)
++    emit(B(here(), 0x9094b8))                 # back to the hook site + 4
++    fs_put(0x9094b4, [B(0x9094b4, estart)], 'Pane::Calculate entry: the HUD edge anchor, so static panes (which skip the +0x13c site) are hooked too (hud_edge.c)')
++
++FRAME_STEP = {BUILD_141: _hud_edge_frame_step}
++
++BINDING = [
++    {'what': "HUD edge anchor, v1 (hud_edge.c: entry + 0x13c cuts, compass 'PicStrap', lives 'Life'/'TxtLife', coins 'TxtCounterSh'/'TxtCounter', moons 'Counter'/'TxtTotalShine', matched by pane name only, a fixed signed horizontal offset from the screen aspect -- iPhone 19.5:9 +140 out, iPhone Duo 1.43:1 -126 in, iPad 4:3 -160 in, 16:9 0 -- translation only, a dirty flag so a moved container carries its children, an orig/mod table so a fixed offset never drifts, no settings UI, no user state)", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
++     'why': "Pane::Calculate and the pane layout are this build's nn::ui2d code, found by the HUDLOG diagnostic run (log-17) and confirmed by disassembly of DmIOS; the edge offset comes from the screen aspect the loader already writes to state page + 0x58 (log-28). This replaces the cancelled draggable HUD (0113): it has no user-adjustable state, no settings UI, and its only tree walk is the bounded flag-only mark-dirty, so the 0113 crash class (a name/match walk reading a pane through a bad pointer) is structurally absent.",
++     'blocked': 'the stubs have no function-matched form yet'},
++]
+-- 
+2.43.0
+
