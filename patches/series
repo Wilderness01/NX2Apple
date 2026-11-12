@@ -81,3 +81,5 @@
 0120-ios-hud-edge-eight-slots.patch
 0121-ios-launcher-zh.patch
 0122-ios-skip-shader-prebuild.patch
+0123-ios-hud-editor-mockup.patch
+0124-ios-msl-separate.patch

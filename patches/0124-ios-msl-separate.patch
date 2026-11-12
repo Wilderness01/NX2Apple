@@ -1,0 +1,112 @@
+From 420110a04a22ab72733cc33c4a29687f206d5f9e Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Thu, 12 Nov 2026 16:35:12 +0000
+Subject: [PATCH] 0124: leave the iOS shader libraries out of the IPA when
+ DM_COPY_MSL=NO (V1.3.16)
+
+---
+ dm/ios/tools/build_ipa.sh     | 11 +++++++++--
+ scripts/build_ipa_from_nsp.py |  9 +++++++++
+ 2 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/dm/ios/tools/build_ipa.sh b/dm/ios/tools/build_ipa.sh
+index 3019b44..658040d 100755
+--- a/dm/ios/tools/build_ipa.sh
++++ b/dm/ios/tools/build_ipa.sh
+@@ -6,6 +6,7 @@
+ # Usage: dm/ios/tools/build_ipa.sh [output.ipa | --prepare-xcode]; --prepare-xcode generates the project without building, signing or packing.
+ #   Environment: GAME=game profile (dm/games/<base game title ID>, or one in DM_GAMES_DIR; required), W=the game's work folder (required: <NSP folder>/<title ID>-work, never the home folder), PATCHED / ROMFS / MSL_IOS can each be overridden
+ #   DM_COPY_ROMFS=NO leaves the game files (RomFS) out of the IPA, as it does for the Xcode build phase: the package then stays small (a large game's full package can exceed what iOS extracts), and the app takes the files from Documents/romfs.img (scripts/push_romfs.sh); default: they are packed
++#   DM_COPY_MSL=NO leaves the shader libraries out of the IPA: the package then stays small, and the app takes them from Documents/games/<title ID>/msl/b-<chain>.img (main.m sets DM_MSL_DIR to that folder first); default: they are packed
+ #   DM_ENTITLEMENTS=<plist> is the unsigned IPA's entitlements, signed ad-hoc into the executable (default: Increased Memory Limit; an empty string = none)
+ #   DM_FRAMEWORK=1 (route C, docs/launcher-c-plan.md M1) compiles the game's modules into DmIOS.app/Frameworks/DmGame.framework instead of the executable
+ #     (project-framework.yml): Gen/framework/ holds the framework's dm/ tables, profile.tsv and game.manifest.json; the framework is signed ad-hoc first
+@@ -270,6 +271,9 @@ if [ -n "$FRAMEWORK_ONLY" ]; then
+   OUTFW=$FRAMEWORK_ONLY/$FW_NAME.framework; mkdir -p "$OUTFW"
+   rsync -a --delete --exclude /msl --exclude /pso --exclude /icon.png -- "$BUILT/" "$OUTFW/" || die "copy the framework to $OUTFW"
+   # An NVN game's libraries may be the one file b-<chain>.img (dm/tools/shader_lib.py): it goes in as msl/<MSLDIR>.img, where the host reads it (nvn_mtl.m), as stage_resources.sh copies it into an app
++  # DM_COPY_MSL=NO leaves them out of the framework: the app takes them from Documents/games/<title ID>/msl/, as the one-game app does
++  if [ "${DM_COPY_MSL:-YES}" = NO ]; then rm -rf "$OUTFW/msl" || die "remove $OUTFW/msl"; t "no shader libraries in the framework (DM_COPY_MSL=NO): the app takes Documents/games/$GAME/msl/"
++  else
+   LIB=$(lib_path "$MSL_IOS/$MSLDIR") || die "shader libraries $MSL_IOS/$MSLDIR"
+   mkdir -p "$OUTFW/msl" || die "mkdir $OUTFW/msl"
+   if [ -f "$LIB" ]; then
+@@ -280,6 +284,7 @@ if [ -n "$FRAMEWORK_ONLY" ]; then
+     mkdir -p "$OUTFW/msl/$MSLDIR" && rsync -a --delete -- "$LIB/" "$OUTFW/msl/$MSLDIR/" || die "copy the shader libraries"
+   fi
+   for old in "$OUTFW/msl/"*; do case "$old" in "$OUTFW/msl/$MSLDIR"|"$OUTFW/msl/$MSLDIR.img") ;; *) rm -rf "$old";; esac; done
++  fi
+   if [ -n "$PSO" ]; then mkdir -p "$OUTFW/pso" && rsync -a --delete -- "$PSO/" "$OUTFW/pso/" || die "copy the pipeline archive"; else rm -rf "$OUTFW/pso"; fi
+   if [ -f "$ICON" ]; then sips -s format png -z 512 512 "$ICON" --out "$OUTFW/icon.png" > /dev/null || die "sips: cannot convert the icon $ICON"; else rm -f "$OUTFW/icon.png"; fi
+   python3 -c 'import json, sys; m = json.load(open(sys.argv[1])); sys.exit(m["framework_executable"] != sys.argv[2])' "$OUTFW/game.manifest.json" "$FW_NAME" \
+@@ -337,7 +342,7 @@ if [ -n "${PROGRAMS_TSV:-}" ]; then   # each program's shader libraries, RomFS,
+   if [ -n "$AOC" ] && [ -d "$AOC" ]; then MAPS+=("$P/aoc=$AOC"); fi
+   while IFS= read -r row; do prog_set "$row"; SKIP+=(--skip "$P/p$PN")
+     if [ -f "$ROMFS" ]; then MAPS+=("$P/p$PN/romfs.img=$ROMFS"); else MAPS+=("$P/p$PN/romfs=$ROMFS"); fi
+-    MAPS+=("$P/msl/p$PN/$MSLDIR=$MSL_IOS/$MSLDIR")
++    [ "${DM_COPY_MSL:-YES}" != NO ] && MAPS+=("$P/msl/p$PN/$MSLDIR=$MSL_IOS/$MSLDIR")
+     if [ -d "$(dirname "$ROMFS")/html" ]; then MAPS+=("$P/p$PN/html=$(dirname "$ROMFS")/html"); fi
+     if [ -d "$(dirname "$ROMFS")/jit" ]; then MAPS+=("$P/p$PN/jit=$(dirname "$ROMFS")/jit"); t "program $PN: nn::jit image $(dirname "$ROMFS")/jit"; fi   # beside its RomFS (loader.c dm_jit_serve_dir)
+   done < <(prog_rows); prog_back
+@@ -361,7 +366,9 @@ elif [ -n "$AOC" ] && [ -d "$AOC" ]; then
+   t "add-on content alongside the game data (DM_FULL_ROMFS=1 packs it): $(ls "$AOC" | tr '\n' ' ')"
+ fi
+ if [ -n "${PSO:-}" ]; then MAPS+=("$P/pso=$PSO"); fi
+-MAPS+=("$P/msl/$MSLDIR=$MSL_IOS/$MSLDIR" "$P=$APP")
++if [ "${DM_COPY_MSL:-YES}" = NO ]; then t "no shader libraries in the IPA (DM_COPY_MSL=NO): the app takes them from Documents/games/$GAME/msl/"
++else MAPS+=("$P/msl/$MSLDIR=$MSL_IOS/$MSLDIR"); fi
++MAPS+=("$P=$APP")
+   if [ -d "$(dirname "$ROMFS")/html" ]; then MAPS+=("$P/html=$(dirname "$ROMFS")/html"); t "offline HTML pages: $(dirname "$ROMFS")/html"; fi   # beside its RomFS, where the host finds them (hle_web.c)
+   if [ -d "$(dirname "$ROMFS")/jit" ]; then MAPS+=("$P/jit=$(dirname "$ROMFS")/jit"); t "nn::jit image: $(dirname "$ROMFS")/jit"; fi
+ fi
+diff --git a/scripts/build_ipa_from_nsp.py b/scripts/build_ipa_from_nsp.py
+index c7f4b0d..6d49ecd 100755
+--- a/scripts/build_ipa_from_nsp.py
++++ b/scripts/build_ipa_from_nsp.py
+@@ -57,6 +57,8 @@ APP_NAME = ''                           # app name on the home screen (empty = t
+ BUNDLE_ID = ''                          # the app's bundle ID (empty = saved per-game Xcode ID, else org.nxnative.<base game title ID in lowercase>)
+ ROMFS = 'bundle'                        # 'bundle' = the game files go into the IPA (or the Xcode app), as always; 'separate' = they stay out (DM_COPY_ROMFS=NO): the IPA is small, and its rebuilds do not pack or send the RomFS again.
+                                         #   Copy it to the phone once per game version with the scripts/push_romfs.sh command printed at the end (the app checks that the image is the one it was built for)
++MSL = 'bundle'                          # 'bundle' = the shader libraries go into the IPA (or the Xcode app), as always; 'separate' = they stay out (DM_COPY_MSL=NO): the IPA is small, and the shader image is
++                                        #   copied to the phone once per game version, into Documents/games/<title ID>/msl/ (the app takes it from there; the image is <build folder>/shader/ios/b-<chain>.img)
+ PREPARE_XCODE = False                   # prepare a per-game Xcode project and add it to the workspace instead of packing an IPA; requires KEEP_EXTRACTED
+ PLATFORM = 'ios'                        # 'ios' = the IPA (or the Xcode project); 'mac-app' = a double-clickable Mac app of the game; 'mac' = development: build only what running the game on this Mac needs (Mac shaders, the Mac host), no iOS shaders,
+                                         #   Xcode project or IPA; keeps the extracted files and prints the command that runs the game (needs Apple silicon)
+@@ -3106,6 +3108,8 @@ def parse_args(argv):
+     ap.add_argument('--bundle-id', help='the app\'s bundle ID (default: saved Xcode ID when preparing again, else org.nxnative.<base game title ID in lowercase>)')
+     ap.add_argument('--romfs', choices=('bundle', 'separate'), help='bundle = the game files go into the IPA (default: the ROMFS setting, bundle); separate = they stay out of the IPA and the Xcode app: the build is small and fast, and the RomFS image '
+                     'is copied to the phone once per game version with the scripts/push_romfs.sh command printed at the end (the app refuses an image of another version)')
++    ap.add_argument('--msl', choices=('bundle', 'separate'), help='bundle = the shader libraries go into the IPA (default: the MSL setting, bundle); separate = they stay out of the IPA: the build is small, and the shader image '
++                    'is copied to the phone once per game version, into Documents/games/<title ID>/msl/ (the app takes it from there; the image is <build folder>/shader/ios/b-<chain>.img)')
+     ap.add_argument('--prepare-xcode', action='store_true', help='prepare a per-game Xcode project and add it to the shared workspace instead of packing an IPA (requires keeping extracted files)')
+     ap.add_argument('--framework', action='store_true', help='the game\'s modules go into DmIOS.app/Frameworks/DmGame.framework, which the app dlopens at launch (route C, docs/launcher-c-plan.md M1), instead of the executable; the IPA is otherwise the usual one')
+     ap.add_argument('--shell-framework', metavar='FOLDER', help='route C\'s shell (docs/launcher-c-plan.md M2): build only the game\'s framework, FOLDER/DmGame<title ID>.framework '
+@@ -3248,6 +3252,8 @@ def main(args=None):
+     if romfs_mode not in ('bundle', 'separate'): raise BuildError(f'ROMFS / --romfs must be bundle or separate: {romfs_mode}')
+     if romfs_mode == 'separate' and mac: raise BuildError(f'--romfs separate keeps the game files off the iPhone app: it cannot be combined with --platform {platform}, which runs from the extracted files')
+     if romfs_mode == 'separate' and not keep: raise BuildError('--romfs separate requires --keep-extracted: the image must remain available for the one-time transfer to the phone')
++    msl_mode = args.msl or MSL
++    if msl_mode not in ('bundle', 'separate'): raise BuildError(f'MSL / --msl must be bundle or separate: {msl_mode}')
+     nsp_dir = Path(os.path.expanduser(args.nsp_dir or NSP_DIR or ask('NSP folder: ', 'the NSP folder'))).resolve()
+     if not nsp_dir.exists(): raise BuildError(f'not a folder: {nsp_dir}')
+     nup = nup_file(nsp_dir)   # a NUP file given in place of the folder: its folder is the NSP folder (the build folder and the IPA go there)
+@@ -3552,6 +3558,8 @@ def main(args=None):
+     if args.framework: ipa_env['DM_FRAMEWORK'] = '1'; say('route C: the game\'s modules go into DmIOS.app/Frameworks/DmGame.framework (DM_FRAMEWORK=1)')
+     separate = romfs_mode == 'separate'
+     if separate: ipa_env['DM_COPY_ROMFS'] = 'NO'; say('game files: separate (DM_COPY_ROMFS=NO), left out of the app; the image stays at ' + str(rfs.source(game)))
++    msl_separate = msl_mode == 'separate'
++    if msl_separate: ipa_env['DM_COPY_MSL'] = 'NO'; say('shader libraries: separate (DM_COPY_MSL=NO), left out of the app; the image stays at ' + str(ios))
+     if app_version: ipa_env['DM_APP_VERSION'] = app_version
+     if icon: ipa_env['DM_ICON'] = str(icon); say(f'app icon: {icon}')   # app icon (found above)
+     else: say(('no game icon: the NUP carries none' if nup else 'no game icon: a dump folder has no control data') + '; the home-screen icon will be blank' if dump else '[RED] no game icon in the extraction (an older extraction did not save it: delete extract/ and run again); the home-screen icon will be blank')
+@@ -3608,6 +3616,7 @@ def main(args=None):
+         for d in [ex] + [r['ex'] for r in programs.values()]: say(f'deleting the extracted game files: {d}'); rmtree(d)
+     say(f'done: {out_ipa} ({out_ipa.stat().st_size / 2**30:.1f} GB)')
+     if separate: say_push_romfs(rfs.source(game), bundle_id)
++    if msl_separate: say('shader libraries: copy the image in ' + str(ios) + ' to the phone once per game version, into Documents/games/' + g.id + '/msl/ (the app takes it from there)')
+     report_profile_status(g, reg, pkg_ver, derived, provisional, patched=patched)
+ 
+ 
+-- 
+2.43.0
+
