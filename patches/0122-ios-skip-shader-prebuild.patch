@@ -1,0 +1,78 @@
+From aa678fef5ee37b4513b6e15ec7d5d8e67fd70f4b Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Thu, 12 Nov 2026 15:26:00 +0000
+Subject: [PATCH] 0122: skip the iOS shader precompilation when
+ DM_SKIP_SHADER_PREBUILD=1 (V1.3.15, temporary)
+
+The iOS build precompiles every shader in the game's shader map
+(~27,984 for Super Mario Odyssey, about 50 minutes, ~700 MB in the
+IPA). For this V1.3.15 build only, DM_SKIP_SHADER_PREBUILD=1 makes
+build_shaders return a stub library instead: a 4-byte stub metallib
+(as S2Arm's 3.0 IPA ships), a stamp naming this game and the profile's
+current inputs, and empty c1 / cb tables, so build_ipa.sh's checks
+still pass. The game renders nothing with a stub (this engine has no
+just-in-time shader compilation); the launcher still opens, so this
+build verifies the launcher (HUD settings entry, Chinese settings
+page) and the build itself, not the in-game picture.
+
+TEMPORARY: remove this patch from patches/series and unset
+DM_SKIP_SHADER_PREBUILD in the workflow to restore the full shader
+precompilation for the final playable build. The full build path is
+untouched. This is the 0100 mechanism (Nov 9), re-applied to pin
+f25fa95; it does not touch the shader chain (dm/gfx/tools/dmsh_*).
+---
+ scripts/build_ipa_from_nsp.py | 31 +++++++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/scripts/build_ipa_from_nsp.py b/scripts/build_ipa_from_nsp.py
+index 2f5bbd8..70f9b58 100755
+--- a/scripts/build_ipa_from_nsp.py
++++ b/scripts/build_ipa_from_nsp.py
+@@ -2413,6 +2413,35 @@ def ios_wants_pulling(g, gpus, prepare_xcode, env):
+     return (env.get('IOS_PULL') or ('1' if g.get('pso_mtl4', 'off') == 'on' else '0')) == '1'
+ 
+ 
++def stub_shader_libraries(py, repo, sh, env, g, chain):
++    """A stub iOS shader library (DM_SKIP_SHADER_PREBUILD=1, patch 0122; the 0100 mechanism). Stopgap the user asked for, temporary, for fullscreen testing only, to be re-enabled after:
++    no shader is translated or compiled, so the build skips dmsh_build.py's ~50 minutes and the IPA carries only a 4-byte stub metallib (as S2Arm's 3.0 IPA does)
++    instead of ~700 MB of libraries. The stub still satisfies the checks a full build's libraries pass: build_ipa.sh's lib_has (one *_b.metallib), its stamp
++    (inputs.tsv naming this game and the profile's current inputs, dmsh_chain.py --inputs), and its c1_full.tsv first line (# chain b-<chain> inputs <digest> <time>).
++    The c1 / cb tables are empty (no shader is listed), so the host takes the safe fallback for every shader (its own 64 KiB per c1, whole uniform bindings copied) —
++    and, with no library to load, every draw goes without its shader: the game shows nothing until the shaders are precompiled again. Open: a stub build cannot be used
++    to test the picture (it renders nothing); a small build that still renders needs the host to compile missing shaders at their first use, which this engine
++    does not do (S2Arm's host does, via its S2A.Aot translator and dsh_miss.inc). Re-enable by unsetting DM_SKIP_SHADER_PREBUILD (and removing this patch from
++    patches/series); the full build path is untouched. Returns the iOS shader folder, as build_shaders does."""
++    import datetime
++    ios_lib = sh / 'ios' / f'b-{chain}'
++    mac_lib = sh / 'cache' / f'b-{chain}'
++    r = subprocess.run([py, repo / 'dm/gfx/tools/dmsh_chain.py', '--inputs'], capture_output=True, text=True,
++                       env=dict(env, DM_GAME=g.id))
++    if r.returncode: raise BuildError(f'dmsh_chain.py --inputs failed ({r.returncode}): {(r.stdout.strip() or r.stderr.strip())[-300:]}')
++    inputs = r.stdout.strip()
++    stamp = f'# the game and the profile inputs this library was built from (dm/gfx/tools/dmsh_chain.py inputs)\ngame\t{g.id}\ninputs\t{inputs}\n'
++    for lib in (ios_lib, mac_lib):
++        lib.mkdir(parents=True, exist_ok=True)
++        (lib / 'inputs.tsv').write_text(stamp, encoding='utf-8')
++    (ios_lib / 'stub_b.metallib').write_bytes(b'stub')   # the 4-byte placeholder S2Arm ships: lib_has counts *_b.metallib, so one is enough
++    head = f'# chain b-{chain} inputs {inputs} {datetime.datetime.now().astimezone().isoformat(timespec="seconds")} (stub: DM_SKIP_SHADER_PREBUILD, no shaders precompiled)\n'
++    for name in ('c1_full.tsv', 'cb_extent.tsv'):
++        g.table(name).write_text(head + '# no shaders are listed: the stub build precompiled none, so the host takes the safe fallback for every shader\n', encoding='utf-8')
++    say(f'stub shader libraries: no shaders precompiled (DM_SKIP_SHADER_PREBUILD=1); the iOS library is a 4-byte stub in {ios_lib}')
++    return sh / 'ios'
++
++
+ def build_shaders(py, repo, sh, xlate, env, logs, g, pkg_key=None, mac=False, seen=None, pull=None):
+     """The iOS shader libraries (dmsh_build.py, which also builds the Mac's into sh/cache when the build wants them), or with mac only the Mac's (a Mac-only build: no IOSOUT). Returns the folder the host takes
+     them from. Reused when the shader package (pkg_key, its content; None never reuses) and the chain's tools, translator binaries, profile and compilers are as at the last successful build:
+@@ -2432,6 +2461,8 @@ def build_shaders(py, repo, sh, xlate, env, logs, g, pkg_key=None, mac=False, se
+     chain = chain_of(repo)
+     out = sh / 'partial' if seen else sh / 'cache' if mac else ios
+     libs, kf, kmac = out / f'b-{chain}', ios / f'b-{chain}.key', out / 'key' if seen else sh / f'mac-b-{chain}.key'
++    if env.get('DM_SKIP_SHADER_PREBUILD') == '1' and not mac and not seen:   # 0122 (0100 mechanism): skip the shader precompilation for a fast, small test build; unset to restore the full build
++        return stub_shader_libraries(py, repo, sh, env, g, chain)
+     pso_pairs = g.table('pso_pairs.tsv')
+     if not pso_pairs.is_file(): pso_pairs = sh / 'pso_pairs.tsv'   # the split's copy is a shader input too (vs_pad)
+     if pkg_key:
+-- 
+2.43.0
+

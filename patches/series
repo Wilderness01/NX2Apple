@@ -78,3 +78,6 @@
 0117-ios-pad-menu-button-adjustable.patch
 0118-ios-hud-edge-anchor.patch
 0119-ios-hud-launcher-editor.patch
+0120-ios-hud-edge-eight-slots.patch
+0121-ios-launcher-zh.patch
+0122-ios-skip-shader-prebuild.patch

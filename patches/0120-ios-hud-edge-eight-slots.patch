@@ -1,0 +1,151 @@
+From d7125aed12867ae6016bf9304a43acf6f750a83e Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Thu, 12 Nov 2026 15:09:44 +0000
+Subject: [PATCH] 0120: HUD edge anchor slots 2 -> 8 per element (fix V1.3.14
+ drift)
+
+V1.3.14 (build #45) lost the coin/moon numbers on device: log-28 shows
+two TxtCounterSh + two TxtCounter panes match coins, but the edge table
+had only two slots per element, so the third and fourth pane reclaimed
+slot 0 every frame. The re-init re-derived the original matrix from the
+pane's still-modified matrix (a static pane takes the skip path, so the
+game has not recomputed it at the entry cut) and the offset drifted by
+-140 per frame until the numbers were off-screen. Eight slots per element
+(32 entries) give every observed pane its own entry; no reclamation, no
+drift. BINDING v2 -> v3.
+---
+ dm/games/0100000000010000/hud_edge.c |  8 ++--
+ dm/games/0100000000010000/patches.py | 71 ++++++++++++++--------------
+ 2 files changed, 39 insertions(+), 40 deletions(-)
+
+diff --git a/dm/games/0100000000010000/hud_edge.c b/dm/games/0100000000010000/hud_edge.c
+index af3ac8f..46b005a 100644
+--- a/dm/games/0100000000010000/hud_edge.c
++++ b/dm/games/0100000000010000/hud_edge.c
+@@ -56,8 +56,8 @@
+ // it never reads a pane name and never decides a match.
+ //
+ // A moved pane's original matrix is stored in a small table (state +0x300,
+-// eight 128-byte entries, two per element -- two layout instances can match
+-// the same element) and the modified matrix is always re-derived from that
++// 32 128-byte entries, eight per element -- up to eight layout instances can
++// match the same element) and the modified matrix is always re-derived from that
+ // original, so a fixed offset never accumulates into a drift, and a game
+ // recompute (an animation, a count change, a layout reload) is followed by
+ // re-storing the original. The offset, size and hidden flag the modified
+@@ -85,7 +85,7 @@
+ // dropped into the rewriter's patch area verbatim:
+ //   x0 = the pane (nn::ui2d::Pane *), x1 = the aspect (state + 0x58: a float,
+ //   the screen's width / height; 0 = 16:9), x2 = the edge table (state +
+-//   0x300: eight 128-byte entries, two per HUD element), x3 = the manual
++//   0x300: 32 128-byte entries, eight per HUD element), x3 = the manual
+ //   settings (state + 0x200: 12 floats, a u32 manual mask, a u32 hidden
+ //   mask; a NULL pointer reads as no manual setting).
+ //   Element order: 0 compass (right), 1 lives (right), 2 coins (left),
+@@ -97,7 +97,7 @@ typedef unsigned long uintptr_t;
+ 
+ #define HUD_EDGE_N 4
+ #define HUD_EDGE_ENTRY 128         // bytes per table entry
+-#define HUD_EDGE_SLOTS_PER_ELEM 2  // table slots per HUD element: two layout instances can match the same element
++#define HUD_EDGE_SLOTS_PER_ELEM 8  // table slots per HUD element: up to eight layout instances can match the same element (log-28 shows two TxtCounterSh + two TxtCounter matching coins; two slots thrashed and the re-init re-derived the original from an already-modified matrix, so the offset drifted off-screen -- 0120)
+ 
+ // The manual settings block (state +0x200), as the host writes it.
+ #define HUD_MANUAL_FLOATS 12       // dx, dy, k per element (4 elements)
+diff --git a/dm/games/0100000000010000/patches.py b/dm/games/0100000000010000/patches.py
+index 5121748..0be7019 100644
+--- a/dm/games/0100000000010000/patches.py
++++ b/dm/games/0100000000010000/patches.py
+@@ -16,8 +16,8 @@ BUILD_141 = 'b424be150a8e7d78701cbe7a439d9ebf'   # main 1.4.1 (game.tsv v393216)
+ #   x0 = the pane, x1 = the aspect (a pointer to state page + 0x58: the screen
+ #   aspect ratio r, written there by dm_fps_state_apply in loader.c -- 0 when the
+ #   screen is 16:9, the window's aspect otherwise, so "auto" already resolves to
+-#   the real aspect before the hook runs), x2 = table (state page + 0x300, eight
+-#   128-byte entries, two per HUD element), x3 = the manual params (a pointer to
++#   the real aspect before the hook runs), x2 = table (state page + 0x300, 32
++#   128-byte entries, eight per HUD element), x3 = the manual params (a pointer to
+ #   state page + 0x200, written there by dm_host's hud_manual.c from the launcher's
+ #   DM_HUD_* environment variables: 12 floats -- dx, dy, k per element in the
+ #   order below -- at +0x200..+0x230, a u32 manual mask at +0x230 and a u32 hidden
+@@ -53,38 +53,37 @@ BUILD_141 = 'b424be150a8e7d78701cbe7a439d9ebf'   # main 1.4.1 (game.tsv v393216)
+ #       differs -- so a settings change or an aspect change re-applies, and an
+ #       unchanged frame is a no-op.
+ HUD_EDGE_WORDS = (
+-    "f100003ffa4018441a9f17e4f100001f1a9f17e52a05008635000fe6bd400020528cccc172a7f4c11e2700211e21201054000b6a0f00040052800024"
+-    "b4000c03294604687100011f7a4008845400006034000e21528000087940b00436380dc4b940b804528d2a0572aa6c656b05009f54000c80528d2985"
+-    "72acacc56b05009f54001a20528f0a8772a98e876b07009f54001a01b940bc04515958847119a48454000ba1f9400c04b4000084b940b8846b05009f"
+-    "54000b0053017d0853017c215280002712000029520001246a08009f54000a40b40027e30b0704e493407c84bc6478611e21202054001aa152a88401"
+-    "1e2700201e2020305400274c52b884011e2700201e202030540026c41e2020281a9f17e691000484d37ef485bc6478641e24208054002b4152a87681"
+-    "1e2700201e2020905400252c52b876811e2700201e202090540024a48b050063bd4004631e2020681e231460540029e15293334172a7e3211e270020"
+-    "1e202070540016e4528cccc172a7fcc11e2700201e2020705400164c340005261e2020881e2e10001e200460540004a1d65f03c0529999a172a80181"
+-    "1e2700211e212010540000a90f00040052800024b5fff443d65f03c05291c7211e2e100272a7fc611e27002152a884011e2118001e2700211e223800"
+-    "1e2108001e2020081a9f17e4b5fff2a354000120528000015280000817ffff97b940bc05528e4e8472ae0c246b0400bf54001080d65f03c034000c49"
+-    "0f0004041e2e10031e204081531960e3d37904e58b050045f863c844eb00009f5400234011080063b9407ca48b234041f863c842eb02001f34002244"
+-    "54002240b9407c227100005f9a8110a5aa0503e2910020a4529e5943aa0403e14f00040072ae2923f80384401e27006252800023290f0ca7bd0068a2"
+-    "910040213c9f00203d800820eb01005f54ffff819101c003d2800001b8616867b8616846910010216b0600ff54001681f100c03f54ffff41bd4068a0"
+-    "1e21200054000161bd406ca01e24200054000101bd4070a01e232000540000a1b94074a16b09003f54001e00d503201fd11003ffd2800001bc616880"
+-    "bc21684091001021f100c03f54ffff8134000f49bd4044a05288000172a8c3811e2700221e222800bd0044a0d2800001b90074a92d0d10a1bd0070a3"
+-    "bc616840bc21686091001021f100c03f54ffff81910003e4528000625280000352800001d29fffe6f90003e0390023e2b4000060f240081f540006c0"
+-    "7100fc7f7a40d8245400062d51000421937c7c20f860688017fffff7710004ff5400044d1e2020081e2140011a9f17e10f0004041e2e100334fff361"
+-    "d65f03c03942f00434ffe784d65f03c0528f0a8572a86e856b05009f540017c1b940bc05528eade472ae8dc46b0400bf54fff121b940c004528e4ca5"
+-    "72ad0a656b05009f54000d61b940c40435fff04453027d0853027c215280004717ffff2a3943000434001464d65f03c01e2020081e2040011a9f17e1"
+-    "17ffffdf0f0004015280002617ffff341e20400317ffff77911003ffd65f03c0f940140291008005f100005ffa4210a454fff8e0f240085ffa460040"
+-    "54fff889937c7c27910023eb52800408d29fffec3867696ad1002047eb0000e954000240eb07001f54000062f103fd3f540001c97940a0497100fc3f"
+-    "937c7c2d910003ef321c01297900a0495100054e110004637a40d9445400008011000421f82d69e7382d696ef94004427100050854fff500f100005f"
+-    "fa4210a454fff4a0f240085ffa4c004054fff44917ffffe3360005e8bd4050001e202018540006ccbd4014a5bd4024a29100404791004081d2800006"
+-    "bc6668801e230800bc266840bc6668201e230800bc2668e0910010c6f10030df54ffff01bd4014a6d2800406bd4024a01e2538c61e2238001f0314c5"
+-    "1f0308021e2128a51e242842bd0044a5bd0054a2bc666880bc266840910010c6f100c0df54ffff8117ffff6bd2800001d503201fbc616860bc216880"
+-    "91001021f100c03f54ffff8117ffff55528e4ca56b05009f54fff2c0d65f03c0bd4044a01e212800bd0044a017ffff5b34ffee89d65f03c01e204004"
+-    "17fffedb1e20400117fffecc528a000172a8f8611e2700221e2220105400004417ffffc6bd4054051e2020b85400004c17ffffc21e2220b054000044"
+-    "17ffffbf39416c01d3441426710004df540005000f000406710008df540000611e2c10061e26880653067c217100043f540003a00f0004007100083f"
+-    "540000611e2c10001e2008a02d4114b12d42c0a7bd401ca21e2508051f0616251e220802bd4024a01f1008c21e2728a51e20284217ffffa50f000404"
+-    "17fffeae1e2e100317fffebb54ffde61aa0103e5910020a49100e0a217fffeff5280000717fffe84d65f03c01e2c10001e2088a017ffffe71e2c1006"
+-    "1e26080617ffffdc528de86572adcea56b05009f54000121b940bc04515c98847115d08454ffd92153037d0853037c215280006717fffe71528f0a85"
+-    "72aa8e856b05009f54ffd821b940bc05528e8de472ad8c246b0400bf54ffd781b940c005528d0a6472adcd246b0400bf54ffd6e1b940c4047101949f"
+-    "54ffd681f9400c04b4fffd44b940b887528de86572adcea56b0500ff54fffca1b940bc84515c98847115d08454fffc21d65f03c0"
++    "f100003ffa4018441a9f17e4f100001f1a9f17e52a05008635000fe6bd400020528cccc172a7f4c11e2700211e21201054000b6a0f00040052800024b4000c03"
++    "294604697100013f7a4008845400006034000e21528000097940b00436380dc4b940b804528d2a0572aa6c656b05009f54000c80528d298572acacc56b05009f"
++    "54001ba0528f0a8772a98e876b07009f54001b81b940bc04515958847119a48454000ba1f9400c04b4000084b940b8846b05009f54000b0053017d2953017c21"
++    "5280002712000028520001016a09003f54000a40b40029a30b0704e193407c21bc6178601e20200054001c0152a884041e2700811e2120105400290c52b88404"
++    "1e2700811e212010540028841e2020081a9f17e691000421d37ef424bc6178631e23206054002d0152a876811e2700211e212070540026ec52b876811e270021"
++    "1e212070540026648b040063bd4004621e2020481e22144054002ba15293334172a7e3211e2700211e21205054001844528cccc172a7fcc11e2700211e212050"
++    "540017ac340005261e2020681e2e10011e210440540004a1d65f03c0529999a172a801811e2700211e212010540000a90f00040052800024b5fff443d65f03c0"
++    "5291c7211e2e100272a7fc611e27002152a884011e2118001e2700211e2238001e2108001e2020081a9f17e4b5fff2a354000120528000015280000917ffff97"
++    "b940bc05528e4e8472ae0c246b0400bf54001200d65f03c034000dc80f0004031e2e10021e204060531960e1d37904e48b040046914004438b040063aa0603e5"
++    "f861c841aa0603e4eb00003f54000200b9407c81350016e1910800a1eb01007f54000160f94100a2eb00005f540000a1140000e4f9400022eb00005f54001c20"
++    "91080021eb01007f54ffff61aa0403e291002085f8438441eb00003f540001c04f000401529e5943aa0503e172ae292352800026f9000080b9006883290f1887"
++    "910040213c9f00213d800821eb02003f54ffff819101c003d2800001d503201fb8616867b8616846910010216b0600ff540016a1f100c03f54ffff41bd406881"
++    "1e21200054000161bd406c811e21206054000101bd4070811e222020540000a1b94074816b08003f54001de0d503201fd11003ffaa0503e13dc0002191004021"
++    "3d800821eb01005f54ffff8134001028bd4044815288000172a8c3811e2700241e242821bd004481d2800001b90074882d0d0c80bd007082bc616840bc216860"
++    "91001021f100c03f54ffff81910003e4528000625280000352800001d29fffe6f90003e0390023e2b4000060f240081f540006a07100fc7f7a40d8245400060d"
++    "51000421937c7c20f860688017fffff7710004ff5400044d1e2020081e2140001a9f17e10f0004031e2e100234fff1e1d65f03c03942f00434ffe604d65f03c0"
++    "528f0a8572a86e856b05009f540017a1b940bc05528eade472ae8dc46b0400bf54ffefa1b940c004528e4ca572ad0a656b05009f54000d61b940c40435ffeec4"
++    "53027d2953027c215280004717ffff1e3943000434001404d65f03c01e2020081a9f17e117ffffe00f0004005280002617ffff291e20402217ffff6c911003ff"
++    "d65f03c0f940140291008005f100005ffa4210a454fff900f240085ffa46004054fff8a9937c7c27910023eb52800408d29fffec3867696ad1002047eb0000e9"
++    "54000240eb07001f54000062f103fd3f540001c97940a0497100fc3f937c7c2d910003ef321c01297900a0495100054e110004637a40d9445400008011000421"
++    "f82d69e7382d696ef94004427100050854fff520f100005ffa4210a454fff4c0f240085ffa4c004054fff46917ffffe3910800a5eb05007f54000d20f94000a1"
++    "aa0503e4eb00003f54ffe84117ffff5036000509bd4050011e2020385400062cbd401486bd40248591005081bd4000a4910010a5bd400ca11e2208841e220821"
++    "bd002ca4bd003ca1eb0100bf54ffff01bd401484bd4024813cc280871e2638841e2538213c8580871f0218861f0214251e2628061e252865bd004486bd005485"
++    "17ffff6ad2800001bc616861bc2168a191001021f100c03f54ffff8117ffff55528e4ca56b05009f54fff2c0d65f03c0bd4044811e202821bd00448117ffff5b"
++    "aa0103e417ffff2234ffee48d65f03c01e20402317fffecd1e20402017fffebe528a000172a8f8611e2700241e2420305400004417ffffcbbd4054051e2020b8"
++    "5400004c17ffffc71e2420b05400004417ffffc439416c01d3441426710004df540004a00f000404710008df540000611e2c10041e24882453067c217100043f"
++    "540003400f0004017100083f540000611e2c10011e2108a12d4118912d42c087bd401c851e2608261f041a261e250825bd4024811f1014851e2728c61e2128a5"
++    "17ffffaa0f00040317fffea01e2e100217fffead5280000717fffe7baa0603e417fffeebd65f03c01e2c10011e2188a117ffffea1e2c10041e24082417ffffdf"
++    "528de86572adcea56b05009f54000121b940bc04515c98847115d08454ffd7c153037d2953037c215280006717fffe66528f0a8572aa8e856b05009f54ffd6c1"
++    "b940bc05528e8de472ad8c246b0400bf54ffd621b940c005528d0a6472adcd246b0400bf54ffd581b940c4047101949f54ffd521f9400c04b4fffd44b940b887"
++    "528de86572adcea56b0500ff54fffca1b940bc84515c98847115d08454fffc21d65f03c0"
+ )
+ 
+ # The HUD edge-anchor hook (0118): Pane::Calculate (main+0x909494, the vtable's
+@@ -160,7 +159,7 @@ def _hud_edge_frame_step(ctx):
+ FRAME_STEP = {BUILD_141: _hud_edge_frame_step}
+ 
+ BINDING = [
+-    {'what': "HUD edge anchor, v2 (hud_edge.c: entry + 0x13c cuts, compass 'PicStrap', lives 'Life'/'TxtLife', coins 'TxtCounterSh'/'TxtCounter', moons 'Counter'/'TxtTotalShine', matched by pane name only; the auto edge offset from the screen aspect -- iPhone 19.5:9 +140 out, iPhone Duo 1.43:1 -126 in, iPad 4:3 -160 in, 16:9 0 -- plus the launcher's manual overrides from the DM_HUD_* environment variables (hud_manual.c, state page +0x200), which win over the auto edge, and a hide that pushes the pane off-screen; a dirty flag so a moved container carries its children, an orig/mod table with the applied transform so a fixed offset never drifts, no settings UI in the game itself)", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
+-     'why': "Pane::Calculate and the pane layout are this build's nn::ui2d code, found by the HUDLOG diagnostic run (log-17) and confirmed by disassembly of DmIOS; the edge offset comes from the screen aspect the loader already writes to state page + 0x58 (log-28). The manual settings come from the launcher's HUD editor (HudEditor.swift) through the same environment-variable channel the launcher already uses for its other settings (DM_SCREEN_ASPECT), so the game reads nothing new: the host copies them to state page +0x200 once per present. This replaces the cancelled draggable HUD (0113): it keeps no user-adjustable state in the game, reuses the 0118 pane-name hook, and its only tree walk is the bounded flag-only mark-dirty, so the 0113 crash class (a name/match walk reading a pane through a bad pointer) is structurally absent.",
++    {'what': "HUD edge anchor, v3 (hud_edge.c: entry + 0x13c cuts, compass 'PicStrap', lives 'Life'/'TxtLife', coins 'TxtCounterSh'/'TxtCounter', moons 'Counter'/'TxtTotalShine', matched by pane name only; the auto edge offset from the screen aspect -- iPhone 19.5:9 +140 out, iPhone Duo 1.43:1 -126 in, iPad 4:3 -160 in, 16:9 0 -- plus the launcher's manual overrides from the DM_HUD_* environment variables (hud_manual.c, state page +0x200), which win over the auto edge, and a hide that pushes the pane off-screen; a dirty flag so a moved container carries its children, an orig/mod table with the applied transform so a fixed offset never drifts, eight slots per HUD element (was two): log-28 shows two TxtCounterSh + two TxtCounter panes matching coins, and two slots thrashed, so a reclaimed slot re-derived the original matrix from an already-modified one and the offset drifted a little further off-screen every frame (V1.3.14: the coin/moon numbers and most dots gone, icons still there); eight slots give every observed pane its own entry, no settings UI in the game itself)", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
++     'why': "Pane::Calculate and the pane layout are this build's nn::ui2d code, found by the HUDLOG diagnostic run (log-17) and confirmed by disassembly of DmIOS; the edge offset comes from the screen aspect the loader already writes to state page + 0x58 (log-28). The manual settings come from the launcher's HUD editor (HudEditor.swift) through the same environment-variable channel the launcher already uses for its other settings (DM_SCREEN_ASPECT), so the game reads nothing new: the host copies them to state page +0x200 once per present. This replaces the cancelled draggable HUD (0113): it keeps no user-adjustable state in the game, reuses the 0118 pane-name hook, and its only tree walk is the bounded flag-only mark-dirty, so the 0113 crash class (a name/match walk reading a pane through a bad pointer) is structurally absent. V1.3.14 (build #45) showed the drift on device: with no manual settings at all (log-30: 'HUD manual: no DM_HUD_* set, auto edge anchor only') the coin/moon numbers vanished and the moon dots were wrong, because four panes share the coins element and two slots could not hold them; the table is the only state the stub keeps, so giving each pane its own slot removes the drift at its source.",
+      'blocked': 'the stubs have no function-matched form yet'},
+ ]
+-- 
+2.43.0
+

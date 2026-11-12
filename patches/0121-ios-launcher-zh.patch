@@ -1,0 +1,390 @@
+From 62687f7082c2006f47e53fc3569d392b11d55bde Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Thu, 12 Nov 2026 15:18:26 +0000
+Subject: [PATCH] 0121: the single-game iOS launcher in Chinese (V1.3.15)
+
+The DmIOS launcher renders launcher.json rows verbatim, and launcher.json carries English only (dm/games/settings.py). The Mac launcher and the iOS shell translate each row at display time through the fork's l10n table (frontend/l10n/*.json), keyed launch.set.<ENV>, launch.set.<ENV>.note, launch.opt.<ENV>.<value> and launch.section.<Name>; a key the table does not have keeps the English. The DmIOS app does not bundle that table, so LauncherText.swift carries the Chinese strings itself (as \u{...} escapes: the engine writes Chinese as escapes, never as characters), generated from frontend/l10n/zh.json, and translates rows, section headings and the launcher's own chrome strings at display time, falling back to English for a row this build does not know. The model keeps the English section names, so GameMenu.swift's "Controls" match and the shared Mac window are unaffected. iPad (4:3) has no launch.opt key in zh.json; it is added here as iPad (4:3).
+---
+ dm/ios/Sources/GameMenu.swift     |  10 +-
+ dm/ios/Sources/Launcher.swift     |  48 ++++-----
+ dm/ios/Sources/LauncherRow.swift  |   2 +-
+ dm/ios/Sources/LauncherText.swift | 155 ++++++++++++++++++++++++++++++
+ 4 files changed, 186 insertions(+), 29 deletions(-)
+ create mode 100644 dm/ios/Sources/LauncherText.swift
+
+diff --git a/dm/ios/Sources/GameMenu.swift b/dm/ios/Sources/GameMenu.swift
+index c21379e..eafa4b0 100644
+--- a/dm/ios/Sources/GameMenu.swift
++++ b/dm/ios/Sources/GameMenu.swift
+@@ -8,17 +8,17 @@ var gameMenuModel: LauncherModel?   // the settings screen's model (Launcher.swi
+ 
+ @_cdecl("dm_game_menu")
+ public func dmGameMenu() -> UnsafeMutableRawPointer {
+-    let title = gameMenuModel != nil ? "More settings on the start screen" : ""
++    let title = gameMenuModel != nil ? LauncherText.text("ui.moreSettings", "More settings on the start screen") : ""
+     let menu = UIMenu(title: title, children: [UIDeferredMenuElement.uncached { done in done(gameMenuItems()) }])   // built each time it opens, so it shows the current choices
+     return Unmanaged.passRetained(menu).toOpaque()
+ }
+ 
+ private func gameMenuItems() -> [UIMenuElement] {
+-    let names = ["2D", "3D", "Tap"]
++    let names = ["2D", "3D", LauncherText.text("ui.layoutTap", "Tap")]
+     let layouts = (0..<3).filter { dm_pad_layout_offered(Int32($0)) }.map { l in
+         UIAction(title: names[l], state: dm_pad_layout() == l ? .on : .off) { _ in dm_pad_layout_set(Int32(l)) }
+     }
+-    let layout = UIMenu(title: "Controller layout", options: .singleSelection, children: layouts)   // a choice's value shows in its submenu: a subtitle would make each row two lines
++    let layout = UIMenu(title: LauncherText.text("ui.controllerLayout", "Controller layout"), options: .singleSelection, children: layouts)   // a choice's value shows in its submenu: a subtitle would make each row two lines
+     let padSettings = UIAction(title: "按键设置") { _ in dm_gamepad_open_pad_settings() }   // the button editor (DmGamepad.m): the icons' size and where they sit
+     var items: [UIMenuElement] = []
+     var placed = false
+@@ -41,11 +41,11 @@ private func gameMenuRow(_ m: LauncherModel, _ s: Setting) -> UIMenuElement {
+     func pick(_ v: String) { m.choose(s, v); _ = dm_setting_live(s.env, v) }
+     if s.kind == "toggle" {
+         let a = UIAction(title: s.label, attributes: attributes, state: now == s.onValue ? .on : .off) { _ in pick(now == s.onValue ? s.offValue : s.onValue) }
+-        if fixed { a.subtitle = "Set in env.txt" }
++        if fixed { a.subtitle = LauncherText.text("ui.setInEnvTxt", "Set in env.txt") }
+         return a
+     }
+     let options = s.options ?? []
+     let current = options.first { $0[0] == now }?[1] ?? now
+     let actions = options.map { o in UIAction(title: o[1], attributes: attributes, state: o[0] == now ? .on : .off) { _ in pick(o[0]) } }
+-    return UIMenu(title: s.label, subtitle: fixed ? "\(current), set in env.txt" : nil, options: .singleSelection, children: actions)
++    return UIMenu(title: s.label, subtitle: fixed ? "\(current), \(LauncherText.text("ui.setInEnvTxtInline", "set in env.txt"))" : nil, options: .singleSelection, children: actions)
+ }
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index 61f1639..9633827 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -24,32 +24,32 @@ private struct GameDataSection: View {
+     var body: some View {
+         Section {
+             HStack {
+-                Text("Game data")
++                Text(LauncherText.text("ui.gameData", "Game data"))
+                 Spacer()
+-                Text(picked.isEmpty ? "This app's folder" : (picked as NSString).lastPathComponent)
++                Text(picked.isEmpty ? LauncherText.text("ui.appFolder", "This app's folder") : (picked as NSString).lastPathComponent)
+                     .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+             }
+-            Button(picked.isEmpty ? "Choose game data…" : "Choose a different location…") { picking = true }
++            Button(picked.isEmpty ? LauncherText.text("ui.chooseGameData", "Choose game data…") : LauncherText.text("ui.chooseDifferentLocation", "Choose a different location…")) { picking = true }
+                 // The sheet sits on the button, not on the Section: SwiftUI hands a Section's modifiers to every row, so one tap presented a picker per row and they invalidated each other (LNPANDY/NX2Apple#315).
+                 .sheet(isPresented: $picking) {
+                     DocumentPicker(types: [.item]) { url in
+                         picking = false
+                         if dm_store_picked_data(url) {
+-                            note = "Saved. The game uses this location when you press Play."
++                            note = LauncherText.text("ui.savedLocation", "Saved. The game uses this location when you press Play.")
+                             refresh()
+                         } else {
+-                            note = "That location could not be remembered — try a different one."
++                            note = LauncherText.text("ui.locationNotRemembered", "That location could not be remembered — try a different one.")
+                         }
+                     } onCancel: { picking = false }
+                 }
+             if !picked.isEmpty {
+-                Button("Use the app's own data again", role: .destructive) {
++                Button(LauncherText.text("ui.useOwnData", "Use the app's own data again"), role: .destructive) {
+                     dm_clear_picked_data(); refresh(); note = ""
+                 }
+             }
+         } footer: {
+             Text(note.isEmpty
+-                 ? "Pick the game's romfs.img or its RomFS folder — an external drive or iCloud Drive works. The app remembers the choice; a re-signed build asks once more."
++                 ? LauncherText.text("ui.pickGameDataNote", "Pick the game's romfs.img or its RomFS folder — an external drive or iCloud Drive works. The app remembers the choice; a re-signed build asks once more.")
+                  : note)
+         }
+         .onAppear(perform: refresh)
+@@ -62,7 +62,7 @@ private struct GameDataSection: View {
+         var stale: ObjCBool = false
+         picked = dm_picked_data_path(&stale) ?? ""
+         if stale.boolValue && picked.isEmpty {
+-            note = "The location you picked before is no longer readable (the app was signed differently). Please choose it again."
++            note = LauncherText.text("ui.locationUnreadable", "The location you picked before is no longer readable (the app was signed differently). Please choose it again.")
+         } else if note.isEmpty, let old = dm_old_archive_message() {
+             note = String(cString: old)
+         }
+@@ -80,32 +80,32 @@ private struct CloudSavesSection: View {
+     var body: some View {
+         Section {
+             HStack {
+-                Text("Cloud saves")
++                Text(LauncherText.text("ui.cloudSaves", "Cloud saves"))
+                 Spacer()
+-                Text(folder.isEmpty ? "Off" : (folder as NSString).lastPathComponent)
++                Text(folder.isEmpty ? LauncherText.text("ui.off", "Off") : (folder as NSString).lastPathComponent)
+                     .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+             }
+-            Button(folder.isEmpty ? "Choose a folder in iCloud Drive…" : "Choose a different folder…") { picking = true }
++            Button(folder.isEmpty ? LauncherText.text("ui.chooseCloudFolder", "Choose a folder in iCloud Drive…") : LauncherText.text("ui.chooseDifferentFolder", "Choose a different folder…")) { picking = true }
+                 // The sheet sits on the button, not on the Section: SwiftUI hands a Section's modifiers to every row, so one tap presented a picker per row and they invalidated each other (LNPANDY/NX2Apple#315).
+                 .sheet(isPresented: $picking) {
+                     DocumentPicker(types: [.folder]) { url in
+                         picking = false
+                         if dm_store_cloud_saves(url) {
+-                            note = "Saved. The game uses this folder when you press Play."
++                            note = LauncherText.text("ui.savedCloudFolder", "Saved. The game uses this folder when you press Play.")
+                             refresh()
+                         } else {
+-                            note = "That folder could not be remembered — try a different one."
++                            note = LauncherText.text("ui.folderNotRemembered", "That folder could not be remembered — try a different one.")
+                         }
+                     } onCancel: { picking = false }
+                 }
+             if !folder.isEmpty {
+-                Button("Turn off cloud saves", role: .destructive) {
++                Button(LauncherText.text("ui.turnOffCloudSaves", "Turn off cloud saves"), role: .destructive) {
+                     dm_clear_cloud_saves(); refresh(); note = ""
+                 }
+             }
+         } footer: {
+             Text(note.isEmpty
+-                 ? "Choose a folder in iCloud Drive, and the same one in the Mac app's Cloud saves. The save comes in when the game starts and goes out after each save; a save that is replaced is kept in save-backups."
++                 ? LauncherText.text("ui.cloudFolderNote", "Choose a folder in iCloud Drive, and the same one in the Mac app's Cloud saves. The save comes in when the game starts and goes out after each save; a save that is replaced is kept in save-backups.")
+                  : note)
+         }
+         .onAppear(perform: refresh)
+@@ -115,7 +115,7 @@ private struct CloudSavesSection: View {
+         var stale: ObjCBool = false
+         folder = dm_cloud_saves_path(&stale) ?? ""
+         if stale.boolValue && folder.isEmpty {
+-            note = "The folder you chose before is no longer readable (the app was signed differently). Please choose it again."
++            note = LauncherText.text("ui.folderUnreadable", "The folder you chose before is no longer readable (the app was signed differently). Please choose it again.")
+         }
+     }
+ }
+@@ -169,7 +169,7 @@ private struct LauncherView: View {
+                     }
+                     Text((info("CFBundleDisplayName") as? String) ?? "Game")
+                         .font(.title.weight(.bold)).multilineTextAlignment(.center)
+-                    Text("Version \((info("CFBundleShortVersionString") as? String) ?? "")")
++                    Text("\(LauncherText.text("ui.version", "Version")) \((info("CFBundleShortVersionString") as? String) ?? "")")
+                         .font(.callout).foregroundStyle(.secondary)
+                     playButton
+                 }
+@@ -179,16 +179,16 @@ private struct LauncherView: View {
+                     ForEach(m.sections, id: \.self) { section in
+                         let rows = m.rows(in: section)
+                         if !rows.isEmpty {
+-                            Section(section) {
++                            Section(LauncherText.sectionName(section)) {
+                                 ForEach(rows) { SettingRow(s: $0, m: m) }
+                             }
+                         }
+                     }
+                     Section {
+-                        Button("Reset to tested defaults") { m.reset() }
++                        Button(LauncherText.text("ui.resetDefaults", "Reset to tested defaults")) { m.reset() }
+                             .disabled(!m.changed)
+                     } footer: {
+-                        Text("Brings back all settings this game was tested with.")
++                        Text(LauncherText.text("ui.resetDefaultsNote", "Brings back all settings this game was tested with."))
+                     }
+                     Section("HUD") {
+                         Button("HUD 设置") { showingHud = true }
+@@ -201,7 +201,7 @@ private struct LauncherView: View {
+                     CloudSavesSection()
+                     Section {
+                         HStack {
+-                            Text("Memory available")
++                            Text(LauncherText.text("ui.memoryAvailable", "Memory available"))
+                             Spacer()
+                             Text(ByteCountFormatter.string(fromByteCount: Int64(memory), countStyle: .memory)).monospacedDigit().foregroundStyle(.secondary)
+                         }
+@@ -222,7 +222,7 @@ private struct LauncherView: View {
+     }
+ 
+     @ViewBuilder var playButton: some View {
+-        let button = Button(action: play) { Text("Play").font(.title3.weight(.semibold)).frame(maxWidth: 220) }.controlSize(.large)
++        let button = Button(action: play) { Text(LauncherText.text("ui.play", "Play")).font(.title3.weight(.semibold)).frame(maxWidth: 220) }.controlSize(.large)
+         if #available(iOS 26.0, *) { button.buttonStyle(.glassProminent) } else { button.buttonStyle(.borderedProminent) }
+     }
+ 
+@@ -241,7 +241,9 @@ public func dmShowLauncher(_ viewController: UnsafeMutableRawPointer, _ done: @c
+     let dir = getenv("DM_APP_DM").map { URL(fileURLWithPath: String(cString: $0)) } ?? Bundle.main.resourceURL?.appendingPathComponent("dm")
+     guard let url = dir?.appendingPathComponent("launcher.json"), let data = try? Data(contentsOf: url) else { return false }
+     guard let file = try? JSONDecoder().decode(SettingsFile.self, from: data), !file.settings.isEmpty else { fputs("[RED] launcher: dm/launcher.json cannot be read; starting the game\n", stderr); return false }
+-    let model = LauncherModel(file.settings)
++    // The rows are shown in Chinese (LauncherText.swift): each row by its
++    // env key, falling back to the English in launcher.json.
++    let model = LauncherModel(LauncherText.localizedSettings(file.settings))
+     gameMenuModel = model   // the in-game menu shows and saves the same choices (GameMenu.swift)
+     let hud = HudSettings()   // the HUD editor's settings (HudEditor.swift); its applyToEnvironment() goes in both start paths below
+     if ProcessInfo.processInfo.environment["DM_LAUNCHER"] == "0" { fputs("launcher: off (DM_LAUNCHER=0)\n", stderr); model.applySaved(); hud.applyToEnvironment(); return false }
+diff --git a/dm/ios/Sources/LauncherRow.swift b/dm/ios/Sources/LauncherRow.swift
+index 82fa3b3..a7a53a8 100644
+--- a/dm/ios/Sources/LauncherRow.swift
++++ b/dm/ios/Sources/LauncherRow.swift
+@@ -13,7 +13,7 @@ struct SettingRow: View {
+     private var locked: Bool { m.fixed.contains(s.env) }
+     private var note: String {
+         guard locked else { return s.note }
+-        return (s.note.isEmpty ? "" : s.note + " · ") + (m.fromLaunch.contains(s.env) ? "Set at launch" : "Set by an env file")
++        return (s.note.isEmpty ? "" : s.note + " · ") + (m.fromLaunch.contains(s.env) ? LauncherText.text("ui.setAtLaunch", "Set at launch") : LauncherText.text("ui.setByEnvFile", "Set by an env file"))
+     }
+     private var rangeValue: Binding<Double> {
+         Binding(get: { Double(m.values[s.env] ?? s.def) ?? s.max ?? 1 },
+diff --git a/dm/ios/Sources/LauncherText.swift b/dm/ios/Sources/LauncherText.swift
+new file mode 100644
+index 0000000..79df6a6
+--- /dev/null
++++ b/dm/ios/Sources/LauncherText.swift
+@@ -0,0 +1,155 @@
++// The single-game launcher in Chinese (0121, V1.3.15).
++//
++// The DmIOS launcher renders launcher.json rows verbatim, and
++// launcher.json carries English only (dm/games/settings.py). The Mac
++// launcher and the iOS shell translate each row at display time through
++// the fork's l10n table (frontend/l10n/*.json), keyed launch.set.<ENV>,
++// launch.set.<ENV>.note, launch.opt.<ENV>.<value> and
++// launch.section.<Name>; a key the table does not have keeps the English
++// (frontend/Sources/NX2Apple/Library.swift). The DmIOS app does not bundle
++// that table, so this file carries the Chinese strings itself.
++//
++// Generated by v1314-investigation/0121/gen_launcher_text.py from
++// frontend/l10n/zh.json (the launch.* keys) plus the launcher's own
++// chrome strings (ui.*). Chinese is written as \u{...} escapes: the
++// engine writes Chinese as escapes, never as characters. Do not hand-edit
++// the table; regenerate it.
++import Foundation
++
++/// The launcher's strings in Chinese, keyed as the fork's l10n table
++/// keys them. A key that is not here keeps the English fallback the
++/// caller passes in, exactly as the Mac launcher and the shell do.
++enum LauncherText {
++    private static let table: [String: String] = [
++        "launch.opt.DM_FPS_TARGET.120": "120 fps",
++        "launch.opt.DM_FPS_TARGET.30": "30 fps",
++        "launch.opt.DM_FPS_TARGET.60": "60 fps",
++        "launch.opt.DM_FULLSCREEN.0": "\u{7a97}\u{53e3}",
++        "launch.opt.DM_FULLSCREEN.1": "\u{5168}\u{5c4f}",
++        "launch.opt.DM_LANG.de": "\u{5fb7}\u{8bed}",
++        "launch.opt.DM_LANG.en-GB": "\u{82f1}\u{5f0f}\u{82f1}\u{8bed}",
++        "launch.opt.DM_LANG.en-US": "\u{7f8e}\u{5f0f}\u{82f1}\u{8bed}",
++        "launch.opt.DM_LANG.es": "\u{897f}\u{73ed}\u{7259}\u{8bed}",
++        "launch.opt.DM_LANG.es-419": "\u{62c9}\u{4e01}\u{7f8e}\u{6d32}\u{897f}\u{73ed}\u{7259}\u{8bed}",
++        "launch.opt.DM_LANG.fr": "\u{6cd5}\u{8bed}",
++        "launch.opt.DM_LANG.fr-CA": "\u{52a0}\u{62ff}\u{5927}\u{6cd5}\u{8bed}",
++        "launch.opt.DM_LANG.it": "\u{610f}\u{5927}\u{5229}\u{8bed}",
++        "launch.opt.DM_LANG.ja": "\u{65e5}\u{8bed}",
++        "launch.opt.DM_LANG.ko": "\u{97e9}\u{8bed}",
++        "launch.opt.DM_LANG.nl": "\u{8377}\u{5170}\u{8bed}",
++        "launch.opt.DM_LANG.pt": "\u{8461}\u{8404}\u{7259}\u{8bed}",
++        "launch.opt.DM_LANG.pt-BR": "\u{5df4}\u{897f}\u{8461}\u{8404}\u{7259}\u{8bed}",
++        "launch.opt.DM_LANG.ru": "\u{4fc4}\u{8bed}",
++        "launch.opt.DM_LANG.zh-Hans": "\u{7b80}\u{4f53}\u{4e2d}\u{6587}",
++        "launch.opt.DM_LANG.zh-Hant": "\u{7e41}\u{4f53}\u{4e2d}\u{6587}",
++        "launch.opt.DM_OPMODE.0": "\u{638c}\u{673a}\u{6a21}\u{5f0f}",
++        "launch.opt.DM_OPMODE.1": "\u{5e95}\u{5ea7}\u{6a21}\u{5f0f}",
++        "launch.opt.DM_PICTURE_FIT.fill": "\u{586b}\u{5145}",
++        "launch.opt.DM_PICTURE_FIT.fit": "\u{9002}\u{5e94}",
++        "launch.opt.DM_PRESENT_UPSCALE.metalfx": "MetalFX",
++        "launch.opt.DM_PRESENT_UPSCALE.off": "\u{6807}\u{51c6}",
++        "launch.opt.DM_SCREEN_ASPECT.0": "16:9\u{ff08}Switch\u{ff09}",
++        "launch.opt.DM_SCREEN_ASPECT.1.333": "iPad\u{ff08}4:3\u{ff09}",
++        "launch.opt.DM_SCREEN_ASPECT.1.43": "iPhone Duo \u{5c4f}\u{5e55}\u{ff08}1.43:1\u{ff09}",
++        "launch.opt.DM_SCREEN_ASPECT.auto": "\u{5339}\u{914d}\u{5c4f}\u{5e55}",
++        "launch.opt.DM_UPSCALER.game": "\u{6e38}\u{620f}\u{81ea}\u{5e26}",
++        "launch.opt.DM_UPSCALER.metalfx": "MetalFX",
++        "launch.section.Controls": "\u{63a7}\u{5236}",
++        "launch.section.Game": "\u{6e38}\u{620f}",
++        "launch.section.Performance": "\u{6027}\u{80fd}",
++        "launch.set.DM_DYNAMIC_RESOLUTION": "\u{52a8}\u{6001}\u{5206}\u{8fa8}\u{7387}",
++        "launch.set.DM_DYNAMIC_RESOLUTION.note": "\u{8d1f}\u{8f7d}\u{8f83}\u{9ad8}\u{65f6}\u{5728} 70% \u{5230} 100% \u{4e4b}\u{95f4}\u{8c03}\u{6574}\u{5206}\u{8fa8}\u{7387}\u{3002}\u{5173}\u{95ed}\u{540e}\u{4fdd}\u{6301}\u{6240}\u{9009}\u{4e3b}\u{673a}\u{6a21}\u{5f0f}\u{7684}\u{5b8c}\u{6574}\u{5206}\u{8fa8}\u{7387}\u{3002}",
++        "launch.set.DM_FPS_HOLD": "\u{5e27}\u{5ef6}\u{8fdf}\u{65f6}\u{4fdd}\u{6301}",
++        "launch.set.DM_FPS_TARGET": "\u{5e27}\u{7387}",
++        "launch.set.DM_FULLSCREEN": "\u{663e}\u{793a}\u{6a21}\u{5f0f}",
++        "launch.set.DM_LANG": "\u{6e38}\u{620f}\u{8bed}\u{8a00}",
++        "launch.set.DM_METAL_HUD": "\u{6027}\u{80fd} HUD",
++        "launch.set.DM_NVN_ENC_THREAD": "\u{7f16}\u{7801}\u{7ebf}\u{7a0b}",
++        "launch.set.DM_OPMODE": "\u{4e3b}\u{673a}\u{6a21}\u{5f0f}",
++        "launch.set.DM_PAD_PRESS_TO_JOIN": "\u{6309}\u{4efb}\u{610f}\u{952e}\u{52a0}\u{5165}",
++        "launch.set.DM_PICTURE_FIT": "\u{753b}\u{9762}",
++        "launch.set.DM_PICTURE_FIT.note": "\u{586b}\u{5145}\u{4f1a}\u{88c1}\u{5207}\u{6e38}\u{620f}\u{7684} 16:9 \u{753b}\u{9762}\u{4ee5}\u{94fa}\u{6ee1}\u{5c4f}\u{5e55}\u{3002}\u{8fb9}\u{7f18}\u{9644}\u{8fd1}\u{7684}\u{8840}\u{6761}\u{3001}\u{5b57}\u{5e55}\u{6216}\u{5730}\u{56fe}\u{53ef}\u{80fd}\u{88ab}\u{88c1}\u{6389}\u{3002}\u{4e0d}\u{88c1}\u{5207}\u{7684}\u{5168}\u{5c4f}\u{753b}\u{9762}\u{9700}\u{8981}\u{4e3a}\u{6bcf}\u{4e2a}\u{6e38}\u{620f}\u{5355}\u{72ec}\u{6253}\u{8865}\u{4e01}\u{3002}",
++        "launch.set.DM_PRESENT_SNAP": "\u{5e27}\u{7f13}\u{51b2}",
++        "launch.set.DM_PRESENT_SNAP.note": "\u{663e}\u{793a}\u{5ef6}\u{8fdf}\u{6700}\u{591a}\u{589e}\u{52a0}\u{4e00}\u{5e27}\u{3002}",
++        "launch.set.DM_PRESENT_UPSCALE": "\u{8d85}\u{5206}",
++        "launch.set.DM_PRESENT_UPSCALE.note": "\u{5360}\u{7528}\u{66f4}\u{591a} GPU \u{65f6}\u{95f4}\u{ff0c}\u{53ef}\u{80fd}\u{589e}\u{52a0}\u{53d1}\u{70ed}\u{3002}",
++        "launch.set.DM_PSO_MTL4": "Metal 4 \u{7ba1}\u{7ebf}",
++        "launch.set.DM_PSO_MTL4.note": "\u{4fdd}\u{7559}\u{7ba1}\u{7ebf}\u{5b58}\u{6863}\u{ff0c}\u{5360}\u{7528}\u{66f4}\u{591a}\u{5185}\u{5b58}\u{3002}",
++        "launch.set.DM_PSO_PREBUILD": "\u{9884}\u{5148}\u{6784}\u{5efa}\u{7ba1}\u{7ebf}",
++        "launch.set.DM_PSO_PREBUILD.note": "\u{9996}\u{6b21}\u{542f}\u{52a8}\u{9700}\u{8981}\u{7b49}\u{5f85}\u{51e0}\u{5206}\u{949f}\u{ff0c}\u{4ec5}\u{6b64}\u{4e00}\u{6b21}\u{3002}",
++        "launch.set.DM_RENDER_SCALE": "\u{6e32}\u{67d3}\u{6bd4}\u{4f8b}",
++        "launch.set.DM_RUMBLE": "\u{6e38}\u{620f}\u{9707}\u{52a8}",
++        "launch.set.DM_RUMBLE_GAIN": "\u{9707}\u{52a8}\u{5f3a}\u{5ea6}",
++        "launch.set.DM_RUMBLE_MIN": "\u{9707}\u{52a8}\u{4e0b}\u{9650}",
++        "launch.set.DM_SCREEN_ASPECT": "\u{753b}\u{9762}\u{6bd4}\u{4f8b}",
++        "launch.set.DM_SCREEN_ASPECT.note": "\u{6e32}\u{67d3}\u{7684}\u{50cf}\u{7d20}\u{7ea6}\u{591a}\u{56db}\u{5206}\u{4e4b}\u{4e00}\u{ff1a}\u{7a0d}\u{6162}\u{ff0c}\u{53d1}\u{70ed}\u{7a0d}\u{591a}\u{3002}",
++        "launch.set.DM_SHOW_FPS": "\u{5e27}\u{7387}\u{663e}\u{793a}",
++        "launch.set.DM_TOUCH_HAPTICS": "\u{89e6}\u{63a7}\u{53cd}\u{9988}",
++        "launch.set.DM_UPSCALER": "\u{6e38}\u{620f}\u{81ea}\u{5e26}\u{8d85}\u{5206}",
++        "ui.appFolder": "\u{672c} App \u{7684}\u{6587}\u{4ef6}\u{5939}",
++        "ui.chooseCloudFolder": "\u{5728} iCloud \u{4e91}\u{76d8}\u{4e2d}\u{9009}\u{62e9}\u{6587}\u{4ef6}\u{5939}\u{2026}",
++        "ui.chooseDifferentFolder": "\u{9009}\u{62e9}\u{5176}\u{4ed6}\u{6587}\u{4ef6}\u{5939}\u{2026}",
++        "ui.chooseDifferentLocation": "\u{9009}\u{62e9}\u{5176}\u{4ed6}\u{4f4d}\u{7f6e}\u{2026}",
++        "ui.chooseGameData": "\u{9009}\u{62e9}\u{6e38}\u{620f}\u{6570}\u{636e}\u{2026}",
++        "ui.cloudFolderNote": "\u{5728} iCloud \u{4e91}\u{76d8}\u{4e2d}\u{9009}\u{62e9}\u{4e00}\u{4e2a}\u{6587}\u{4ef6}\u{5939}\u{ff0c}\u{5e76}\u{5728} Mac App \u{7684}\u{4e91}\u{5b58}\u{6863}\u{91cc}\u{9009}\u{540c}\u{4e00}\u{4e2a}\u{6587}\u{4ef6}\u{5939}\u{3002}\u{5b58}\u{6863}\u{5728}\u{6e38}\u{620f}\u{5f00}\u{59cb}\u{65f6}\u{53d6}\u{56de}\u{ff0c}\u{6bcf}\u{6b21}\u{4fdd}\u{5b58}\u{540e}\u{9001}\u{51fa}\u{ff1b}\u{88ab}\u{66ff}\u{6362}\u{7684}\u{5b58}\u{6863}\u{4f1a}\u{7559}\u{5728} save-backups \u{91cc}\u{3002}",
++        "ui.cloudSaves": "\u{4e91}\u{5b58}\u{6863}",
++        "ui.controllerLayout": "\u{624b}\u{67c4}\u{5e03}\u{5c40}",
++        "ui.folderNotRemembered": "\u{65e0}\u{6cd5}\u{8bb0}\u{4f4f}\u{8be5}\u{6587}\u{4ef6}\u{5939}\u{3002}\u{8bf7}\u{6362}\u{4e00}\u{4e2a}\u{8bd5}\u{8bd5}\u{3002}",
++        "ui.folderUnreadable": "\u{4e4b}\u{524d}\u{9009}\u{62e9}\u{7684}\u{6587}\u{4ef6}\u{5939}\u{5df2}\u{65e0}\u{6cd5}\u{8bfb}\u{53d6}\u{3002}\u{8bf7}\u{91cd}\u{65b0}\u{9009}\u{62e9}\u{3002}",
++        "ui.gameData": "\u{6e38}\u{620f}\u{6570}\u{636e}",
++        "ui.layoutTap": "\u{89e6}\u{5c4f}",
++        "ui.locationNotRemembered": "\u{65e0}\u{6cd5}\u{8bb0}\u{4f4f}\u{8be5}\u{4f4d}\u{7f6e}\u{3002}\u{8bf7}\u{6362}\u{4e00}\u{4e2a}\u{8bd5}\u{8bd5}\u{3002}",
++        "ui.locationUnreadable": "\u{4e4b}\u{524d}\u{9009}\u{62e9}\u{7684}\u{4f4d}\u{7f6e}\u{5df2}\u{65e0}\u{6cd5}\u{8bfb}\u{53d6}\u{ff08}App \u{88ab}\u{91cd}\u{7b7e}\u{ff09}\u{3002}\u{8bf7}\u{91cd}\u{65b0}\u{9009}\u{62e9}\u{3002}",
++        "ui.memoryAvailable": "\u{53ef}\u{7528}\u{5185}\u{5b58}",
++        "ui.moreSettings": "\u{66f4}\u{591a}\u{8bbe}\u{7f6e}\u{5728}\u{5f00}\u{59cb}\u{754c}\u{9762}",
++        "ui.off": "\u{5173}",
++        "ui.pickGameDataNote": "\u{9009}\u{62e9}\u{6e38}\u{620f}\u{7684} romfs.img \u{6216} RomFS \u{6587}\u{4ef6}\u{5939}\u{2014}\u{2014}\u{5916}\u{7f6e}\u{786c}\u{76d8}\u{6216} iCloud \u{4e91}\u{76d8}\u{90fd}\u{53ef}\u{4ee5}\u{3002}App \u{4f1a}\u{8bb0}\u{4f4f}\u{4f60}\u{7684}\u{9009}\u{62e9}\u{ff1b}\u{91cd}\u{65b0}\u{7b7e}\u{540d}\u{540e}\u{4f1a}\u{518d}\u{95ee}\u{4e00}\u{6b21}\u{3002}",
++        "ui.play": "\u{5f00}\u{59cb}",
++        "ui.resetDefaults": "\u{6062}\u{590d}\u{6d4b}\u{8bd5}\u{9ed8}\u{8ba4}\u{503c}",
++        "ui.resetDefaultsNote": "\u{6062}\u{590d}\u{4e3a}\u{8be5}\u{6e38}\u{620f}\u{6d4b}\u{8bd5}\u{8fc7}\u{7684}\u{5168}\u{90e8}\u{8bbe}\u{7f6e}\u{3002}",
++        "ui.savedCloudFolder": "\u{5df2}\u{4fdd}\u{5b58}\u{3002}\u{5f00}\u{59cb}\u{6e38}\u{620f}\u{65f6}\u{4f1a}\u{4f7f}\u{7528}\u{8fd9}\u{4e2a}\u{6587}\u{4ef6}\u{5939}\u{3002}",
++        "ui.savedLocation": "\u{5df2}\u{4fdd}\u{5b58}\u{3002}\u{5f00}\u{59cb}\u{6e38}\u{620f}\u{65f6}\u{4f1a}\u{4f7f}\u{7528}\u{8fd9}\u{4e2a}\u{4f4d}\u{7f6e}\u{3002}",
++        "ui.setAtLaunch": "\u{542f}\u{52a8}\u{65f6}\u{8bbe}\u{7f6e}",
++        "ui.setByEnvFile": "\u{7531} env \u{6587}\u{4ef6}\u{8bbe}\u{7f6e}",
++        "ui.setInEnvTxt": "\u{5df2}\u{5728} env.txt \u{4e2d}\u{8bbe}\u{7f6e}",
++        "ui.setInEnvTxtInline": "\u{5df2}\u{5728} env.txt \u{4e2d}\u{8bbe}\u{7f6e}",
++        "ui.turnOffCloudSaves": "\u{5173}\u{95ed}\u{4e91}\u{5b58}\u{6863}",
++        "ui.useOwnData": "\u{6539}\u{7528}\u{672c} App \u{81ea}\u{5e26}\u{7684}\u{6570}\u{636e}",
++        "ui.version": "\u{7248}\u{672c}",
++    ]
++
++    /// The Chinese string for `key`, or `fallback` when the table does
++    /// not have it (a row this build does not know).
++    static func text(_ key: String, _ fallback: String) -> String {
++        table[key] ?? fallback
++    }
++
++    /// A section heading in Chinese. The model keeps
++    /// the English name: GameMenu.swift matches on it ("Controls"), and
++    /// the Mac settings window shares the model.
++    static func sectionName(_ english: String) -> String {
++        text("launch.section." + english, english)
++    }
++
++    /// One launcher.json row in Chinese: its label, its note (only when
++    /// the list has one; the Mac launcher does the same) and its choice
++    /// labels. A row or option the table does not know keeps its English.
++    static func localizedSetting(_ s: Setting) -> Setting {
++        let note = s.note.isEmpty ? "" : text("launch.set." + s.env + ".note", s.note)
++        let options = s.options?.map { o in
++            o.count > 1 ? [o[0], text("launch.opt." + s.env + "." + o[0], o[1])] : o
++        }
++        return Setting(env: s.env, kind: s.kind, label: text("launch.set." + s.env, s.label),
++                       note: note, def: s.def, section: s.section, needs: s.needs, level: s.level,
++                       base: s.base, options: options, min: s.min, max: s.max, step: s.step,
++                       on: s.on, off: s.off)
++    }
++
++    /// The whole list, in Chinese. Called only by the iOS launcher
++    /// (Launcher.swift dmShowLauncher): the model keeps the English
++    /// section names, so the in-game menu (GameMenu.swift) and the Mac
++    /// settings window, which share the model, are unaffected.
++    static func localizedSettings(_ settings: [Setting]) -> [Setting] {
++        settings.map(localizedSetting)
++    }
++}
+-- 
+2.43.0
+
