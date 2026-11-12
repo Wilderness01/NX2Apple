@@ -1,34 +1,47 @@
-# GitHub Mac 云主机上编 NX2Apple 的 iPhone 壳 App（shell app，带游戏库），不是单游戏 IPA
-# V1.3.14：带 0104 补丁（UW trampoline 同步持久写：calcMatrix 期间写字段且不恢复，止住 aspect 字段震荡，修全屏阴影变大闪烁）+ 0106 补丁（16:9 直方图诊断；它带的 set-nop 已被停掉，见下）+ 0110 补丁（虚拟按键换成线稿皮肤（唯一一套，无切换、无 DM_PAD_SKIN 设置项）：黑白线稿+金色弧线 12 张图标（512x512），左摇杆浮动隐藏（左半边任意区域按下即在触点冒出、跟手指走、抬手隐藏），X/ZR/R/L3/R3/十字键隐藏且输入禁掉，ZL 撞地/L 视角/Y 攻击/A/B 字母换图，+/− 齿轮换图（+/− 是圆形），新增跳跃键（=B，在菱形左侧）和拍照键（=十字键下，在跳跃左侧），齿轮菜单加“按键设置”（大小滑块 0.7–1.4 + 拖图标改位置，布局存 NSUserDefaults DmPadLineLayout，重启还在）；0110 还折进 0108 的两样东西（set-nop 停掉：iOS 代码签名不允许运行时改 __TEXT，V1.3.5 因此一开就闪退；图标打进框架 bundle 并改从框架 bundle 读）；0107 枪灰和 0109 双皮肤已从 series 去掉）。 + 0111 补丁（10 个线稿图标后面加液态玻璃圆盘：iOS 26+ 系统真玻璃 UIGlassEffect regular，26 以下回退矢量盘，跟着拖动和大小滑块走）。 + 0112 补丁（按键设置里点图标单独调大小，各存各的）。 + 0113 已移除（V1.3.14：HUD 取消——HUD 移动/调大小、HUD 设置界面、地图 ortho 放宽全删；ortho 代码已另存，地图放宽是后续独立补丁，不在这版）。 + 0114 补丁（图标大小滑块上限 3.0）。 + 0115 补丁（玻璃滑块 0–100%，70% 是现在的样子，100% 最深）。 + 0116 补丁（按键设置面板能任意拖动，位置存 NSUserDefaults，默认放左侧中部偏下、不挡右上角按键；HUD 设置面板随 0113 一并移除）。 + 0117 补丁（齿轮键进可调：第 10 个，大小和位置都能调，按键设置里点齿轮就是选中它、不开菜单）。 + 0118 补丁（HUD 自动贴边：钩 Pane::Calculate，金币/月亮左移、指南针/生命右移，偏移按屏幕比例自动算（iPhone 19.5:9 每边 +140、iPhone Duo 1.43:1 每边 −126、iPad 4:3 每边 −160、16:9 不动）；无设置、无拖动、无 HUD 设置界面；拍照键是虚拟按键、不动）。 + 工作流改动（Build game framework 步加 IOS_PULL=1：编 iOS 版 _bp 占位管线，消 log-20 两下运行时现编管线长帧（454ms/307ms）；只改工作流，不占补丁号）。 + 0119 补丁（启动器 HUD 编辑器：启动器设置里加 HUD 设置入口，预览图（森林背景，四个比例：iPhone 19.5:9、Duo 1.43:1、iPad 4:3、16:9）、金币/月亮/生命/指南针可拖动改位置、滑块调大小 60%–180%、单独隐藏（隐藏后游戏里也不显示），全部恢复自动贴边；设置存 UserDefaults DmHudManual.0–3，启动时写 DM_HUD_* 环境变量，主机 hud_manual.c 拷到状态页 +0x200，游戏侧 hud_edge.c 读到后手动设置优先于自动贴边、隐藏的推到屏外；没手动设置的继续自动贴边）。
+# GitHub Mac 云主机上编 NX2Apple 的 iPhone 单游戏 IPA（DmIOS.app），不是壳 App
+# V1.3.15：带 0104 补丁（UW trampoline 同步持久写：calcMatrix 期间写字段且不恢复，止住 aspect 字段震荡，修全屏阴影变大闪烁）+ 0106 补丁（16:9 直方图诊断；它带的 set-nop 已被停掉，见下）+ 0110 补丁（虚拟按键换成线稿皮肤（唯一一套，无切换、无 DM_PAD_SKIN 设置项）：黑白线稿+金色弧线 12 张图标（512x512），左摇杆浮动隐藏（左半边任意区域按下即在触点冒出、跟手指走、抬手隐藏），X/ZR/R/L3/R3/十字键隐藏且输入禁掉，ZL 撞地/L 视角/Y 攻击/A/B 字母换图，+/− 齿轮换图（+/− 是圆形），新增跳跃键（=B，在菱形左侧）和拍照键（=十字键下，在跳跃左侧），齿轮菜单加“按键设置”（大小滑块 0.7–1.4 + 拖图标改位置，布局存 NSUserDefaults DmPadLineLayout，重启还在）；0110 还折进 0108 的两样东西（set-nop 停掉：iOS 代码签名不允许运行时改 __TEXT，V1.3.5 因此一开就闪退；图标打进框架 bundle 并改从框架 bundle 读）；0107 枪灰和 0109 双皮肤已从 series 去掉）。 + 0111 补丁（10 个线稿图标后面加液态玻璃圆盘：iOS 26+ 系统真玻璃 UIGlassEffect regular，26 以下回退矢量盘，跟着拖动和大小滑块走）。 + 0112 补丁（按键设置里点图标单独调大小，各存各的）。 + 0113 已移除（V1.3.14：HUD 取消——HUD 移动/调大小、HUD 设置界面、地图 ortho 放宽全删；ortho 代码已另存，地图放宽是后续独立补丁，不在这版）。 + 0114 补丁（图标大小滑块上限 3.0）。 + 0115 补丁（玻璃滑块 0–100%，70% 是现在的样子，100% 最深）。 + 0116 补丁（按键设置面板能任意拖动，位置存 NSUserDefaults，默认放左侧中部偏下、不挡右上角按键；HUD 设置面板随 0113 一并移除）。 + 0117 补丁（齿轮键进可调：第 10 个，大小和位置都能调，按键设置里点齿轮就是选中它、不开菜单）。 + 0118 补丁（HUD 自动贴边：钩 Pane::Calculate，金币/月亮左移、指南针/生命右移，偏移按屏幕比例自动算（iPhone 19.5:9 每边 +140、iPhone Duo 1.43:1 每边 −126、iPad 4:3 每边 −160、16:9 不动）；无设置、无拖动、无 HUD 设置界面；拍照键是虚拟按键、不动）。 + 工作流改动（Build single-game IPA 步加 IOS_PULL=1：编 iOS 版 _bp 占位管线，消 log-20 两下运行时现编管线长帧（454ms/307ms）；只改工作流，不占补丁号）。 + 0119 补丁（启动器 HUD 编辑器：启动器设置里加 HUD 设置入口，预览图（森林背景，四个比例：iPhone 19.5:9、Duo 1.43:1、iPad 4:3、16:9）、金币/月亮/生命/指南针可拖动改位置、滑块调大小 60%–180%、单独隐藏（隐藏后游戏里也不显示），全部恢复自动贴边；设置存 UserDefaults DmHudManual.0–3，启动时写 DM_HUD_* 环境变量，主机 hud_manual.c 拷到状态页 +0x200，游戏侧 hud_edge.c 读到后手动设置优先于自动贴边、隐藏的推到屏外；没手动设置的继续自动贴边）。 + 0120 补丁（HUD 数字丢失修复：edge 表每元素槽位 2→8（32 条），4 个金币 pane 不再抢槽重初始化、偏移不再每帧漂移，数字不再被推出屏幕）。 + 0121 补丁（单游戏启动器设置页中文：LauncherText.swift 按 fork 的 l10n 表（launch.set./launch.opt./launch.section.）翻译设置行/分组/启动器文案，缺键回退英文；模型里分组名保持英文，游戏内菜单的 Controls 匹配不受影响；iPad（4:3）选项在 l10n 里没有，在此补中文）。
+# TEMPORARY（V1.3.15 这一版，补丁 0122 + 下面 DM_SKIP_SHADER_PREBUILD=1）：先跳过着色器预编译，编得快。
+#   机制：0122 给 engine 的 build_ipa_from_nsp.py 加了个门——DM_SKIP_SHADER_PREBUILD=1 时 build_shaders
+#   不跑 dmsh_build.py，改写一个 4 字节 stub metallib + 戳 + 空 c1/cb 表（0100 的做法，2026-11-09 验过）。
+#   这次构建预计约 10–15 分钟（原来约 1 小时 5 分，27,984 个着色器约 50 分钟）、产物约 30–40MB
+#   （原来约 700MB），产物名不变，还是 SuperMarioOdyssey-V1.3.15.ipa。
+#   注意：这套引擎运行时不会现编着色器，stub 装上后进游戏是黑屏，只能看启动器（HUD 设置入口、中文设置页）、
+#   验构建本身，看不了游戏里的 HUD（数字/点点/贴边）。要测游戏里 HUD 必须加回预编译。
+#   加回来（最后的完整版）：删掉下面 env 里的 DM_SKIP_SHADER_PREBUILD=1 这一行，并把 patches/series 里
+#   的 0122-ios-skip-shader-prebuild.patch 删掉、series 从 83 条回到 82 条。只删 env 那一行也行
+#   （没设这个变量，0122 的门不触发，照样全量预编译），但干净做法是两处一起删。
 # 放到 Wilderness01/NX2Apple 的 .github/workflows/build-shell-mac.yml
 # 手动触发：两个 Google Drive 文件 ID 有默认值，prod.keys 走 GitHub Secret，绝不进仓库、不进日志。
 #
-# 做法依据（2026-11-07 已核对 README + frontend 源码）：
+# 做法依据（2026-11-07 已核对 README + frontend 源码；V1.3.15 起只编单游戏版，见下）：
 #   单游戏 IPA 是 engine/scripts/build_ipa_from_nsp.py 不带 --shell-framework 的产物，
-#   打开就是单个游戏，没有游戏库。README 说的 iPhone App 是壳 App：
-#   每个游戏用 --shell-framework 编成 DmGame<TitleID>.framework，
-#   再用 engine/dm/ios/tools/build_shell.sh --prepare-xcode 生成 DmShell 工程，
-#   xcodebuild 编出壳 App（scheme DmShell，bundle id org.nxnative.shell），
-#   未签名打包成 SuperMarioOdyssey-V1.3.14.ipa（ShellExport.swift 的导出做法：CODE_SIGNING_ALLOWED=NO，
-#   可执行文件用 Gen/DmShell.entitlements 做 ad-hoc 签名，zip 成 Payload/*.app）。
-#   游戏数据 romfs.img 仍在包外，装好后拷到壳 App 的 Documents/games/0100000000010000/ 里。
+#   打开就是单个游戏，没有游戏库，bundle id 是 org.nxnative.0100000000010000（默认）。
+#   V1.3.15 起不再编壳 App：不再用 --shell-framework 编游戏 framework，
+#   不再跑 build_shell.sh 编 DmShell.app，不再打包壳 App。
+#   用 --romfs separate：romfs.img 不打进 IPA（包外，约 5.68GB，已在手机上），
+#   IPA 只含代码 + 预编译着色器，约 700MB；装好后把 romfs.img 和存档拷到
+#   单游戏 App 的 Documents/games/0100000000010000/ 里（见迁移步骤）。
+#   未签名 IPA：build_ipa_from_nsp.py -o 直接出 SuperMarioOdyssey-V1.3.15.ipa（未签名，
+#   老大自己用 AltStore / SideStore 装）。
 # 游戏：0100000000010000，两个 NSP 文件（2026-11-06 20:25 核对，谷歌云盘已设 Anyone with the link）：
 #   本体 SUPER MARIO ODYSSEY [0100000000010000] [v0].nsp，5,611,007,028 字节
 #   更新 SUPER MARIO ODYSSEY [0100000000010800] [v393216].nsp，397,296,416 字节
 #
 # 限制：
-# 1. 云主机上没有配对的 iPhone，做不了签名 + 安装；跑完拿到的是未签名 SuperMarioOdyssey-V1.3.14.ipa，
-#    老大自己用 AltStore / SideStore 装。壳 App 的 bundle id 是 org.nxnative.shell，
-#    和之前那个单游戏 App（org.nxnative.0100000000010000）是两个 App，互不覆盖。
-# 2. GitHub 单次任务最长 6 小时；framework 那步要重编 shader（云主机是临时的，没缓存），
-#    上次单游戏版 Build IPA 用了约 1 小时，这次差不多。
-# 3. 壳 App 跟随手机系统语言（英文或简体中文）；游戏内语言在壳里每个游戏的设置里改，
+# 1. 云主机上没有配对的 iPhone，做不了签名 + 安装；跑完拿到的是未签名 SuperMarioOdyssey-V1.3.15.ipa，
+#    老大自己用 AltStore / SideStore 装。单游戏 App 的 bundle id 是 org.nxnative.0100000000010000，
+#    和壳 App（org.nxnative.shell）是两个 App，互不覆盖；装单游戏版不会动壳 App，
+#    壳 App 删不删随老大，存档拷过去确认能玩再删壳 App。
+# 2. GitHub 单次任务最长 6 小时；编 IPA 那步要重编 shader（云主机是临时的，没缓存），
+#    上次单游戏版 Build IPA 用了约 1 小时。这次临时跳过着色器预编译（0122，见上），
+#    预计约 10–15 分钟；最后加回预编译的完整版，恢复约 1 小时。
+# 3. 单游戏 App 的设置页已改中文（0121 补丁）；游戏内语言在设置页的游戏语言里改（已是简体中文），
 #    或在 Documents/env.txt 写 DM_LANG=zh-Hans。
 # 4. 谷歌云盘上传已去掉（2026-11-08）：最后一步不再往谷歌云盘传 IPA，
-#    跑完只出 GitHub Artifacts（SuperMarioOdyssey-V1.3.14），老大直接从那下载。
+#    跑完只出 GitHub Artifacts（SuperMarioOdyssey-V1.3.15），老大直接从那下载。
 #    原因：服务账号自己没有云盘存储空间，rclone 会报 403 storageQuotaExceeded，
 #    且 GDRIVE_SA_KEY 已删。NSP 输入仍从谷歌云盘下载（gdown），那步不动。
-name: Build NX2Apple shell app (iPhone, manual)
+name: Build NX2Apple single-game IPA (iPhone, manual)
 
 on:
   workflow_dispatch:
@@ -59,7 +72,6 @@ jobs:
           set -euo pipefail
           python3 tools/engine.py sync
           du -sh engine
-          test -x engine/dm/ios/tools/build_shell.sh
 
       - name: Install build tools
         run: |
@@ -101,61 +113,41 @@ jobs:
         run: |
           set -euo pipefail
           # runner 上没有 Metal Toolchain 时，build.py 的 metal_check.py 会报错，
-          # 先装上再编，否则编 framework 一启动就失败。
+          # 先装上再编，否则编 IPA 一启动就失败。
           if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
             sudo xcodebuild -downloadComponent MetalToolchain
           fi
           xcrun -sdk macosx metal --version
 
-      - name: Build game framework
+      - name: Build single-game IPA
         env:
           IOS_PULL: "1"
+          # TEMPORARY（V1.3.15 这一版）：跳过着色器预编译（0122 的门）。删掉这一行、并把
+          # patches/series 里的 0122 删掉，即恢复全量预编译（最后的完整版）。
+          DM_SKIP_SHADER_PREBUILD: "1"
         run: |
           set -euo pipefail
           source .venv/bin/activate
           # UW 超宽屏的 env（0098 补丁的 uw.c 要读这些，不设则 UW 静默不生效）：
-          # --env-file 把它们烘进 framework 的 dm/env.txt，装上即用。
+          # --env-file 把它们烘进 IPA 的 dm/env.txt，装上即用。
           printf '%s\n' 'DM_ASPECT=auto' 'DM_UW_NOPATCH=1' 'DM_UW_CAM=0x136f550,0x13540e8' 'DM_UW_VTSLOT=13' 'DM_UW_UI=6' 'DM_UW_ORTHO_MODE=widen' > "$RUNNER_TEMP/uw-env.txt"
-          # 带 --shell-framework：只编游戏的 framework，不出单游戏 IPA。
-          # framework 写在 $RUNNER_TEMP/shell-framework/DmGame<TitleID>.framework
-          python3 engine/scripts/build_ipa_from_nsp.py "$RUNNER_TEMP/game" -k "$RUNNER_TEMP/prod.keys" --shell-framework "$RUNNER_TEMP/shell-framework" --env-file "$RUNNER_TEMP/uw-env.txt"
-          find "$RUNNER_TEMP/shell-framework" -maxdepth 1 -name 'DmGame*.framework' -exec ls -ld {} \;
-
-      - name: Build shell app
-        env:
-          SHELL_DIR: ${{ runner.temp }}/shell
-          DM_SHELL_FRAMEWORKS: ${{ runner.temp }}/shell-framework/DmGame0100000000010000.framework
-          DM_BUNDLE_ID: org.nxnative.shell
-        run: |
-          set -euo pipefail
-          # build_shell.sh --build：生成 DmShell 工程并用 xcodebuild 编出未签名的壳 App。
-          # DM_SHELL_PACKAGE 用仓库根目录的 frontend-ios（engine 里没有这个包）。
-          export DM_SHELL_PACKAGE="$PWD/frontend-ios"
-          export FONT_PY="$PWD/.venv/bin/python"
-          bash engine/dm/ios/tools/build_shell.sh --build
-          ls -lh "$SHELL_DIR/dd/Build/Products/Release-iphoneos/DmShell.app"
-
-      - name: Pack shell IPA
-        env:
-          SHELL_DIR: ${{ runner.temp }}/shell
-        run: |
-          set -euo pipefail
-          mkdir -p out/stage/Payload
-          APP="$SHELL_DIR/dd/Build/Products/Release-iphoneos/DmShell.app"
-          # 未签名的 App 没有签名来带 entitlements（Increased Memory Limit），
-          # 给可执行文件做 ad-hoc 签名把 entitlements 带上，AltStore 装时会替换并保留。
-          /usr/bin/xattr -cr "$APP/DmShell"
-          /usr/bin/codesign --force --sign - --entitlements "$SHELL_DIR/Gen/DmShell.entitlements" "$APP/DmShell"
-          cp -R "$APP" out/stage/Payload/
-          ditto -c -k --sequesterRsrc --keepParent out/stage/Payload out/SuperMarioOdyssey-V1.3.14.ipa
+          # V1.3.15 起只编单游戏 IPA，不再编壳 App：不带 --shell-framework（那是给壳 App 编游戏 framework 的），
+          # 不再跑 build_shell.sh。--romfs separate：romfs.img 不打进 IPA（包外，约 5.68GB，已在手机上），
+          # IPA 只含代码 + 着色器（这次临时跳过预编译，是 4 字节 stub，约 30–40MB；
+          # 完整版是预编译着色器，约 700MB）；装好后把 romfs.img 和存档拷到
+          # 单游戏 App 的 Documents/games/0100000000010000/ 里（见迁移步骤）。
+          # -o 直接指定产物名（默认是 SuperMarioOdyssey.ipa，写在 NSP 文件夹里）。
+          mkdir -p out
+          python3 engine/scripts/build_ipa_from_nsp.py "$RUNNER_TEMP/game" -k "$RUNNER_TEMP/prod.keys" --romfs separate --env-file "$RUNNER_TEMP/uw-env.txt" -o "$PWD/out/SuperMarioOdyssey-V1.3.15.ipa"
+          test -f out/SuperMarioOdyssey-V1.3.15.ipa
           # 2026-11-07 只出 IPA 版：不再把磁盘上的 RomFS.img 拷到 out/ 里（不上传，runner 销毁即丢弃）。
           ls -lh out/
 
-      - name: Upload shell IPA
+      - name: Upload single-game IPA
         uses: actions/upload-artifact@v4
         with:
-          name: SuperMarioOdyssey-V1.3.14
-          path: "out/SuperMarioOdyssey-V1.3.14.ipa"
+          name: SuperMarioOdyssey-V1.3.15
+          path: "out/SuperMarioOdyssey-V1.3.15.ipa"
           if-no-files-found: error
 
       # 2026-11-07 只出 IPA 版：romfs.img 不再上传（已验证的那份留在老大手机上）。
