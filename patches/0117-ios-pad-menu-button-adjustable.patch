@@ -1,0 +1,149 @@
+From 4ec86c03163ec3a8d208adec3e3ff096a5829889 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Thu, 12 Nov 2026 00:00:35 +0000
+Subject: [PATCH] Pad: the menu (gear) button is adjustable in the button
+ editor (0117)
+
+The gear was fixed and hidden while the button editor was open, so it
+could not be picked. It is now the 10th movable control (E_MENU):
+visible in the button editor, tap it to select it, drag it to move it,
+and the size slider tunes it like the rest. Its size and offset are
+stored in DmPadLineLayout under "menu", next to the other nine, so an
+old save keeps the gear exactly where and how it was.
+
+menuTakes returns NO while the button editor is open, so the touch
+falls through to the pad and editTouchBegan picks the gear up instead
+of opening the menu. The gear stays hidden in the HUD editor, where it
+has no role. Its glass disc follows _menu.hidden, so it shows in the
+button editor as before.
+---
+ dm/ios/Sources/DmGamepad.m | 31 ++++++++++++++++++-------------
+ 1 file changed, 18 insertions(+), 13 deletions(-)
+
+diff --git a/dm/ios/Sources/DmGamepad.m b/dm/ios/Sources/DmGamepad.m
+index 26853f0..20ea7a0 100644
+--- a/dm/ios/Sources/DmGamepad.m
++++ b/dm/ios/Sources/DmGamepad.m
+@@ -49,10 +49,10 @@
+ #import "DmGameMenu.h"
+ 
+ enum { B_A = 0, B_B, B_X, B_Y, B_LS, B_RS, B_L, B_R, B_ZL, B_ZR, B_PLUS, B_MINUS, B_LEFT, B_UP, B_RIGHT, B_DOWN, B_N };
+-enum { E_A = 0, E_B, E_Y, E_ZL, E_L, E_MINUS, E_PLUS, E_JUMP, E_PHOTO, E_N };   // the movable controls (the button editor); others are hidden (X, ZR, R, L3, R3, D-pad), fixed (the menu) or floating (the stick)
++enum { E_A = 0, E_B, E_Y, E_ZL, E_L, E_MINUS, E_PLUS, E_JUMP, E_PHOTO, E_MENU, E_N };   // the movable controls (the button editor), the menu included (0117); others are hidden (X, ZR, R, L3, R3, D-pad) or floating (the stick)
+ enum { G_A = 0, G_B, G_Y, G_ZL, G_L, G_PLUS, G_MINUS, G_JUMP, G_PHOTO, G_MENU, G_N };   // the controls with a glass disc behind them (0111)
+-static NSString *const k_lineEditKeys[E_N] = {@"a", @"b", @"y", @"zl", @"l", @"minus", @"plus", @"jump", @"photo"};   // the NSUserDefaults offsets' keys
+-static NSString *const k_lineEditNames[E_N] = {@"A键", @"B键", @"攻击键", @"撞地键", @"视角键", @"+键", @"−键", @"跳跃键", @"拍照键"};   // the editor's name for the selected icon
++static NSString *const k_lineEditKeys[E_N] = {@"a", @"b", @"y", @"zl", @"l", @"minus", @"plus", @"jump", @"photo", @"menu"};   // the NSUserDefaults offsets' keys
++static NSString *const k_lineEditNames[E_N] = {@"A键", @"B键", @"攻击键", @"撞地键", @"视角键", @"+键", @"−键", @"跳跃键", @"拍照键", @"设置键"};   // the editor's name for the selected icon
+ static NSString *const k_hudEditKeys[4] = {@"compass", @"life", @"coins", @"moons"};   // the HUD editor's NSUserDefaults keys (the order is hud_calc.c's: 0 compass, 1 life, 2 coins, 3 moons)
+ static NSString *const k_hudEditNames[4] = {@"指南针（右栏）", @"生命值", @"金币", @"月亮"};   // the editor's name for the selected HUD panel (0 is the whole right strip: compass, life ring and guide text together)
+ enum { C_NONE = 0, C_STICK, C_DPAD, C_FACE, C_BTN, C_GAME };   // which control a touch holds; C_GAME: none, the touch goes to the game's touch screen (finger slot << 8)
+@@ -496,6 +496,7 @@ static int lockedKey(int c) {   // DmPadGeometry.h's control → the key it pres
+                  case DM_PAD_C_MINUS: return B_MINUS; case DM_PAD_C_PLUS: return B_PLUS; case DM_PAD_C_L3: return B_LS; default: return B_RS; }
+ }
+ - (BOOL)menuTakes:(CGPoint)p {   // the menu button takes a touch in its hit circle unless a locked key's target is nearer (the drawn keys are hidden in Tap and with a controller)
++    if (_editing) return NO;   // the button editor is open: the touch falls through to the pad, where editTouchBegan picks the gear up as a movable control (0117)
+     if (dm_pad_menu_distance(self.geo, p) > 1) return NO;
+     if (_tap || _padOff || (_layout.separated && !CGRectContainsPoint(_layout.controls, p))) return YES;
+     return dm_pad_menu_takes(self.geo, _full, _layout.separated, p);
+@@ -722,7 +723,7 @@ static CGRect growRect(CGRect r, CGFloat fill) {   // grow a rect about its cent
+         default: return squareFrame(self.menuCenter, 2 * self.geo->swapR);
+     }
+ }
+-- (BOOL)glassHidden:(int)g {   // the glass follows its control: hidden with it in the Tap layout, and with the menu while the editor is open
++- (BOOL)glassHidden:(int)g {   // the glass follows its control: hidden with it in the Tap layout, and with the menu while the HUD editor is open
+     CALayer *icon = [self glassIconLayer:g];
+     return icon ? icon.hidden : _menu.hidden;
+ }
+@@ -789,8 +790,8 @@ static BOOL g_hintShown;   // once per launch
+ // the selected icon only; a missing size falls back to the legacy global "scale", then 1) and
+ // each dragged control's offset in points from its built-in centre, so it survives a restart
+ // and works in every orientation. X, ZR, R, L3, R3 and the D-pad are hidden and disabled
+-// (applyLayout, recompute, touchesBegan); the menu is fixed; the left stick floats, so it has
+-// no stored position. The extra buttons anchor on the diamond's centre and gap, so they follow
++// (applyLayout, recompute, touchesBegan); the menu is adjustable like the rest
++// (0117); the left stick floats, so it has no stored position. The extra buttons anchor on the diamond's centre and gap, so they follow
+ // its layout. With an offset, the dragged face key falls out of the diamond's shared test and
+ // is hit-tested on its own (faceSplit, dm_pad_hit).
+ - (CGPoint)lineOffset:(NSString *)name { NSValue *v = _lineOffsets[name]; return v ? v.CGPointValue : CGPointZero; }   // the editor's drag offset for a control, or none
+@@ -812,12 +813,14 @@ static BOOL g_hintShown;   // once per launch
+     // the biggest key's hit circle, so the shared test still routes it to the diamond and
+     // faceAt: then picks the key by its own radius.
+     // The drop keys and the pills have their own slots, so they scale there. The stick, the
+-    // knob, the menu and L3 / R3 are not adjustable, so they keep the legacy global size.
++    // knob and L3 / R3 are not adjustable, so they keep the legacy global size.
+     CGFloat s = _lineScale;
+     CGFloat maxFace = fmax(_lineSizes[E_A], fmax(_lineSizes[E_B], _lineSizes[E_Y]));
+     g->faceHitR = fmax(g->faceHitR, g->faceR * 1.25 * maxFace);   // the diamond's hit radius, so dm_pad_hit's face test covers the biggest key (lineFaceHitR uses the built-in radius, so this is not scaled twice)
+     g->dropR[DM_PAD_ZL] *= _lineSizes[E_ZL]; g->dropR[DM_PAD_L] *= _lineSizes[E_L];
+-    g->clickR *= s; g->stickR *= s; g->knobR *= s; g->swapR *= s;
++    g->clickR *= s; g->stickR *= s; g->knobR *= s;
++    g->swapR *= _lineSizes[E_MENU];   // the menu button's own size (0117): never the legacy global, its stored size falls back to it on an old save (loadLineLayout)
++    CGPoint mo = [self lineOffset:@"menu"]; g->swap.x += mo.x; g->swap.y += mo.y;   // the menu button's drag offset (0117): menuCenter, the frame, the glass and menuTakes all follow it
+     for (int i = 0; i < 2; i++) { CGFloat ps = _lineSizes[i == DM_PAD_MINUS ? E_MINUS : E_PLUS]; CGRect r = g->pill[i]; CGFloat w = r.size.width * ps, h = r.size.height * ps; g->pill[i] = CGRectMake(CGRectGetMidX(r) - w / 2, CGRectGetMidY(r) - h / 2, w, h); }
+     static const int faceMoved[] = {0, 1, 3}; static NSString *const faceNames[] = {@"a", @"b", @"y"};   // faceKey[] is A B X Y
+     BOOL split = NO;
+@@ -1084,7 +1087,7 @@ static const CGFloat k_panel_default[2][2] = {{0.30, 0.58}, {0.30, 0.56}};   //
+     _glassSlider.frame = CGRectMake(48, 40, w - 48 - 12, 20);
+     UIView *hint = [_editBar viewWithTag:304]; hint.frame = CGRectMake(0, 66, w, 34);
+ }
+-- (void)openPadSettings {   // the in-game menu's "按键设置": hide the gear (it cannot be tapped now), show the editor
++- (void)openPadSettings {   // the in-game menu's "按键设置": the gear stays visible and can be picked (0117), show the editor
+     if (_padOff || _editing) return;
+     [self reset];   // release every key and touch first, as the menu does
+     _editing = YES;
+@@ -1145,7 +1148,7 @@ static const CGFloat k_panel_default[2][2] = {{0.30, 0.58}, {0.30, 0.56}};   //
+         case E_A: return _key[B_A].hidden; case E_B: return _key[B_B].hidden; case E_Y: return _key[B_Y].hidden;
+         case E_ZL: return _key[B_ZL].hidden; case E_L: return _key[B_L].hidden;
+         case E_MINUS: return _key[B_MINUS].hidden; case E_PLUS: return _key[B_PLUS].hidden;
+-        case E_JUMP: return _jump.hidden; default: return _photo.hidden;
++        case E_JUMP: return _jump.hidden; case E_MENU: return _menu.hidden; default: return _photo.hidden;
+     }
+ }
+ - (CGFloat)editDrawnR:(int)e {   // the selected icon's drawn radius (the highlight rings this, not the hit circle)
+@@ -1153,6 +1156,7 @@ static const CGFloat k_panel_default[2][2] = {{0.30, 0.58}, {0.30, 0.56}};   //
+         case E_A: return [self lineFaceR:B_A]; case E_B: return [self lineFaceR:B_B]; case E_Y: return [self lineFaceR:B_Y];
+         case E_ZL: return [self dropR:B_ZL]; case E_L: return [self dropR:B_L];
+         case E_MINUS: case E_PLUS: return [self linePillRFor:e];
++        case E_MENU: return self.geo->swapR;   // the menu button's drawn radius (0117)
+         default: return [self lineExtraRFor:e];
+     }
+ }
+@@ -1162,7 +1166,7 @@ static const CGFloat k_panel_default[2][2] = {{0.30, 0.58}, {0.30, 0.56}};   //
+         case E_ZL: return [self dropCenter:B_ZL]; case E_L: return [self dropCenter:B_L];
+         case E_MINUS: { CGRect r = [self pillRect:B_MINUS]; return CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r)); }
+         case E_PLUS: { CGRect r = [self pillRect:B_PLUS]; return CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r)); }
+-        case E_JUMP: return [self jumpCenter]; default: return [self photoCenter];
++        case E_JUMP: return [self jumpCenter]; case E_MENU: return [self menuCenter]; default: return [self photoCenter];
+     }
+ }
+ - (CGFloat)editRadius:(int)e {   // a movable control's hit radius, in points
+@@ -1170,6 +1174,7 @@ static const CGFloat k_panel_default[2][2] = {{0.30, 0.58}, {0.30, 0.56}};   //
+         case E_A: return [self lineFaceHitR:B_A]; case E_B: return [self lineFaceHitR:B_B]; case E_Y: return [self lineFaceHitR:B_Y];
+         case E_ZL: return [self dropR:B_ZL]; case E_L: return [self dropR:B_L];
+         case E_MINUS: case E_PLUS: return [self linePillRFor:e];
++        case E_MENU: return MAX(self.geo->swapR * 1.6, 22);   // the menu button's hit radius, the same formula as dm_pad_menu_hit_r (0117)
+         default: return [self lineExtraRFor:e];   // jump and photo
+     }
+ }
+@@ -1253,7 +1258,7 @@ static const CGFloat k_panel_default[2][2] = {{0.30, 0.58}, {0.30, 0.56}};   //
+     _hudSlider.frame = CGRectMake(48, 40, w - 48 - 12, 20);
+     UIView *hint = [_hudEditBar viewWithTag:316]; hint.frame = CGRectMake(0, 66, w, 18);
+ }
+-- (void)openHudSettings {   // the in-game menu's "HUD 设置": hide the gear (it cannot be tapped now), show the editor
++- (void)openHudSettings {   // the in-game menu's "HUD 设置": hide the gear (it has no role in the HUD editor), show the editor
+     if (_padOff || _hudEditing || _editing) return;
+     [self reset];   // release every key and touch first, as the menu does
+     _hudEditing = YES;
+@@ -1413,7 +1418,7 @@ static BOOL pads_slotted(GCController *gone) {
+ }
+ - (void)updateControlVisibility {
+     _controls.hidden = _padOff;
+-    _menu.hidden = _editing || _hudEditing || (_padOff && _layout.onTV);   // the gear stays hidden while an editor is open
++    _menu.hidden = _hudEditing || (_padOff && _layout.onTV);   // the gear stays visible in the button editor (it is adjustable now, 0117); hidden only in the HUD editor
+     [self syncGlassVisibility];   // the glass hides with the whole touch pad while a controller is in use
+ }
+ - (void)padsChanged:(NSNotification *)note {
+-- 
+2.43.0
+
