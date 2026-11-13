@@ -83,3 +83,6 @@
 0122-ios-skip-shader-prebuild.patch
 0123-ios-hud-editor-mockup.patch
 0124-ios-msl-separate.patch
+0125-ios-hud-editor-fit-screen.patch
+0126-ios-hud-edge-fix.patch
+0127-ios-hud-six-elements.patch

@@ -1,0 +1,90 @@
+From 77e71aedc04602005d69530762fb955d95788829 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Fri, 13 Nov 2026 00:18:02 +0000
+Subject: [PATCH] 0125: fit the HUD editor preview inside the screen
+ (auto-scale on every shape)
+
+---
+ dm/ios/Sources/HudEditor.swift | 49 ++++++++++++++++++++++++++++++----
+ 1 file changed, 44 insertions(+), 5 deletions(-)
+
+diff --git a/dm/ios/Sources/HudEditor.swift b/dm/ios/Sources/HudEditor.swift
+index 1cb768e..e836ce2 100644
+--- a/dm/ios/Sources/HudEditor.swift
++++ b/dm/ios/Sources/HudEditor.swift
+@@ -579,9 +579,43 @@ struct HudEditorView: View {
+         settings.set(el, cur)
+     }
+ 
++    // The preview's size, fitted inside the screen (0125): it must be fully
++    // visible -- never cut off -- on every shape, in portrait and in
++    // landscape. Before this the preview took the full width
++    // (.frame(maxWidth: .infinity) + .aspectRatio(..., .fit)), so its height
++    // was width / ratio: in landscape on an iPhone the iPad 4:3 preview was
++    // ~675pt tall in a ~386pt viewport, and the top (coins) and the bottom
++    // were cut off; only the widest (iPhone 19.5:9) shape fitted. Now the size
++    // is the aspect rect fitted inside the available box: the width is the
++    // container width minus the VStack's horizontal padding, the height is the
++    // container height minus a reserve for the aspect picker and a peek of the
++    // element list below the preview (the rest of the list and the controls
++    // scroll), and the preview takes the smaller of the width-constrained and
++    // height-constrained sizes, so neither dimension overflows. The device
++    // frame scales with the preview (it is drawn on the same box), and the HUD
++    // elements scale with the preview width (unit = preview.width / 100), so
++    // the layout, drag, resize and hide behaviour are unchanged -- only the
++    // overall scale changes. The container is read with a GeometryReader
++    // outside the ScrollView (inside one it would see an unbounded height),
++    // so a rotation re-fits the preview.
++    private static func fittedPreviewSize(aspect: HudAspect, container: CGSize) -> CGSize {
++        let availW = max(0, container.width - 32)
++        let availH = max(0, container.height - 120)
++        let w = min(availW, availH * CGFloat(aspect.ratio))
++        return CGSize(width: w, height: w / CGFloat(aspect.ratio))
++    }
++
+     var body: some View {
+         NavigationStack {
+-            ScrollView {
++            // The container (the viewport below the navigation bar) is read
++            // here, outside the ScrollView: a GeometryReader inside the
++            // ScrollView would see an unbounded height and could not bound
++            // the preview. previewSize is the aspect rect fitted inside it
++            // (fittedPreviewSize), so the preview is fully visible on every
++            // shape; a rotation re-fits it.
++            GeometryReader { outer in
++                let previewSize = Self.fittedPreviewSize(aspect: aspect, container: outer.size)
++                ScrollView {
+                 VStack(alignment: .leading, spacing: 16) {
+                     // The preview, at the chosen shape, in the mockup's device
+                     // frame: a thick black rounded border (1.1% of the preview
+@@ -664,7 +698,11 @@ struct HudEditorView: View {
+                         .overlay(RoundedRectangle(cornerRadius: 26).strokeBorder(Color(red: 20 / 255, green: 24 / 255, blue: 28 / 255), lineWidth: border))
+                         .shadow(color: Color(red: 24 / 255, green: 42 / 255, blue: 22 / 255).opacity(0.16), radius: 38, x: 0, y: 16)
+                     }
+-                    .aspectRatio(aspect.ratio, contentMode: .fit)
++                    // Fixed to the fitted size (0125): the preview is the
++                    // aspect rect inside the viewport, never wider or taller
++                    // than it. The outer .frame(maxWidth: .infinity) centres
++                    // it in the VStack when it is narrower than the screen.
++                    .frame(width: previewSize.width, height: previewSize.height)
+                     .frame(maxWidth: .infinity)
+ 
+                     // The four shapes: switching shape moves the auto-anchored
+@@ -745,10 +783,11 @@ struct HudEditorView: View {
+                     }
+                 }
+                 .padding()
++                }
++                .navigationTitle("HUD 设置")
++                .navigationBarTitleDisplayMode(.inline)
++                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("完成") { dismiss() } } }
+             }
+-            .navigationTitle("HUD 设置")
+-            .navigationBarTitleDisplayMode(.inline)
+-            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("完成") { dismiss() } } }
+         }
+     }
+ }
+-- 
+2.43.0
+

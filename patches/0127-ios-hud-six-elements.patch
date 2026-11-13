@@ -1,0 +1,584 @@
+From eb27f06afa55934ab600fd70fae133fbf2933a9c Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Fri, 13 Nov 2026 00:46:06 +0000
+Subject: [PATCH 2/2] 0127: split the two kinds of coins into two HUD elements
+ (6 total), drop the white bar
+
+Coins, regional coins and moons are three separately adjustable groups now
+(the player: the hexagon + 020 is a second kind of coins, the dots are the
+moons). Regional coins is element 5 (appended: raw values 0-4 never change,
+so saved settings survive); the state page grows to 18 floats and the
+manual/hidden masks move to +0x248/+0x24C. The white bar under the counts
+is gone from the editor (it has no matching pane in the game, a texture) --
+not drawn, belongs to no group. All preview icons, the background, the
+device frame, layout, fonts and colours are unchanged (0127 moves the
+hexagon drawing verbatim, it does not redraw it). Compass/hints: not the
+slot root cause (two panes each, within slots); their auto-edge and manual
+paths are verified in the host test, and the hints pane name (TxtGuide01)
+is still the unproven identification from 0123.
+---
+ dm/games/0100000000010000/hud_edge.c |  50 ++++++------
+ dm/games/0100000000010000/patches.py | 102 +++++++++++++------------
+ dm/host/hud_manual.c                 |  28 ++++---
+ dm/host/hud_manual.h                 |   8 +-
+ dm/ios/Sources/HudEditor.swift       | 109 ++++++++++++++++-----------
+ 5 files changed, 164 insertions(+), 133 deletions(-)
+
+diff --git a/dm/games/0100000000010000/hud_edge.c b/dm/games/0100000000010000/hud_edge.c
+index 42fb47e..62a84aa 100644
+--- a/dm/games/0100000000010000/hud_edge.c
++++ b/dm/games/0100000000010000/hud_edge.c
+@@ -1,11 +1,11 @@
+-// hud_edge.c -- Super Mario Odyssey HUD edge anchor + launcher manual settings (0118 + 0119 + 0120 + 0123 + 0126).
++// hud_edge.c -- Super Mario Odyssey HUD edge anchor + launcher manual settings (0118 + 0119 + 0120 + 0123 + 0126 + 0127).
+ //
+ // The game's HUD (coins, moons, compass, lives, hints) is laid out for a 1280x720
+ // (16:9) screen, so on a wider screen (iPhone 19.5:9) it sits inset from the
+ // edges, and on a narrower screen (iPhone Duo 1.43:1, iPad 4:3) it would be
+ // cut off at the edges. By default this hook pushes the HUD to the screen
+ // edges, automatically adapting to the screen aspect (0118): the left widgets
+-// (coins, moons) move left on a wider screen and right on a narrower one; the
++// (coins, regional coins, moons) move left on a wider screen and right on a narrower one; the
+ // right widgets (compass, lives, hints) move right on a wider screen and left
+ // on a narrower one. A manual setting made in the launcher's HUD editor (0119)
+ // overrides the automatic edge anchor for that element: it is moved, resized
+@@ -58,7 +58,7 @@
+ // it never reads a pane name and never decides a match.
+ //
+ // A moved pane's original matrix is stored in a small table (state +0x300,
+-// 80 128-byte entries, sixteen per element -- up to sixteen layout instances can
++// 96 128-byte entries, sixteen per element -- up to sixteen layout instances can
+ // match the same element) and the modified matrix is always re-derived from that
+ // original, so a fixed offset never accumulates into a drift, and a game
+ // recompute (an animation, a count change, a layout reload) is followed by
+@@ -103,9 +103,10 @@
+ // a 452x38 line under the guide text), so whether it follows the coins in
+ // the game depends on its parent, which the available logs do not show --
+ // it may stay where the game put it (a known limitation, 0123).
+-// The moon icon and number (PicIconSh / PicIcon / TxtTotalShine under a
+-// 'Counter') belong to the COINS element (0123 regrouping, per the launcher
+-// editor: the hexagon icon + 020 move with the coins), and the moons element
++// The regional-coins icon and number (PicIconSh / PicIcon / TxtTotalShine under a
++// 'Counter') are their OWN element (0127: the player splits the two kinds of
++// coins into two separately adjustable groups -- coins = the coin icon + number,
++// regional coins = the hexagon icon + number, moons = the dots). The moons element
+ // is the 'Counter' group itself (which carries the dots). A bare
+ // 'TxtTotalShine' whose parent is NOT a 'Counter' stays the moons fallback.
+ // 'PicIcon' also appears elsewhere (the lives cluster, the cursor group),
+@@ -120,24 +121,24 @@
+ // dropped into the rewriter's patch area verbatim:
+ //   x0 = the pane (nn::ui2d::Pane *), x1 = the aspect (state + 0x58: a float,
+ //   the screen's width / height; 0 = 16:9), x2 = the edge table (state +
+-//   0x300: 40 128-byte entries, eight per HUD element), x3 = the manual
+-//   settings (state + 0x200: 15 floats, a u32 manual mask, a u32 hidden
++//   0x300: 96 128-byte entries, sixteen per HUD element), x3 = the manual
++//   settings (state + 0x200: 18 floats, a u32 manual mask, a u32 hidden
+ //   mask; a NULL pointer reads as no manual setting).
+ //   Element order: 0 compass (right), 1 lives (right), 2 coins (left),
+-//   3 moons (left), 4 hints (right). The state page starts zeroed, so a table entry with
++//   3 moons (left), 4 hints (right), 5 regional coins (left). The state page starts zeroed, so a table entry with
+ //   pane == 0 is unused.
+ 
+ typedef unsigned int u32;
+ typedef unsigned long uintptr_t;
+ 
+-#define HUD_EDGE_N 5
++#define HUD_EDGE_N 6
+ #define HUD_EDGE_ENTRY 128         // bytes per table entry
+ #define HUD_EDGE_SLOTS_PER_ELEM 16  // table slots per HUD element: up to sixteen layout instances can match the same element (log-20 shows TEN panes matching coins -- 2x TxtCounterSh + 2x TxtCounter + 2x PicIconSh + 2x PicIcon + 2x TxtTotalShine, two Counter groups; eight slots thrashed and the re-init re-derived the original from an already-modified matrix, so the offset drifted off-screen -- 0126; 0120 raised it 2 -> 8 for the four number panes alone)
+ 
+ // The manual settings block (state +0x200), as the host writes it.
+-#define HUD_MANUAL_FLOATS 15       // dx, dy, k per element (5 elements)
+-#define HUD_MANUAL_MASK_OFF 64     // byte offset of the manual mask (+0x240; the 15 floats end at +0x23B, 4 bytes of padding follow)
+-#define HUD_HIDDEN_MASK_OFF 68     // byte offset of the hidden mask (+0x244)
++#define HUD_MANUAL_FLOATS 18       // dx, dy, k per element (6 elements)
++#define HUD_MANUAL_MASK_OFF 72     // byte offset of the manual mask (+0x248; the 18 floats end at +0x247)
++#define HUD_HIDDEN_MASK_OFF 76     // byte offset of the hidden mask (+0x24C)
+ 
+ // A hidden element is pushed this far off-screen (0113 hid its guide text
+ // the same way: a pane already past 5000 is off-screen). The layout is at
+@@ -462,13 +463,14 @@ void hud_edge(void *pane, const float *aspect_ptr, void *table, const float *par
+     // 'Life' container, or a bare 'TxtLife' whose parent is NOT named
+     // 'Life'. Coins: 'TxtCounterSh' and its sibling 'TxtCounter', both
+     // matched by name, so both take the same offset and no twin-write walk
+-    // is needed -- plus, since 0123, the moon icon and its number, which
+-    // live UNDER the moons 'Counter' group: a 'PicIconSh' / 'PicIcon' /
+-    // 'TxtTotalShine' whose parent IS a 'Counter' belongs to the coins
+-    // element (the launcher editor groups the hexagon icon + 020 with the
+-    // coins), and the parent-compensation step below keeps it from being
+-    // moved twice. 'PicIcon' is also used elsewhere (the lives cluster, the
+-    // cursor group), so it is only matched when its parent is a 'Counter'.
++    // is needed. Regional coins (0127): the hexagon icon and its number,
++    // which live UNDER the moons 'Counter' group: a 'PicIconSh' / 'PicIcon' /
++    // 'TxtTotalShine' whose parent IS a 'Counter' belongs to the regional
++    // coins element (its own element since 0127, so it can be dragged and
++    // hidden separately from the coins), and the parent-compensation step
++    // below keeps it from being moved twice. 'PicIcon' is also used
++    // elsewhere (the lives cluster, the cursor group), so it is only matched
++    // when its parent is a 'Counter'.
+     // Compass: 'PicStrap', the right strip (the dial itself is not a Pane,
+     // so the strip is the compass; moving the strip moves the whole
+     // right-hand cluster together). Hints: 'TxtGuide01', the "+ menu / - map"
+@@ -487,14 +489,14 @@ void hud_edge(void *pane, const float *aspect_ptr, void *table, const float *par
+     else if (hud_edge_words_eq(nw, HUD_E_TCSH0, HUD_E_TCSH1, HUD_E_TCSH2, HUD_E_TCSH3, 4)) idx = 2;
+     else if (hud_edge_words_eq(nw, HUD_E_TC0, HUD_E_TC1, HUD_E_TC2, 0, 3)) idx = 2;
+     else if (hud_edge_words_eq(nw, HUD_E_PICONSH0, HUD_E_PICONSH1, HUD_E_PICONSH2, 0, 3)) {
+-        if (hud_edge_parent_is(pane, HUD_E_COUNTER0, HUD_E_COUNTER1, 2)) idx = 2;
++        if (hud_edge_parent_is(pane, HUD_E_COUNTER0, HUD_E_COUNTER1, 2)) idx = 5;
+     }
+     else if (hud_edge_words_eq(nw, HUD_E_PICON0, HUD_E_PICON1, 0, 0, 2)) {
+-        if (hud_edge_parent_is(pane, HUD_E_COUNTER0, HUD_E_COUNTER1, 2)) idx = 2;
++        if (hud_edge_parent_is(pane, HUD_E_COUNTER0, HUD_E_COUNTER1, 2)) idx = 5;
+     }
+     else if (hud_edge_words_eq(nw, HUD_E_COUNTER0, HUD_E_COUNTER1, 0, 0, 2)) idx = 3;
+     else if (hud_edge_words_eq(nw, HUD_E_TSHINE0, HUD_E_TSHINE1, HUD_E_TSHINE2, HUD_E_TSHINE3, 4)) {
+-        if (hud_edge_parent_is(pane, HUD_E_COUNTER0, HUD_E_COUNTER1, 2)) idx = 2;
++        if (hud_edge_parent_is(pane, HUD_E_COUNTER0, HUD_E_COUNTER1, 2)) idx = 5;
+         else idx = 3;
+     }
+     else if (hud_edge_words_eq(nw, HUD_E_TGUIDE0, HUD_E_TGUIDE1, HUD_E_TGUIDE2, 0, 3)) idx = 4;
+@@ -515,7 +517,7 @@ void hud_edge(void *pane, const float *aspect_ptr, void *table, const float *par
+         tdy = hud_edge_clamp_off(params[idx * 3 + 1], 360.0f);
+         tk = hud_edge_clamp_k(params[idx * 3 + 2]);
+     } else if (!hidden) {
+-        // Automatic: left widgets (coins, moons) take dx = -edge; right
++        // Automatic: left widgets (coins, regional coins, moons) take dx = -edge; right
+         // widgets (compass, lives, hints) take dx = +edge. A wider screen
+         // (edge > 0) pushes both outward to the edges; a narrower screen
+         // (edge < 0) pulls both inward so they stay visible and at the
+diff --git a/dm/games/0100000000010000/patches.py b/dm/games/0100000000010000/patches.py
+index 7ccaecf..98a7f85 100644
+--- a/dm/games/0100000000010000/patches.py
++++ b/dm/games/0100000000010000/patches.py
+@@ -60,7 +60,11 @@ BUILD_141 = 'b424be150a8e7d78701cbe7a439d9ebf'   # main 1.4.1 (game.tsv v393216)
+ #       whose parent is NOT a 'Counter' stays the moons fallback. 'PicIcon' is
+ #       only matched when its parent is a 'Counter' (it is also used by the lives
+ #       cluster and the cursor group). The hints element is 'TxtGuide01', the
+-#       "+ menu / - map" text under the compass 'PicStrap' strip. A matched pane
++#       "+ menu / - map" text under the compass 'PicStrap' strip. (0127) the two
++#       kinds of coins split into two elements: the hexagon icon + 020 are their
++#       OWN element (regional coins, index 5) now, so coins, regional coins and
++#       moons can each be dragged and hidden separately; the state page grows to
++#       18 floats and the masks move to +0x248/+0x24C. A matched pane
+ #       whose parent is also matched gets PARENT COMPENSATION: its stored
+ #       original is its global matrix with the parent's applied transform
+ #       undone (translate by -dx_m,-dy_m, then scale about the parent's centre
+@@ -71,55 +75,55 @@ BUILD_141 = 'b424be150a8e7d78701cbe7a439d9ebf'   # main 1.4.1 (game.tsv v393216)
+ #       so it is not moved: a known limitation, see hud_edge.c.
+ HUD_EDGE_WORDS = (
+     "f100003ffa4018441a9f17e4f100001f1a9f17e52a05008635000466bd400021528cccc172a7f4c11e2700201e202030540003ca0f00040052800024"
+-    "b4000463294804697100013f7a40088454000060340002a1528000097940b00436380244b940b804528d2a0572aa6c656b05009f540004e0528d2987"
+-    "72acacc76b07009f54002300528f0a8572a98e856b05009f54002361b940bc04515958847119a484540004a0d65f03c0529999a172a801811e270020"
++    "b4000463294904697100013f7a40088454000060340002a1528000097940b00436380244b940b804528d2a0572aa6c656b05009f540004e0528d2987"
++    "72acacc76b07009f540022c0528f0a8572a98e856b05009f54002321b940bc04515958847119a484540004a0d65f03c0529999a172a801811e270020"
+     "1e202030540000a90f00040052800024b5fffbe3d65f03c05291c7211e2e100272a7fc611e27002052a884011e2018201e2700211e2238001e210800"
+     "1e2020081a9f17e4b5fffa4354fffd40528000015280000917ffffd4b940bc05528e4e8472ae0c246b0400bf54fffc413943000435fffc04f9400c05"
+     "5280000d14000009f9400c05b4000085b940b8a46b07009f54fffb0053017d2953017c215280002d12000028f100007f520001011a9f07e40a090021"
+-    "d110c3ff5200010c6a01008754002d6135003308d28002619acd2421360034611e2020080f0004031e2e10011a9f17e79101c006910003ebaa0603e1"
+-    "aa0b03e3910280043cc104223c810462eb01009f54ffffa1b4002485f24008bf54002441d2850004aa0203e18b0400441400000491020021eb04003f"
+-    "54002360b9407c2334ffff83f9400023eb0300bf54ffff21bd406827529e594372ae29231e2700621e2220e054002200bd4070241e2020881e241480"
+-    "54002181b9407423bd406c267100007f1a9f07ea540035e11e2020e80f0004021e2204c054003ce11e2e10021e22208054002040bd400fe2bd401fe5"
+-    "1e2738511e2638b4bd000ff1bd001ff4bd4050a51e2020b8540036ccbd401433bd4024321e2e10109100c3e7aa0703e3aa0b03e11e241a1052800005"
+-    "bd400025110004a5bd40102291001063910010211e3008a51e300842bc1fc065bd000c6271000cbf54fffec11e333a221e323a940f000411aa0b03e3"
+-    "3dc00bf5528000011f024e051f144a023d8017f51e3128a51e312842bd003fe5bd004fe23cc104e2110004213c81046271000c3f54ffff815280002e"
+-    "d503201f531961a1d37909a38b0300478b030083aa0703e5aa0703e4f861c841eb00003f54000200b9407ca1350017a1910a0081eb01007f54000160"
+-    "f9414082eb02001f540000a114000125f9400022eb02001f54002440910a0021eb01007f54ffff61aa0503e2910020a7f8438441eb00003f540001c0"
+-    "4f000402529e5943aa0703e172ae292352800024f90000a0b90068a3290f10ad910040213c9f00223d800822eb01005f54ffff81d2800001d503201f"
+-    "b86168c4b8616843910010216b03009f54001501f100c03f54ffff41bd4068a21e20204054000161bd406ca21e23204054000101bd4070a21e212040"
+-    "540000a1b94074a16b08003f54000b80d503201f1e2620605200014a0a0e014a1e2704001a9f17e17100019f0a0a00211e2414201a9f17e36a01007f"
+-    "540008c1aa0703e3aa0703e13dc00022910040213d800822eb02003f54ffff8134001188bd4044a25288000172a8c3811e2700241e242842bd0044a2"
+-    "d2800001b90074a82d0d0ca0bd0070a1d503201fbc616840bc2168c091001021f100c03f54ffff819100c3e4528000625280000352800001d29fffe6"
+-    "f9001be03900e3e2b4000060f240081f540006007100fc7f7a40d8245400056d51000421937c7c20f860688017fffff73942f00435ffde04f9400c05"
+-    "53017d2953017c215280002d17ffff17528f0a8572a86e856b05009f540029c1b940bc05528eade472ae8dc46b0400bf54ffdc41b940c004528e4ca5"
+-    "72ad0a656b05009f54001681b940c40435ffdb64f9400c0553027d2953027c215280004d17ffff02d2800000d503201fbc6068c2bc20684291001000"
+-    "f100c01f54ffff81b90074bf2d0d0ca0bd0070a19110c3ffd65f03c0f940140291008005f100005ffa4210a454fff9a0f240085ffa46004054fff949"
+-    "937c7c279100e3eb52800408d29fffec3867696ad1002047eb0000e954000240eb07001f54000062f103fd3f540001c97940a0497100fc3f937c7c2d"
+-    "9100c3ef321c01297900a0495100054e110004637a40d9445400008011000421f82d69e7382d696ef94004427100050854fff5c0f100005ffa4210a4"
+-    "54fff560f240085ffa4c004054fff50917ffffe3910a0084eb04007f54001800f9400081aa0403e5eb01001f54ffe78117ffff4a0f0004061e2040c7"
+-    "35000547d28500035280000a8b0300441e2e10045280000e17ffff29aa0703e13cc105623c810422eb01005f54ffffa117ffff6336000b49bd405002"
+-    "1e20205854000cacbd4014a6bd4024a5910050a1bd40006491001063bd400c621e2108841e210842bd002c64bd003c62eb03003f54ffff01bd4014a4"
+-    "bd4024a23cc280a71e2638841e2538423c8580a71f0418261f0214251e2628061e252865bd0044a6bd0054a517ffff5f1e2020681e2e10041e240420"
+-    "54fff380d28500015280000a8b0100445280000e17fffefd0b0d05a193407c21bc6178601e20200054000da152a884041e2700811e21201054000f4c"
+-    "52b884041e2700811e21201054000f641e2020081a9f17e791000421d37ef424bc6178631e23206054000b8152a876811e2700211e21207054000a8c"
+-    "52b876811e2700211e21207054000a048b040061bd4004211e2020281e211420540009a15293334172a7e3211e2700221e222030540000e4528cccc1"
+-    "72a7fcc11e2700221e2220305400004c17fffe731e20404117fffe710f0004001e2e10011e20400317fffe6daa0103e517fffee1bd4044a21e202842"
+-    "bd0044a217ffff1e528e4ca56b05009f54ffe9a0d65f03c01e2020080f0004031e2140001e2e10011a9f17e717fffe5d528a000172a8f8611e270024"
+-    "1e2420505400004417ffff97bd4054051e2020b85400004c17ffff931e2420b05400004417ffff9039416c01d34414247100049f54000ce00f000404"
+-    "7100089f540000611e2c10041e24884453067c217100043f54000b800f0004027100083f540000611e2c10021e2208a22d4118b12d42c0a7bd401ca5"
+-    "1e2608461f041a261e250845bd4024a21f1014851e2728c61e2228a517ffff761e20402317ffffb01e2e100117fffe300f00040317ffffac0f000400"
+-    "17ffff9dbd400fe252880003bd401ff072a8c3831e2700651e2738421e263a141e253842bd001ff4bd000fe21e2e10051e25208054ffcf601e204051"
+-    "17fffe511e204020120000c717ffff8baa0703e517fffe8e1e204020120000c717ffff86528a000372a8f8631e2700721e3220b05400004417fffe46"
+-    "bd4054a21e2020585400004c17fffe421e3220505400004417fffe3f39416ca3d3441465710004bf540004a0710008bf540004c00f00040553067c63"
+-    "7100047f540003807100087f540004600f0004022d414c362d4340351e3308531f054ed31e300852bd4014301f1548b2bd4024221e302a731e222a52"
+-    "17fffe29bd400fe2bd401fe51e2738421e2638b4bd000fe2bd001ff417ffffc81e2c10021e2288a217ffffa81e2c10041e24084417ffff9d1e2c1010"
+-    "1e30884217ffffe61e2c10101e3008a517ffffdd1e2c10101e3088a517ffffda1e2c10101e30084217ffffdd528d2a0572a92c656b05009f540002a1"
+-    "b940bc04528dec6572aa6dc56b05009f54000a00515b9884713d8c8454ffb1c1f9400c05b4ffb185b940b8a7528de86472adcea46b0400ff54ffb0e1"
+-    "b940bca4515c98847115d08454ffd540d65f03c0528de86572adcea56b05009f54000141b940bc04515c98847115d08454ffaf41f9400c0553037d29"
+-    "53037c215280006d17fffda1528f0a8572aa8e856b05009f540003c1b940bc05528e8de472ad8c246b0400bf54ffad81b940c005528d0a6472adcd24"
+-    "6b0400bf54fface1b940c4047101949f54ffac81f9400c05b4000165b940b8a7528de86472adcea46b0400ff540000c1b940bca7528cae8472a00e44"
+-    "6b0400ff54ffcfe053037d2953037c215280006d17fffd80528f0a8572a8ee856b05009f54ffaa01b940bc05528d2ea472acac846b0400bf54ffa961"
+-    "b940c005528626046b0400bf54ffa8e1f9400c0553047d2953047c215280008d17fffd6eb940c0047101a09f54fff640d65f03c0"
++    "d110c3ff5200010c6a01008754002ce135003288d28002619acd2421360033e11e2020080f0004031e2e10011a9f17e79101c006910003ebaa0603e1"
++    "aa0b03e3910280043cc104223c810462eb01009f54ffffa1b4002445f24008bf54002401aa0203e191400c441400000491020021eb04003f54002340"
++    "b9407c2334ffff83f9400023eb0300bf54ffff21bd406827529e594372ae29231e2700621e2220e0540021e0bd4070241e2020881e24148054002161"
++    "b9407423bd406c267100007f1a9f07ea540035811e2020e80f0004021e2204c054003c811e2e10021e22208054002020bd400fe2bd401fe51e273852"
++    "1e2638b4bd000ff2bd001ff4bd4050a51e2020b85400366cbd401433bd4024311e2e10109100c3e7aa0703e3aa0b03e11e241a1052800005bd400025"
++    "110004a5bd40102291001063910010211e3008a51e300842bc1fc065bd000c6271000cbf54fffec11e333a421e313a940f000412aa0b03e33dc00bf5"
++    "528000011f024e051f1446023d8017f51e3228a51e322842bd003fe5bd004fe23cc104e2110004213c81046271000c3f54ffff815280002e531961a1"
++    "d37909a38b0300478b030083aa0703e5aa0703e4f861c841eb00003f54000200b9407ca1350017a1910c0081eb01007f54000160f9418082eb02001f"
++    "540000a114000123f9400022eb02001f54002400910c0021eb01007f54ffff61aa0503e2910020a7f8438441eb00003f540001c04f000402529e5943"
++    "aa0703e172ae292352800024f90000a0b90068a3290f10ad910040213c9f00223d800822eb01005f54ffff81d2800001d503201fb86168c4b8616843"
++    "910010216b03009f540014e1f100c03f54ffff41bd4068a21e20204054000161bd406ca21e23204054000101bd4070a21e212040540000a1b94074a1"
++    "6b08003f54000b80d503201f1e2620605200014a0a0e014a1e2704001a9f17e17100019f0a0a00211e2414201a9f17e36a01007f540008c1aa0703e3"
++    "aa0703e13dc00022910040213d800822eb02003f54ffff8134001168bd4044a25288000172a8c3811e2700241e242842bd0044a2d2800001b90074a8"
++    "2d0d0ca0bd0070a1d503201fbc616840bc2168c091001021f100c03f54ffff819100c3e4528000625280000352800001d29fffe6f9001be03900e3e2"
++    "b4000060f240081f540006007100fc7f7a40d8245400056d51000421937c7c20f860688017fffff73942f00435ffde44f9400c0553017d2953017c21"
++    "5280002d17ffff19528f0a8572a86e856b05009f54002981b940bc05528eade472ae8dc46b0400bf54ffdc81b940c004528e4ca572ad0a656b05009f"
++    "54001641b940c40435ffdba4f9400c0553027d2953027c215280004d17ffff04d2800000d503201fbc6068c2bc20684291001000f100c01f54ffff81"
++    "b90074bf2d0d0ca0bd0070a19110c3ffd65f03c0f940140291008005f100005ffa4210a454fff9a0f240085ffa46004054fff949937c7c279100e3eb"
++    "52800408d29fffec3867696ad1002047eb0000e954000240eb07001f54000062f103fd3f540001c97940a0497100fc3f937c7c2d9100c3ef321c0129"
++    "7900a0495100054e110004637a40d9445400008011000421f82d69e7382d696ef94004427100050854fff5c0f100005ffa4210a454fff560f240085f"
++    "fa4c004054fff50917ffffe3910c0084eb04007f540017c0f9400081aa0403e5eb01001f54ffe78117ffff4a0f0004061e2040c73500052791400c44"
++    "5280000a1e2e10045280000e17ffff2aaa0703e13cc105623c810422eb01005f54ffffa117ffff6436000b29bd4050021e20205854000c8cbd4014a6"
++    "bd4024a5910050a1bd40006491001063bd400c621e2108841e210842bd002c64bd003c62eb03003f54ffff01bd4014a4bd4024a23cc280a71e263884"
++    "1e2538423c8580a71f0418241f0214221e2428041e222862bd0044a4bd0054a217ffff601e2020681e2e10041e24042054fff3a091400c445280000a"
++    "5280000e17fffeff0b0d05a193407c21bc6178601e20200054000da152a884041e2700811e21201054000f4c52b884041e2700811e21201054000f64"
++    "1e2020081a9f17e791000421d37ef424bc6178631e23206054000b8152a876811e2700211e21207054000a8c52b876811e2700211e21207054000a04"
++    "8b040061bd4004211e2020281e211420540009a15293334172a7e3211e2700221e222030540000e4528cccc172a7fcc11e2700221e2220305400004c"
++    "17fffe771e20404117fffe750f0004001e2e10011e20400317fffe71aa0103e517fffee3bd4044a21e202842bd0044a217ffff20528e4ca56b05009f"
++    "54ffe9e0d65f03c01e2020080f0004031e2140001e2e10011a9f17e717fffe61528a000172a8f8611e2700241e2420505400004417ffff98bd405405"
++    "1e2020b85400004c17ffff941e2420b05400004417ffff9139416c01d34414247100049f54000ce00f0004047100089f540000611e2c10041e248844"
++    "53067c217100043f54000b800f0004027100083f540000611e2c10021e2208a22d4118b12d42c0a7bd401ca51e2608461f041a261e250845bd4024a2"
++    "1f1014851e2728c61e2228a517ffff771e20402317ffffb01e2e100117fffe340f00040317ffffac0f00040017ffff9dbd400fe252880003bd401ff0"
++    "72a8c3831e2700651e2738421e263a141e253842bd001ff4bd000fe21e2e10051e25208054ffcfc01e20405217fffe541e204020120000c717ffff8b"
++    "aa0703e517fffe901e204020120000c717ffff86528a000372a8f8631e2700701e3020b05400004417fffe49bd4054a21e2020585400004c17fffe45"
++    "1e3020505400004417fffe4239416ca3d3441465710004bf540004a0710008bf540004c00f00040553067c637100047f540003807100087f54000460"
++    "0f0004022d414c362d4340351e3308531f054ed31e300851bd4014301f1544b1bd4024221e302a731e222a3117fffe2cbd400fe2bd401fe51e273842"
++    "1e2638b4bd000fe2bd001ff417ffffc81e2c10021e2288a217ffffa81e2c10041e24084417ffff9d1e2c10101e30884217ffffe61e2c10101e3008a5"
++    "17ffffdd1e2c10101e3088a517ffffda1e2c10101e30084217ffffdd528d2a0572a92c656b05009f54000301b940bc04528dec6572aa6dc56b05009f"
++    "54000a60515b9884713d8c8454ffb241f9400c05b4ffb205b940b8a7528de86472adcea46b0400ff54ffb161b940bca4515c98847115d08454ffb0e1"
++    "53057d2953057c21528000ad17fffdaf528de86572adcea56b05009f54000141b940bc04515c98847115d08454ffaf61f9400c0553037d2953037c21"
++    "5280006d17fffda2528f0a8572aa8e856b05009f540003c1b940bc05528e8de472ad8c246b0400bf54ffada1b940c005528d0a6472adcd246b0400bf"
++    "54ffad01b940c4047101949f54ffaca1f9400c05b4000165b940b8a7528de86472adcea46b0400ff540000c1b940bca7528cae8472a00e446b0400ff"
++    "54fffa6053037d2953037c215280006d17fffd81528f0a8572a8ee856b05009f54ffaa21b940bc05528d2ea472acac846b0400bf54ffa981b940c005"
++    "528626046b0400bf54ffa901f9400c0553047d2953047c215280008d17fffd6fb940c0047101a09f54fff5e0d65f03c0"
+ )
+ 
+ # The HUD edge-anchor hook (0118): Pane::Calculate (main+0x909494, the vtable's
+@@ -197,7 +201,7 @@ def _hud_edge_frame_step(ctx):
+ FRAME_STEP = {BUILD_141: _hud_edge_frame_step}
+ 
+ BINDING = [
+-    {'what': "HUD edge anchor, v5 (hud_edge.c: entry + 0x13c cuts, compass 'PicStrap', lives 'Life'/'TxtLife', coins 'TxtCounterSh'/'TxtCounter' plus the moon icon/number 'PicIconSh'/'PicIcon'/'TxtTotalShine' under a 'Counter', moons 'Counter'/'TxtTotalShine', hints 'TxtGuide01', matched by pane name only; the auto edge offset from the screen aspect -- iPhone 19.5:9 +140 out, iPhone Duo 1.43:1 -126 in, iPad 4:3 -160 in, 16:9 0 -- plus the launcher's manual overrides from the DM_HUD_* environment variables (hud_manual.c, state page +0x200), which win over the auto edge, and a hide that pushes the pane off-screen; a dirty flag so a moved container carries its children, an orig/mod table with the applied transform so a fixed offset never drifts, sixteen slots per HUD element (was eight): log-20 shows TEN panes matching coins (two TxtCounterSh + two TxtCounter + two PicIconSh + two PicIcon + two TxtTotalShine, two Counter groups), and eight slots thrashed, so a reclaimed slot re-derived the original matrix from an already-modified one and the offset drifted a little further off-screen every frame (V1.3.16: the coin numbers 0904/023 gone, icons/dots/life/compass still there); sixteen slots give every observed pane its own entry, no settings UI in the game itself; 0123 regroups the moon icon + 020 into the coins element, splits the '+ menu / - map' hints into their own element, and adds parent compensation so a matched child of a matched parent (moon icon under the moons Counter, hints under the compass strip) is moved once, not twice; the manual/hidden masks move to state +0x240/+0x244 because the fifth element's data now occupies +0x200..+0x23B; the white bar under the counts has no matching pane name and stays put)", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
+-     'why': "Pane::Calculate and the pane layout are this build's nn::ui2d code, found by the HUDLOG diagnostic run (log-17) and confirmed by disassembly of DmIOS; the edge offset comes from the screen aspect the loader already writes to state page + 0x58 (log-28). The manual settings come from the launcher's HUD editor (HudEditor.swift) through the same environment-variable channel the launcher already uses for its other settings (DM_SCREEN_ASPECT), so the game reads nothing new: the host copies them to state page +0x200 once per present. This replaces the cancelled draggable HUD (0113): it keeps no user-adjustable state in the game, reuses the 0118 pane-name hook, and its only tree walk is the bounded flag-only mark-dirty, so the 0113 crash class (a name/match walk reading a pane through a bad pointer) is structurally absent. V1.3.14 (build #45) showed the drift on device: with no manual settings at all (log-30: 'HUD manual: no DM_HUD_* set, auto edge anchor only') the coin/moon numbers vanished and the moon dots were wrong, because four panes share the coins element and two slots could not hold them; the table is the only state the stub keeps, so giving each pane its own slot removes the drift at its source. V1.3.16 (build #48) showed it again: 0123 added the hexagon icon/number (six more panes, two Counter groups) to the coins element, so ten panes share it and eight slots could not hold them -- the ninth/tenth pane reclaims slot 0 every frame and the numbers drift off-screen (log-32, host test section K reproduces it: the second TxtCounterSh/TxtCounter reach -4100 after 30 frames); sixteen slots give every observed pane its own entry.",
++    {'what': "HUD edge anchor, v6 (hud_edge.c: entry + 0x13c cuts, compass 'PicStrap', lives 'Life'/'TxtLife', coins 'TxtCounterSh'/'TxtCounter', regional coins 'PicIconSh'/'PicIcon'/'TxtTotalShine' under a 'Counter', moons 'Counter'/'TxtTotalShine', hints 'TxtGuide01', matched by pane name only; the auto edge offset from the screen aspect -- iPhone 19.5:9 +140 out, iPhone Duo 1.43:1 -126 in, iPad 4:3 -160 in, 16:9 0 -- plus the launcher's manual overrides from the DM_HUD_* environment variables (hud_manual.c, state page +0x200), which win over the auto edge, and a hide that pushes the pane off-screen; a dirty flag so a moved container carries its children, an orig/mod table with the applied transform so a fixed offset never drifts, sixteen slots per HUD element (0126: log-20 shows TEN panes matching coins and eight slots thrashed, so the numbers drifted off-screen in V1.3.16); no settings UI in the game itself; 0123 regroups the moon icon + 020 into the coins element, splits the '+ menu / - map' hints into their own element, and adds parent compensation so a matched child of a matched parent (moon icon under the moons Counter, hints under the compass strip) is moved once, not twice; 0127 splits the two kinds of coins into two separately adjustable elements (coins, regional coins, moons), so the state page grows to 18 floats and the manual/hidden masks move to state +0x248/+0x24C; the white bar under the counts has no matching pane name and stays put, and the launcher editor no longer draws it)", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
++     'why': "Pane::Calculate and the pane layout are this build's nn::ui2d code, found by the HUDLOG diagnostic run (log-17) and confirmed by disassembly of DmIOS; the edge offset comes from the screen aspect the loader already writes to state page + 0x58 (log-28). The manual settings come from the launcher's HUD editor (HudEditor.swift) through the same environment-variable channel the launcher already uses for its other settings (DM_SCREEN_ASPECT), so the game reads nothing new: the host copies them to state page +0x200 once per present. This replaces the cancelled draggable HUD (0113): it keeps no user-adjustable state in the game, reuses the 0118 pane-name hook, and its only tree walk is the bounded flag-only mark-dirty, so the 0113 crash class (a name/match walk reading a pane through a bad pointer) is structurally absent. V1.3.14 (build #45) showed the drift on device: with no manual settings at all (log-30: 'HUD manual: no DM_HUD_* set, auto edge anchor only') the coin/moon numbers vanished and the moon dots were wrong, because four panes share the coins element and two slots could not hold them; the table is the only state the stub keeps, so giving each pane its own slot removes the drift at its source.",
+      'blocked': 'the stubs have no function-matched form yet'},
+ ]
+diff --git a/dm/host/hud_manual.c b/dm/host/hud_manual.c
+index ce1cfa2..186d4dd 100644
+--- a/dm/host/hud_manual.c
++++ b/dm/host/hud_manual.c
+@@ -1,6 +1,7 @@
+ // hud_manual.c -- the launcher HUD editor's host side (0119, V1.3.14; 0123:
+-// five elements, the hints element added, masks moved to +0x240/+0x244). The
+-// launcher's HUD editor (HudEditor.swift) writes the five DM_HUD_* environment
++// five elements, the hints element added, masks moved to +0x240/+0x244; 0127:
++// six elements, the regional-coins element added, masks moved to +0x248/+0x24C).
++// The launcher's HUD editor (HudEditor.swift) writes the six DM_HUD_* environment
+ // variables before the game starts; this file copies them into the frame step
+ // state page (state +0x200), where the rewriter's hud_edge stub reads them every
+ // frame. Nothing here writes game code: the stub is a load-time rewriter cut
+@@ -13,28 +14,31 @@
+ #include <string.h>
+ 
+ // The HUD block in the frame step state page (patches.py, hud_edge.c):
+-//   +0x200: 15 floats, per element (dx, dy, k): compass, lives, coins, moons, hints
+-//   +0x240: u32 manual mask, one bit per element (the launcher set it)
+-//   +0x244: u32 hidden mask, one bit per element (the launcher hid it)
+-//   +0x300: the HUD table (40 x 128 bytes, eight per element, hud_edge's working copy)
++//   +0x200: 18 floats, per element (dx, dy, k): compass, lives, coins, moons, hints, regional coins
++//   +0x248: u32 manual mask, one bit per element (the launcher set it)
++//   +0x24C: u32 hidden mask, one bit per element (the launcher hid it)
++//   +0x300: the HUD table (96 x 128 bytes, sixteen per element, hud_edge's working copy)
+ // The block fits the frame step state's reserved 0x4000 bytes; loader.c's own
+ // fields end below +0x200, so there is no overlap. (0113 used the same +0x200
+ // block for its own params; that block is free now that 0113 is deleted.)
+ // (0123: the masks moved from +0x230/+0x234 -- 15 floats occupy +0x200..+0x23B,
+-// so the old mask slots would have collided with the hints element's data.)
++// so the old mask slots would have collided with the hints element's data.
++// 0127: the masks move from +0x240/+0x244 -- 18 floats occupy +0x200..+0x247,
++// so the old mask slots would have collided with the regional-coins data.)
+ #define HUD_MANUAL_PARAMS_OFF  0x200
+-#define HUD_MANUAL_MASK_OFF    (HUD_MANUAL_PARAMS_OFF + 64)
+-#define HUD_MANUAL_HIDDEN_OFF  (HUD_MANUAL_PARAMS_OFF + 68)
++#define HUD_MANUAL_MASK_OFF    (HUD_MANUAL_PARAMS_OFF + 72)
++#define HUD_MANUAL_HIDDEN_OFF  (HUD_MANUAL_PARAMS_OFF + 76)
+ 
+ #define HUD_LOG(...) LOG("[hud] " __VA_ARGS__)
+ 
+-// The five environment variables the launcher's HUD editor writes (HudEditor.swift):
+-//   DM_HUD_COMPASS / DM_HUD_LIFE / DM_HUD_COINS / DM_HUD_MOONS / DM_HUD_HINTS
++// The six environment variables the launcher's HUD editor writes (HudEditor.swift):
++//   DM_HUD_COMPASS / DM_HUD_LIFE / DM_HUD_COINS / DM_HUD_MOONS / DM_HUD_HINTS / DM_HUD_REGIONAL
+ // Each is "dx,dy,k,hidden" (dx, dy in layout points, 1280x720 space; k the size
+ // multiplier; hidden 1 to hide the element). Unset (or unparseable) means the
+ // element has no manual setting: it keeps the auto edge anchor (0118).
+ static const char *const g_hud_env[DM_HUD_N] = {
+     "DM_HUD_COMPASS", "DM_HUD_LIFE", "DM_HUD_COINS", "DM_HUD_MOONS", "DM_HUD_HINTS",
++    "DM_HUD_REGIONAL",
+ };
+ 
+ static float g_hud_dx[DM_HUD_N], g_hud_dy[DM_HUD_N], g_hud_k[DM_HUD_N] = {1, 1, 1, 1, 1};   // as last written to the state page
+@@ -90,7 +94,7 @@ void dm_hud_manual_frame_tick(void) {
+     }
+     memcpy(g_hud_dx, dx, sizeof dx); memcpy(g_hud_dy, dy, sizeof dy); memcpy(g_hud_k, k, sizeof k);
+     g_hud_manual = manual; g_hud_hidden = hidden;
+-    float params[15];
++    float params[18];
+     for (int i = 0; i < DM_HUD_N; i++) { params[i*3] = dx[i]; params[i*3+1] = dy[i]; params[i*3+2] = k[i]; }
+     memcpy(st + HUD_MANUAL_PARAMS_OFF, params, sizeof params);
+     memcpy(st + HUD_MANUAL_MASK_OFF, &manual, 4);
+diff --git a/dm/host/hud_manual.h b/dm/host/hud_manual.h
+index ac5ecd0..f710a29 100644
+--- a/dm/host/hud_manual.h
++++ b/dm/host/hud_manual.h
+@@ -1,16 +1,16 @@
+-// hud_manual.h (0119; 0123: five elements) -- the launcher HUD editor's host
++// hud_manual.h (0119; 0123: five elements; 0127: six elements) -- the launcher HUD editor's host
+ // side. The launcher's HUD editor (HudEditor.swift, in the iOS launcher)
+-// writes the five DM_HUD_* environment variables before the game starts;
++// writes the six DM_HUD_* environment variables before the game starts;
+ // hud_manual.c copies them into the frame step state page (state +0x200),
+ // where the rewriter's hud_edge stub reads them every frame. Element order:
+-// 0 compass, 1 lives, 2 coins, 3 moons, 4 hints. (0113's hud.h / hud.c did
++// 0 compass, 1 lives, 2 coins, 3 moons, 4 hints, 5 regional coins. (0113's hud.h / hud.c did
+ // the same job for its own editor; they were deleted with 0113. This file is
+ // the new, smaller host side: env vars in, state page out, no per-frame game
+ // calls, no log drain.)
+ #ifndef DM_HUD_MANUAL_H
+ #define DM_HUD_MANUAL_H
+ 
+-#define DM_HUD_N 5   // compass, lives, coins, moons, hints
++#define DM_HUD_N 6   // compass, lives, coins, moons, hints, regional coins
+ 
+ // Copy the launcher's DM_HUD_* settings into the frame step state page (called
+ // once per present from uw_frame_hook; writes only when something changed).
+diff --git a/dm/ios/Sources/HudEditor.swift b/dm/ios/Sources/HudEditor.swift
+index e836ce2..542dff4 100644
+--- a/dm/ios/Sources/HudEditor.swift
++++ b/dm/ios/Sources/HudEditor.swift
+@@ -1,5 +1,5 @@
+ // HudEditor.swift -- the launcher HUD editor (0123). The settings screen
+-// shows a game preview (the bundled forest photo, the five HUD elements) at the
++// shows a game preview (the bundled forest photo, the six HUD elements) at the
+ // device's screen shape, and each element can be dragged, resized (60%-180%) or
+ // hidden. A manual setting wins over the auto edge anchor (0118); an element with
+ // no manual setting keeps the auto edge. Hidden in the editor means hidden in
+@@ -12,7 +12,7 @@
+ // The preview is a port of mockup.html (the design the player approved): the
+ // background is the bundled photo for the aspect (Sources/HudBackgrounds/*.jpg,
+ // the mockup's own art), the stage has the same thick black rounded device frame,
+-// the five elements are drawn with the mockup's shapes and colours, and their
++// the six elements are drawn with the mockup's shapes and colours, and their
+ // default positions are the mockup's defaultPos formula (edge-anchored fractions
+ // of the preview, measured from the elements' em-sized boxes). Element sizes
+ // scale with the preview width (u = preview.width / 100, the mockup's em), so the
+@@ -45,17 +45,20 @@ struct HudElementSetting: Equatable {
+     }
+ }
+ 
+-// The five HUD elements, in the game's fixed order (hud_edge.c, hud_manual.c,
++// The six HUD elements, in the game's fixed order (hud_edge.c, hud_manual.c,
+ // patches.py). The raw values must never change: saved settings and the state
+ // page are keyed by them. Display order in the editor (mockup.html META) is
+-// coins, moons, lives, hints, compass -- see displayOrder, not rawValue.
++// coins, regional coins, moons, lives, hints, compass -- see displayOrder, not rawValue.
+ //
+-// Grouping (the player's call, mockup.html): coins = the coin icon + 0896, the
+-// hexagon icon + 020 and the white bar (the whole top-left cluster, one unit);
+-// moons = only the two rows of dots below the bar (its own unit). The old
+-// 0119 moons-falls-back-to-coins rule is gone: each group has its own setting.
++// Grouping (the player's call, 0127: the two kinds of coins are separate
++// groups now): coins = only the coin icon + 0896; regional coins = only the
++// hexagon icon + 020; moons = only the two rows of dots below (its own unit).
++// The white bar under the counts is GONE from the editor (0127): it has no
++// matching pane in the game (a texture, it cannot move), so it is not drawn
++// and belongs to no group. The old 0119 moons-falls-back-to-coins rule is
++// gone: each group has its own setting.
+ enum HudElement: Int, CaseIterable, Identifiable {
+-    case compass = 0, lives, coins, moons, hints
++    case compass = 0, lives, coins, moons, hints, regional
+     var id: Int { rawValue }
+     var env: String {
+         switch self {
+@@ -64,6 +67,7 @@ enum HudElement: Int, CaseIterable, Identifiable {
+         case .coins: return "DM_HUD_COINS"
+         case .moons: return "DM_HUD_MOONS"
+         case .hints: return "DM_HUD_HINTS"
++        case .regional: return "DM_HUD_REGIONAL"
+         }
+     }
+     var name: String {
+@@ -73,6 +77,7 @@ enum HudElement: Int, CaseIterable, Identifiable {
+         case .coins: return "金币"
+         case .moons: return "月亮"
+         case .hints: return "菜单 / 地图提示词"
++        case .regional: return "地区金币"
+         }
+     }
+     // The name on the selected element's tag (mockup.html: the hints tag reads
+@@ -80,7 +85,7 @@ enum HudElement: Int, CaseIterable, Identifiable {
+     var tagName: String { self == .hints ? "菜单 / 地图" : name }
+     var key: String { "DmHudManual.\(rawValue)" }   // UserDefaults key, one per element
+     // Display order in the editor list and the preview (mockup.html META).
+-    static var displayOrder: [HudElement] { [.coins, .moons, .lives, .hints, .compass] }
++    static var displayOrder: [HudElement] { [.coins, .regional, .moons, .lives, .hints, .compass] }
+ 
+     // The element's rendered size in preview points at scale k, mirroring
+     // mockup.html's em sizing (u = preview.width / 100; coins/moons use a
+@@ -93,11 +98,18 @@ enum HudElement: Int, CaseIterable, Identifiable {
+     static func previewSize(_ el: HudElement, k: Double, unit u: CGFloat) -> CGSize {
+         switch el {
+         case .coins:
+-            // Top row: coin icon 1.08em + .34em + "0896" 2.60em, gap .62em, hex
+-            // icon 1.08em + .34em + "020" 1.95em = 8.01em; height 1.08em (icons)
+-            // + .18em gap + .17em bar = 1.43em; plus .30em / .16em padding.
++            // Coin icon 1.08em + .34em + "0896" 2.60em = 4.02em; height 1.08em
++            // (icons only -- the hexagon + 020 are the regional-coins element
++            // now, and the white bar is gone, 0127); plus .30em / .16em padding.
+             let em = 3.3 * u * CGFloat(k)
+-            return CGSize(width: 8.61 * em, height: 1.75 * em)
++            return CGSize(width: 4.62 * em, height: 1.40 * em)
++        case .regional:
++            // Hexagon icon 1.08em + .34em + "020" 1.95em = 3.37em; height
++            // 1.08em (icons only); plus .30em / .16em padding. The hexagon
++            // drawing is identical to the old coins view (0127 moves it, it
++            // does not redraw it).
++            let em = 3.3 * u * CGFloat(k)
++            return CGSize(width: 3.97 * em, height: 1.40 * em)
+         case .moons:
+             // Row 1: 8 filled dots .46em + 2 empty dots .40em, 9 gaps .30em =
+             // 7.18em; row 2: 6 empty dots = 3.90em; plus .10em left padding.
+@@ -120,17 +132,20 @@ enum HudElement: Int, CaseIterable, Identifiable {
+ 
+     // The element's default top-left corner in preview points: mockup.html's
+     // defaultPos (mx = 1.8% of W, my = 5% of H, gap = 1.2% of W; the
+-    // coins-to-moons gap is 2.2% of H). Left: coins on top, moons under it.
+-    // Right: lives on top, hints under it, compass under that, centred on the
+-    // lives column. `sizes` holds every element's previewSize at its own k.
++    // coins-to-regional and regional-to-moons gaps are 2.2% of H). Left: coins
++    // on top, regional coins under it, moons under that. Right: lives on top,
++    // hints under it, compass under that, centred on the lives column.
++    // `sizes` holds every element's previewSize at its own k.
+     static func defaultTopLeft(_ el: HudElement, preview: CGSize, sizes: [HudElement: CGSize]) -> CGPoint {
+         let W = preview.width, H = preview.height
+         let mx = W * 0.018, my = H * 0.05, gap = W * 0.012
+-        let coins = sizes[.coins] ?? .zero, lives = sizes[.lives] ?? .zero
++        let coins = sizes[.coins] ?? .zero, regional = sizes[.regional] ?? .zero
++        let lives = sizes[.lives] ?? .zero
+         let hints = sizes[.hints] ?? .zero, compass = sizes[.compass] ?? .zero
+         switch el {
+         case .coins: return CGPoint(x: mx, y: my)
+-        case .moons: return CGPoint(x: mx, y: my + coins.height + H * 0.022)
++        case .regional: return CGPoint(x: mx, y: my + coins.height + H * 0.022)
++        case .moons: return CGPoint(x: mx, y: my + coins.height + H * 0.022 + regional.height + H * 0.022)
+         case .lives: return CGPoint(x: W - mx - lives.width, y: my)
+         case .hints: return CGPoint(x: W - mx - hints.width, y: my + lives.height + gap * 0.8)
+         case .compass: return CGPoint(x: W - mx - lives.width / 2 - compass.width / 2,
+@@ -230,7 +245,7 @@ private extension View {
+     }
+ }
+ 
+-// A white bold number with the mockup's outline (coins "0896", moons "020").
++// A white bold number with the mockup's outline (coins "0896", regional coins "020").
+ private struct HudNumber: View {
+     let text: String
+     let size: CGFloat
+@@ -275,7 +290,7 @@ private struct CoinIcon: View {
+     }
+ }
+ 
+-// The moon icon (mockup SVG, 100x100 viewBox): a white hexagon with a dark
++// The regional-coins icon (mockup SVG, 100x100 viewBox): a white hexagon with a dark
+ // ring and a dark centre dot.
+ private struct Hexagon: Shape {
+     func path(in rect: CGRect) -> Path {
+@@ -383,6 +398,7 @@ private struct HudElementPreview: View {
+         Group {
+             switch el {
+             case .coins: coinsView
++            case .regional: regionalCoinsView
+             case .moons: moonsView
+             case .lives: livesView
+             case .hints: hintsView
+@@ -391,38 +407,43 @@ private struct HudElementPreview: View {
+         }
+     }
+ 
+-    // Top-left cluster: coin icon + 0896, hexagon icon + 020, white bar below.
++    // Coin icon + 0896 only (0127: the hexagon + 020 are the regional-coins
++    // element now, and the white bar is gone -- it has no matching pane in the
++    // game, so it is not drawn and belongs to no group). The coin icon and the
++    // number drawing are unchanged.
+     private var coinsView: some View {
+         let em = 3.3 * unit * CGFloat(k)
+         let icon = 1.08 * em
+-        return VStack(spacing: 0.18 * em) {
+-            HStack(spacing: 0.62 * em) {
+-                HStack(spacing: 0.34 * em) {
+-                    CoinIcon(size: icon)
+-                    HudNumber(text: "0896", size: em)
+-                }
+-                HStack(spacing: 0.34 * em) {
+-                    ZStack {
+-                        Hexagon().fill(Color.white)
+-                        Circle().stroke(Color(red: 16 / 255, green: 21 / 255, blue: 28 / 255), lineWidth: 0.09 * icon)
+-                            .frame(width: 0.40 * icon, height: 0.40 * icon)
+-                        Circle().fill(Color(red: 16 / 255, green: 21 / 255, blue: 28 / 255))
+-                            .frame(width: 0.11 * icon, height: 0.11 * icon)
+-                    }
+-                    .frame(width: icon, height: icon)
+-                    HudNumber(text: "020", size: em)
+-                }
++        return HStack(spacing: 0.34 * em) {
++            CoinIcon(size: icon)
++            HudNumber(text: "0896", size: em)
++        }
++        .padding(.vertical, 0.16 * em)
++        .padding(.horizontal, 0.30 * em)
++    }
++
++    // Hexagon icon + 020 only (0127: its own element now). The hexagon drawing
++    // is moved verbatim from the old coins view -- same Hexagon fill, same
++    // inner circles, same sizes; only its group changed.
++    private var regionalCoinsView: some View {
++        let em = 3.3 * unit * CGFloat(k)
++        let icon = 1.08 * em
++        return HStack(spacing: 0.34 * em) {
++            ZStack {
++                Hexagon().fill(Color.white)
++                Circle().stroke(Color(red: 16 / 255, green: 21 / 255, blue: 28 / 255), lineWidth: 0.09 * icon)
++                    .frame(width: 0.40 * icon, height: 0.40 * icon)
++                Circle().fill(Color(red: 16 / 255, green: 21 / 255, blue: 28 / 255))
++                    .frame(width: 0.11 * icon, height: 0.11 * icon)
+             }
+-            Rectangle().fill(Color.white)
+-                .frame(width: 8.01 * em, height: 0.17 * em)
+-                .cornerRadius(2)
+-                .shadow(color: .black.opacity(0.35), radius: 0.10 * em, x: 0, y: 0.04 * em)
++            .frame(width: icon, height: icon)
++            HudNumber(text: "020", size: em)
+         }
+         .padding(.vertical, 0.16 * em)
+         .padding(.horizontal, 0.30 * em)
+     }
+ 
+-    // Only the two rows of dots (the hexagon icon + 020 belong to coins now):
++    // Only the two rows of dots (the hexagon icon + 020 belong to regional coins now):
+     // top row 8 filled + 2 empty, bottom row 6 empty.
+     private var moonsView: some View {
+         let em = 3.3 * unit * CGFloat(k)
+-- 
+2.43.0
+
