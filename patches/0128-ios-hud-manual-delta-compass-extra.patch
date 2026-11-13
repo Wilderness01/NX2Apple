@@ -1,0 +1,290 @@
+From 37d4782303d3f208b6345a19cdf82d9b03d89dd8 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Fri, 13 Nov 2026 01:48:53 +0000
+Subject: [PATCH] 0128: manual HUD settings are a delta from the auto edge
+ anchor; compass takes an extra +128
+
+V1.3.17 (log-33) showed the manual settings landing one whole edge away
+from where the player dragged them: the editor shows the element at its
+edge-anchored default and records the drag from there, but the game applied
+the manual offset as an absolute offset from the game's default layout,
+replacing the edge -- coins manual 16,-3 landed at default+16 instead of
+edge+16, and the moons manual 293,169 likewise. The manual offset is now
+ADDED to the edge anchor, so dragging in the editor moves the element by
+the same amount in the game, and a manual element still follows the aspect
+(as the editor does). An old saved setting (recorded as a drag from the
+edge) is now read correctly with no migration.
+
+The compass dial is centred in its 340-wide 'PicStrap' strip, so the plain
+edge puts the strip at the screen edge but the dial ~128 short of it (the
+V1.3.17 screenshot puts the dial's right edge ~155 layout points from the
+screen edge while the lives heart is at the edge). The compass takes an
+extra +128 on its edge anchor (auto and manual base), bringing the dial --
+and the hints text in the strip -- to the edge, matching the editor, which
+centres the compass on the lives column. The strip's right edge then sits
+~100 past the screen edge; the strip is transparent there.
+
+Not fixed here: the moon dots are not Counter children (log-20 lists no dot
+panes under the Counter, and none anywhere), so if the real dots are not
+Counter children the manual move will not carry them -- a probe is needed
+to identify the dots' pane/parent. The hints pane name TxtGuide01 is the
+wrong pane for the visible '+ menu / - map' text (log-20 puts it at global
+(798,86), centre-screen, while the visible hints are at ~1340) -- a probe
+is needed to identify the real hints pane name. No state-page layout
+change; BINDING v6 -> v7; HUD_EDGE_WORDS regenerated (744 words).
+---
+ dm/games/0100000000010000/hud_edge.c | 85 ++++++++++++++++++-------
+ dm/games/0100000000010000/patches.py | 94 ++++++++++++++--------------
+ 2 files changed, 109 insertions(+), 70 deletions(-)
+
+diff --git a/dm/games/0100000000010000/hud_edge.c b/dm/games/0100000000010000/hud_edge.c
+index 62a84aa..7375646 100644
+--- a/dm/games/0100000000010000/hud_edge.c
++++ b/dm/games/0100000000010000/hud_edge.c
+@@ -8,10 +8,17 @@
+ // (coins, regional coins, moons) move left on a wider screen and right on a narrower one; the
+ // right widgets (compass, lives, hints) move right on a wider screen and left
+ // on a narrower one. A manual setting made in the launcher's HUD editor (0119)
+-// overrides the automatic edge anchor for that element: it is moved, resized
+-// and hidden exactly as the player set it, and it stays put when the screen
+-// aspect changes, while elements with no manual setting keep following the
+-// aspect. A hidden element is moved off-screen, so it is not drawn.
++// is a delta from that automatic edge anchor (0128): the editor shows the
++// element at its edge-anchored default and the player drags from there, so the
++// manual offset is added to the edge -- dragging in the editor moves the
++// element by the same amount in the game -- while elements with no manual
++// setting keep following the aspect. A hidden element is moved off-screen, so
++// it is not drawn. The compass takes one extra offset (0128): its pane
++// 'PicStrap' is a 340-wide strip and the visible dial is centred in it, so
++// the plain edge puts the strip at the screen edge but the dial ~128 short
++// of it; the extra offset brings the dial (and the hints text in the strip)
++// to the edge, matching the editor, which centres the compass on the lives
++// column.
+ //
+ // The automatic offset comes from the screen aspect the host already writes
+ // into the frame-step state page (loader.c dm_fps_state_apply, state +0x58:
+@@ -31,12 +38,14 @@
+ // DM_HUD_COMPASS / DM_HUD_LIFE / DM_HUD_COINS / DM_HUD_MOONS / DM_HUD_HINTS
+ // environment variables from the player's editor choices before the game starts):
+ //   +0x200: 15 floats, per element (dx, dy, k): compass, lives, coins,
+-//     moons, hints. dx / dy are layout points (the 1280x720 space), absolute
+-//     from the game's own layout position -- NOT added to the automatic edge
+-//     offset, so a manual element stays put when the aspect changes. A drag
+-//     down the screen is a negative dy (the layout is y-up); the launcher
+-//     negates its y-down drag when it writes the value. k is the element's
+-//     size, 0.6 to 1.8 (the editor's slider), 1 is the game's own size.
++//     moons, hints. dx / dy are layout points (the 1280x720 space), a DELTA
++//     from the automatic edge anchor (0128): the launcher's editor shows the
++//     element at its edge-anchored default and records the drag from there,
++//     so the manual offset is ADDED to the edge -- dragging in the editor
++//     moves the element by the same amount in the game. A drag down the
++//     screen is a negative dy (the layout is y-up); the launcher negates its
++//     y-down drag when it writes the value. k is the element's size, 0.6 to
++//     1.8 (the editor's slider), 1 is the game's own size.
+ //   +0x240: u32 manual mask (bit i: element i has a manual setting).
+ //   +0x244: u32 hidden mask (bit i: element i is hidden).
+ // The state page starts zeroed, so an unwritten block reads as no manual
+@@ -67,6 +76,18 @@
+ // or an aspect change re-applies instead of being ignored, and a manual
+ // element is not re-derived from the automatic offset.
+ //
++// (0128) A manual setting is a delta from the automatic edge anchor, NOT an
++// absolute offset from the game's default layout. The old (0119-0127) code
++// treated it as absolute, replacing the edge -- but the editor shows the
++// element at its edge-anchored default and records the drag from there, so
++// a manual element landed one whole edge (140 on iPhone) away from where
++// the player dragged it (V1.3.17, log-33: coins manual 16,-3 landed at
++// default+16 instead of edge+16; the moons manual 293,169 likewise). The
++// manual offset is now ADDED to the edge anchor, so dragging in the editor
++// moves the element by the same amount in the game, and a manual element
++// still follows the aspect (as the editor does). An old saved setting (recorded
++// as a drag from the edge) is now read correctly with no migration.
++//
+ // Parent compensation (0123): some matched panes are CHILDREN of other
+ // matched panes -- the moon icon (PicIconSh / PicIcon) and its number
+ // (TxtTotalShine, when its parent is a Counter) sit inside the moons
+@@ -145,6 +166,18 @@ typedef unsigned long uintptr_t;
+ // most 1560 wide, so +10000 is safely outside it whatever the aspect.
+ #define HUD_HIDE_DX 10000.0f
+ 
++// The compass dial is centred in its 340-wide 'PicStrap' strip, so the plain
++// edge puts the strip at the screen edge but the dial ~128 short of it (0128:
++// log-20 gives the strip as 340x720; the V1.3.17 screenshot puts the dial's
++// centre ~175 from the strip's left edge, i.e. centred, and the editor
++// centres the compass on the lives column). This extra offset, added to the
++// compass's edge anchor on every aspect, brings the dial (and the hints text
++// in the strip) to the edge. It is a property of the strip's layout (the dial
++// centred in 340), not of the aspect, so it is a constant. The strip's right
++// edge then sits ~100 past the screen edge -- the strip is transparent there,
++// only the dial and the hints text are visible.
++#define HUD_COMPASS_EXTRA 128.0f
++
+ // The pane names, as little-endian u32s (no string literal: a literal would
+ // sit in .rodata and the code would load its address with an adrp, a
+ // relocation, and the embedded words carry no literal pool).
+@@ -503,27 +536,33 @@ void hud_edge(void *pane, const float *aspect_ptr, void *table, const float *par
+     if (idx < 0) return;   // not a HUD element: leave it alone
+ 
+     // What this element should be, this frame. Priority: hidden first, then
+-    // manual, then the automatic edge anchor (0118). A manual setting is an
+-    // absolute offset from the game's own layout position -- it replaces the
+-    // automatic offset, it is not added to it, so a manual element stays put
+-    // when the aspect changes. A hidden element is pushed off-screen; its
+-    // manual offset and size do not matter while it is hidden, and it comes
+-    // back to its manual (or automatic) place when it is shown again.
++    // manual, then the automatic edge anchor (0118). A manual setting is a
++    // DELTA from the automatic edge anchor (0128): the launcher's editor
++    // shows the element at its edge-anchored default and records the drag
++    // from there, so the manual offset is ADDED to the edge -- dragging in
++    // the editor moves the element by the same amount in the game -- and a
++    // manual element still follows the aspect (as the editor does). The
++    // compass's base anchor also carries the extra offset above (its dial is
++    // centred in the 340-wide strip). A hidden element is pushed off-screen;
++    // its manual offset and size do not matter while it is hidden, and it
++    // comes back to its manual (or automatic) place when it is shown again.
+     int manual = (manual_mask >> idx) & 1u;
+     int hidden = (hidden_mask >> idx) & 1u;
+     float tdx = 0.0f, tdy = 0.0f, tk = 1.0f;
++    float base = (idx == 0 || idx == 1 || idx == 4) ? edge : -edge;
++    if (idx == 0) base += HUD_COMPASS_EXTRA;   // the dial, centred in the 340 strip
+     if (!hidden && manual && params) {
+-        tdx = hud_edge_clamp_off(params[idx * 3 + 0], 640.0f);
++        tdx = base + hud_edge_clamp_off(params[idx * 3 + 0], 640.0f);
+         tdy = hud_edge_clamp_off(params[idx * 3 + 1], 360.0f);
+         tk = hud_edge_clamp_k(params[idx * 3 + 2]);
+     } else if (!hidden) {
+         // Automatic: left widgets (coins, regional coins, moons) take dx = -edge; right
+-        // widgets (compass, lives, hints) take dx = +edge. A wider screen
+-        // (edge > 0) pushes both outward to the edges; a narrower screen
+-        // (edge < 0) pulls both inward so they stay visible and at the
+-        // edges. dy is always 0 and the scale is always 1: this patch only
+-        // translates, never resizes.
+-        tdx = (idx == 0 || idx == 1 || idx == 4) ? edge : -edge;
++        // widgets (compass, lives, hints) take dx = +edge (the compass also
++        // takes the extra offset above). A wider screen (edge > 0) pushes
++        // both outward to the edges; a narrower screen (edge < 0) pulls both
++        // inward so they stay visible and at the edges. dy is always 0 and
++        // the scale is always 1: this patch only translates, never resizes.
++        tdx = base;
+     }
+     // A manual or automatic identity (16:9, no move, no resize, not hidden)
+     // is nothing to do: skip the table entirely, so a no-op element never
+diff --git a/dm/games/0100000000010000/patches.py b/dm/games/0100000000010000/patches.py
+index 98a7f85..f3c38d0 100644
+--- a/dm/games/0100000000010000/patches.py
++++ b/dm/games/0100000000010000/patches.py
+@@ -74,56 +74,56 @@ BUILD_141 = 'b424be150a8e7d78701cbe7a439d9ebf'   # main 1.4.1 (game.tsv v393216)
+ #       pane name (no Bar/Line pane in any log or in the DmIOS string pool),
+ #       so it is not moved: a known limitation, see hud_edge.c.
+ HUD_EDGE_WORDS = (
+-    "f100003ffa4018441a9f17e4f100001f1a9f17e52a05008635000466bd400021528cccc172a7f4c11e2700201e202030540003ca0f00040052800024"
+-    "b4000463294904697100013f7a40088454000060340002a1528000097940b00436380244b940b804528d2a0572aa6c656b05009f540004e0528d2987"
+-    "72acacc76b07009f540022c0528f0a8572a98e856b05009f54002321b940bc04515958847119a484540004a0d65f03c0529999a172a801811e270020"
+-    "1e202030540000a90f00040052800024b5fffbe3d65f03c05291c7211e2e100272a7fc611e27002052a884011e2018201e2700211e2238001e210800"
+-    "1e2020081a9f17e4b5fffa4354fffd40528000015280000917ffffd4b940bc05528e4e8472ae0c246b0400bf54fffc413943000435fffc04f9400c05"
+-    "5280000d14000009f9400c05b4000085b940b8a46b07009f54fffb0053017d2953017c215280002d12000028f100007f520001011a9f07e40a090021"
+-    "d110c3ff5200010c6a01008754002ce135003288d28002619acd2421360033e11e2020080f0004031e2e10011a9f17e79101c006910003ebaa0603e1"
+-    "aa0b03e3910280043cc104223c810462eb01009f54ffffa1b4002445f24008bf54002401aa0203e191400c441400000491020021eb04003f54002340"
+-    "b9407c2334ffff83f9400023eb0300bf54ffff21bd406827529e594372ae29231e2700621e2220e0540021e0bd4070241e2020881e24148054002161"
+-    "b9407423bd406c267100007f1a9f07ea540035811e2020e80f0004021e2204c054003c811e2e10021e22208054002020bd400fe2bd401fe51e273852"
+-    "1e2638b4bd000ff2bd001ff4bd4050a51e2020b85400366cbd401433bd4024311e2e10109100c3e7aa0703e3aa0b03e11e241a1052800005bd400025"
+-    "110004a5bd40102291001063910010211e3008a51e300842bc1fc065bd000c6271000cbf54fffec11e333a421e313a940f000412aa0b03e33dc00bf5"
+-    "528000011f024e051f1446023d8017f51e3228a51e322842bd003fe5bd004fe23cc104e2110004213c81046271000c3f54ffff815280002e531961a1"
+-    "d37909a38b0300478b030083aa0703e5aa0703e4f861c841eb00003f54000200b9407ca1350017a1910c0081eb01007f54000160f9418082eb02001f"
+-    "540000a114000123f9400022eb02001f54002400910c0021eb01007f54ffff61aa0503e2910020a7f8438441eb00003f540001c04f000402529e5943"
+-    "aa0703e172ae292352800024f90000a0b90068a3290f10ad910040213c9f00223d800822eb01005f54ffff81d2800001d503201fb86168c4b8616843"
+-    "910010216b03009f540014e1f100c03f54ffff41bd4068a21e20204054000161bd406ca21e23204054000101bd4070a21e212040540000a1b94074a1"
+-    "6b08003f54000b80d503201f1e2620605200014a0a0e014a1e2704001a9f17e17100019f0a0a00211e2414201a9f17e36a01007f540008c1aa0703e3"
+-    "aa0703e13dc00022910040213d800822eb02003f54ffff8134001168bd4044a25288000172a8c3811e2700241e242842bd0044a2d2800001b90074a8"
++    "f100003ffa401844fa40180454000460bd400021528cccc172a7f4c11e2700201e202030540003ca0f00040052800024b4000463294920617100003f"
++    "7a40088454000060340002a8528000017940b00436380244b940b804528d2a0572aa6c656b05009f540004e0528d298572acacc56b05009f54000620"
++    "528f0a8672a98e866b06009f540022a1b940bc04515958847119a48454000460d65f03c0529999a172a801811e2700201e202030540000a90f000400"
++    "52800024b5fffbe3d65f03c05291c7211e2e100272a7fc611e27002052a884011e2018201e2700211e2238001e2108001e2020081a9f17e4b5fffa43"
++    "54fffd40528000085280000117ffffd4b940bc05528e4e8472ae0c246b0400bf54fffc413943000434002a44d65f03c0f9400c07b40020e7b940b8e4"
++    "6b05009f54002081d65f03c03942f00435002004f9400c075280002b2a0b03e51ac52421120000291ac5250812000108d503201ff100007f52000104"
++    "1a9f07e60a010081d110c3ff6a0100ca2a0403ec54002da1350033a81e2020080f0004031e2e10011a9f17ea9101c006910003eeaa0603e1aa0e03e3"
++    "910280043cc104223c810462eb01009f54ffffa1b4002467f24008ff54002421aa0203e191400c441400000491020021eb04003f54002360b9407c23"
++    "34ffff83f9400023eb0300ff54ffff21bd406830529e594372ae29231e2700621e22220054002200bd4070261e2020c81e2614c054002181b9407423"
++    "bd406c277100007f1a9f07ed540036a11e2022080f0004021e2204e054003ce11e2e10021e2220c054002040bd400fe2bd401fe41e3038521e273894"
++    "bd000ff2bd001ff4bd4050e41e202098540036ccbd401433bd4024311e2e10029100c3eaaa0a03e3aa0e03e11e26184252800007bd400025110004e7"
++    "bd40102491001063910010211e2208a51e220884bc1fc065bd000c6471000cff54fffec11e313a851e333a520f000414aa0e03e33dc00bf552800001"
++    "1f124c441f0544423d8017f51e3428841e342842bd003fe4bd004fe23cc10542110004213c81046271000c3f54ffff815280002ad503201f531960a1"
++    "d37908a38b0300478b030083aa0703e5aa0703e4f861c841eb00003f54000200b9407ca1350017a1910c0081eb01007f54000160f9418082eb02001f"
++    "540000a11400012ef9400022eb02001f54002560910c0021eb01007f54ffff61aa0503e2910020a7f8438441eb00003f540001c04f000402529e5943"
++    "aa0703e172ae292352800024f90000a0b90068a3290f10ab910040213c9f00223d800822eb01005f54ffff81d2800001d503201fb86168c4b8616843"
++    "910010216b03009f540015c1f100c03f54ffff41bd4068a21e20204054000161bd406ca21e23204054000101bd4070a21e212040540000a1b94074a1"
++    "6b01011f54000b80d503201f1e302000520001ad0a0a01ad1e2704601a9f17e17100019f0a0d00211e2614201a9f17e36a01007f540008e1aa0703e3"
++    "aa0703e13dc00022910040213d800822eb02003f54ffff8134001248bd4044a25288000172a8c3811e2700241e242842bd0044a2d2800001b90074a8"
+     "2d0d0ca0bd0070a1d503201fbc616840bc2168c091001021f100c03f54ffff819100c3e4528000625280000352800001d29fffe6f9001be03900e3e2"
+-    "b4000060f240081f540006007100fc7f7a40d8245400056d51000421937c7c20f860688017fffff73942f00435ffde44f9400c0553017d2953017c21"
+-    "5280002d17ffff19528f0a8572a86e856b05009f54002981b940bc05528eade472ae8dc46b0400bf54ffdc81b940c004528e4ca572ad0a656b05009f"
+-    "54001641b940c40435ffdba4f9400c0553027d2953027c215280004d17ffff04d2800000d503201fbc6068c2bc20684291001000f100c01f54ffff81"
++    "b4000060f240081f540006007100fc7f7a40d8245400056d51000421937c7c20f860688017fffff7528f0a8572a86e856b05009f54002aa1b940bc05"
++    "528eade472ae8dc46b0400bf54ffdd01b940c004528e4ca572ad0a656b05009f54001881b940c40435ffdc24f9400c075280004b2a0b03e51ac52421"
++    "1e2140001ac52508120000291200010817ffff0ad65f03c05280002b2a0b03e517ffff01d2800000bc6068c2bc20684291001000f100c01f54ffff81"
+     "b90074bf2d0d0ca0bd0070a19110c3ffd65f03c0f940140291008005f100005ffa4210a454fff9a0f240085ffa46004054fff949937c7c279100e3eb"
+     "52800408d29fffec3867696ad1002047eb0000e954000240eb07001f54000062f103fd3f540001c97940a0497100fc3f937c7c2d9100c3ef321c0129"
+     "7900a0495100054e110004637a40d9445400008011000421f82d69e7382d696ef94004427100050854fff5c0f100005ffa4210a454fff560f240085f"
+-    "fa4c004054fff50917ffffe3910c0084eb04007f540017c0f9400081aa0403e5eb01001f54ffe78117ffff4a0f0004061e2040c73500052791400c44"
+-    "5280000a1e2e10045280000e17ffff2aaa0703e13cc105623c810422eb01005f54ffffa117ffff6436000b29bd4050021e20205854000c8cbd4014a6"
+-    "bd4024a5910050a1bd40006491001063bd400c621e2108841e210842bd002c64bd003c62eb03003f54ffff01bd4014a4bd4024a23cc280a71e263884"
+-    "1e2538423c8580a71f0418241f0214221e2428041e222862bd0044a4bd0054a217ffff601e2020681e2e10041e24042054fff3a091400c445280000a"
+-    "5280000e17fffeff0b0d05a193407c21bc6178601e20200054000da152a884041e2700811e21201054000f4c52b884041e2700811e21201054000f64"
+-    "1e2020081a9f17e791000421d37ef424bc6178631e23206054000b8152a876811e2700211e21207054000a8c52b876811e2700211e21207054000a04"
+-    "8b040061bd4004211e2020281e211420540009a15293334172a7e3211e2700221e222030540000e4528cccc172a7fcc11e2700221e2220305400004c"
+-    "17fffe771e20404117fffe750f0004001e2e10011e20400317fffe71aa0103e517fffee3bd4044a21e202842bd0044a217ffff20528e4ca56b05009f"
+-    "54ffe9e0d65f03c01e2020080f0004031e2140001e2e10011a9f17e717fffe61528a000172a8f8611e2700241e2420505400004417ffff98bd405405"
+-    "1e2020b85400004c17ffff941e2420b05400004417ffff9139416c01d34414247100049f54000ce00f0004047100089f540000611e2c10041e248844"
+-    "53067c217100043f54000b800f0004027100083f540000611e2c10021e2208a22d4118b12d42c0a7bd401ca51e2608461f041a261e250845bd4024a2"
+-    "1f1014851e2728c61e2228a517ffff771e20402317ffffb01e2e100117fffe340f00040317ffffac0f00040017ffff9dbd400fe252880003bd401ff0"
+-    "72a8c3831e2700651e2738421e263a141e253842bd001ff4bd000fe21e2e10051e25208054ffcfc01e20405217fffe541e204020120000c717ffff8b"
+-    "aa0703e517fffe901e204020120000c717ffff86528a000372a8f8631e2700701e3020b05400004417fffe49bd4054a21e2020585400004c17fffe45"
+-    "1e3020505400004417fffe4239416ca3d3441465710004bf540004a0710008bf540004c00f00040553067c637100047f540003807100087f54000460"
+-    "0f0004022d414c362d4340351e3308531f054ed31e300851bd4014301f1544b1bd4024221e302a731e222a3117fffe2cbd400fe2bd401fe51e273842"
+-    "1e2638b4bd000fe2bd001ff417ffffc81e2c10021e2288a217ffffa81e2c10041e24084417ffff9d1e2c10101e30884217ffffe61e2c10101e3008a5"
+-    "17ffffdd1e2c10101e3088a517ffffda1e2c10101e30084217ffffdd528d2a0572a92c656b05009f54000301b940bc04528dec6572aa6dc56b05009f"
+-    "54000a60515b9884713d8c8454ffb241f9400c05b4ffb205b940b8a7528de86472adcea46b0400ff54ffb161b940bca4515c98847115d08454ffb0e1"
+-    "53057d2953057c21528000ad17fffdaf528de86572adcea56b05009f54000141b940bc04515c98847115d08454ffaf61f9400c0553037d2953037c21"
+-    "5280006d17fffda2528f0a8572aa8e856b05009f540003c1b940bc05528e8de472ad8c246b0400bf54ffada1b940c005528d0a6472adcd246b0400bf"
+-    "54ffad01b940c4047101949f54ffaca1f9400c05b4000165b940b8a7528de86472adcea46b0400ff540000c1b940bca7528cae8472a00e446b0400ff"
+-    "54fffa6053037d2953037c215280006d17fffd81528f0a8572a8ee856b05009f54ffaa21b940bc05528d2ea472acac846b0400bf54ffa981b940c005"
+-    "528626046b0400bf54ffa901f9400c0553047d2953047c215280008d17fffd6fb940c0047101a09f54fff5e0d65f03c0"
++    "fa4c004054fff50917ffffe3910c0084eb04007f54001860f9400081aa0403e5eb01001f54ffe78117ffff4a0f0004071e2040f03500060a91400c44"
++    "5280000d1e2e100617ffff2b0f02646112000108f9400c0712000029528000055280000b1e21280017fffeb9aa0703e13cc105c23c810422eb01005f"
++    "54ffffa117ffff5d34000ba9bd4050021e20205854000cccbd4014a6bd4024a5910050a1bd40006491001063bd400c621e2108841e210842bd002c64"
++    "bd003c62eb03003f54ffff01bd4014a4bd4024a23cc280a71e2638841e2538423c8580a71f0418241f0214221e2428041e222862bd0044a4bd0054a2"
++    "17ffff591e2020681e2e10021e22042054fff2c01e20404691400c445280000d5280000a17fffef70b0504a193407c21bc6178611e21202054000da1"
++    "52a884041e2700821e2220305400072c52b884041e2700821e222030540006a4910004211e212800d37ef424bc6178631e23206054000ba152a87681"
++    "1e2700211e2120705400052c52b876811e2700211e212070540004a48b0400611e202008bd4004211a9f17e61e2020281e2114205400096152933341"
++    "72a7e3211e2700221e22203054000104528cccc172a7fcc11e2700221e2220305400006c120000ca17fffe6c1e204041120000ca17fffe690f000400"
++    "1e2e10011e20400317fffe65aa0103e517fffed8bd4044a21e202842bd0044a217ffff15528e4ca56b05009f54ffe7a0d65f03c01e20402317ffffdb"
++    "1e20404117ffffcb528a000172a8f8611e2700241e2420505400004417ffff96bd4054051e2020b85400004c17ffff921e2420b05400004417ffff8f"
++    "39416c01d34414247100049f54000ba00f0004047100089f540000611e2c10041e24884453067c217100043f54000b000f0004027100083f54000061"
++    "1e2c10021e2208a22d4118b12d42c0a7bd401ca51e2608461f041a261e250845bd4024a21f1014851e2728c61e2228a517ffff75120000ca1e2e1001"
++    "17fffe2b0f00040317ffffab0f00040117ffff9bbd400fe252880003bd401fe572a8c3831e2700641e3038421e2738b41e243842bd001ff4bd000fe2"
++    "1e2e10041e2420c054ffcea01e20405217fffe4baa0703e517fffe8b528a000372a8f8631e2700711e3120905400004417fffe46bd4054e21e202058"
++    "5400004c17fffe421e3120505400004417fffe3f39416ce3d3441467710004ff540004a0710008ff540004c00f00040453067c637100047f54000380"
++    "7100087f540004600f0004022d414c362d4314351e3308531f044ed31e250851bd4014251f154491bd4024221e252a731e222a3117fffe29bd400fe2"
++    "bd401fe41e3038421e273894bd000fe2bd001ff417ffffce1e2c10041e24084417ffffa71e2c10021e2288a217ffffac1e2c10051e25884217ffffe6"
++    "1e2c10051e25088417ffffdd1e2c10051e25888417ffffda1e2c10051e25084217ffffdd528d2a0572a92c656b05009f540002e1b940bc04528dec65"
++    "72aa6dc56b05009f540009c0515b9884713d8c8454ffb1a1f9400c07b4ffb167b940b8e5528de86472adcea46b0400bf54ffb0c1b940bce4515c9884"
++    "7115d08454ffb041528000ab2a0b03e517fffea2528de86572adcea56b05009f54000121b940bc04515c98847115d08454ffaee1f9400c075280006b"
++    "2a0b03e517fffe96528f0a8572aa8e856b05009f54000381b940bc05528e8de472ad8c246b0400bf54ffad41b940c005528d0a6472adcd246b0400bf"
++    "54ffaca1b940c4047101949f54ffac41f9400c07b4000147b940b8e5528de86472adcea46b0400bf540000a1b940bce4515c98847115d08454fffac0"
++    "5280006b2a0b03e517fffe77528f0a8572a8ee856b05009f54ffaa01b940bc05528d2ea472acac846b0400bf54ffa961b940c005528626046b0400bf"
++    "54ffa8e1f9400c075280008b2a0b03e517fffd70b940c0047101a09f54fff680d65f03c0"
+ )
+ 
+ # The HUD edge-anchor hook (0118): Pane::Calculate (main+0x909494, the vtable's
+@@ -201,7 +201,7 @@ def _hud_edge_frame_step(ctx):
+ FRAME_STEP = {BUILD_141: _hud_edge_frame_step}
+ 
+ BINDING = [
+-    {'what': "HUD edge anchor, v6 (hud_edge.c: entry + 0x13c cuts, compass 'PicStrap', lives 'Life'/'TxtLife', coins 'TxtCounterSh'/'TxtCounter', regional coins 'PicIconSh'/'PicIcon'/'TxtTotalShine' under a 'Counter', moons 'Counter'/'TxtTotalShine', hints 'TxtGuide01', matched by pane name only; the auto edge offset from the screen aspect -- iPhone 19.5:9 +140 out, iPhone Duo 1.43:1 -126 in, iPad 4:3 -160 in, 16:9 0 -- plus the launcher's manual overrides from the DM_HUD_* environment variables (hud_manual.c, state page +0x200), which win over the auto edge, and a hide that pushes the pane off-screen; a dirty flag so a moved container carries its children, an orig/mod table with the applied transform so a fixed offset never drifts, sixteen slots per HUD element (0126: log-20 shows TEN panes matching coins and eight slots thrashed, so the numbers drifted off-screen in V1.3.16); no settings UI in the game itself; 0123 regroups the moon icon + 020 into the coins element, splits the '+ menu / - map' hints into their own element, and adds parent compensation so a matched child of a matched parent (moon icon under the moons Counter, hints under the compass strip) is moved once, not twice; 0127 splits the two kinds of coins into two separately adjustable elements (coins, regional coins, moons), so the state page grows to 18 floats and the manual/hidden masks move to state +0x248/+0x24C; the white bar under the counts has no matching pane name and stays put, and the launcher editor no longer draws it)", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
++    {'what': "HUD edge anchor, v7 (hud_edge.c: entry + 0x13c cuts, compass 'PicStrap', lives 'Life'/'TxtLife', coins 'TxtCounterSh'/'TxtCounter', regional coins 'PicIconSh'/'PicIcon'/'TxtTotalShine' under a 'Counter', moons 'Counter'/'TxtTotalShine', hints 'TxtGuide01', matched by pane name only; the auto edge offset from the screen aspect -- iPhone 19.5:9 +140 out, iPhone Duo 1.43:1 -126 in, iPad 4:3 -160 in, 16:9 0 -- plus the launcher's manual settings from the DM_HUD_* environment variables (hud_manual.c, state page +0x200), which are a delta from the auto edge anchor (0128: the editor shows the element at its edge-anchored default and records the drag from there, so the manual offset is ADDED to the edge -- dragging in the editor moves the element by the same amount in the game, and a manual element still follows the aspect), and a hide that pushes the pane off-screen; the compass takes an extra +128 on its edge anchor (0128: its dial is centred in the 340-wide 'PicStrap' strip, so the plain edge puts the strip at the screen edge but the dial ~128 short of it -- the extra brings the dial, and the hints text in the strip, to the edge); a dirty flag so a moved container carries its children, an orig/mod table with the applied transform so a fixed offset never drifts, sixteen slots per HUD element (0126: log-20 shows TEN panes matching coins and eight slots thrashed, so the numbers drifted off-screen in V1.3.16); no settings UI in the game itself; 0123 regroups the moon icon + 020 into the coins element, splits the '+ menu / - map' hints into their own element, and adds parent compensation so a matched child of a matched parent (moon icon under the moons Counter, hints under the compass strip) is moved once, not twice; 0127 splits the two kinds of coins into two separately adjustable elements (coins, regional coins, moons), so the state page grows to 18 floats and the manual/hidden masks move to state +0x248/+0x24C; the white bar under the counts has no matching pane name and stays put, and the launcher editor no longer draws it)", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
+      'why': "Pane::Calculate and the pane layout are this build's nn::ui2d code, found by the HUDLOG diagnostic run (log-17) and confirmed by disassembly of DmIOS; the edge offset comes from the screen aspect the loader already writes to state page + 0x58 (log-28). The manual settings come from the launcher's HUD editor (HudEditor.swift) through the same environment-variable channel the launcher already uses for its other settings (DM_SCREEN_ASPECT), so the game reads nothing new: the host copies them to state page +0x200 once per present. This replaces the cancelled draggable HUD (0113): it keeps no user-adjustable state in the game, reuses the 0118 pane-name hook, and its only tree walk is the bounded flag-only mark-dirty, so the 0113 crash class (a name/match walk reading a pane through a bad pointer) is structurally absent. V1.3.14 (build #45) showed the drift on device: with no manual settings at all (log-30: 'HUD manual: no DM_HUD_* set, auto edge anchor only') the coin/moon numbers vanished and the moon dots were wrong, because four panes share the coins element and two slots could not hold them; the table is the only state the stub keeps, so giving each pane its own slot removes the drift at its source.",
+      'blocked': 'the stubs have no function-matched form yet'},
+ ]
+-- 
+2.43.0
+
