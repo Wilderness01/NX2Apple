@@ -1,0 +1,334 @@
+From 2933366bf6becc875aaa147ea84aabd86e5ad683 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Sat, 14 Nov 2026 10:18:26 +0000
+Subject: [PATCH] 0133: extend the HUD layout probe with chain + fields records
+ (log-41)
+
+---
+ dm/games/0100000000010000/hud_probe.c | 138 +++++++++++++++++++++++++-
+ dm/games/0100000000010000/patches.py  |  65 +++++++-----
+ dm/host/hud_manual.c                  |  43 ++++++++
+ 3 files changed, 218 insertions(+), 28 deletions(-)
+
+diff --git a/dm/games/0100000000010000/hud_probe.c b/dm/games/0100000000010000/hud_probe.c
+index c6362af..314384b 100644
+--- a/dm/games/0100000000010000/hud_probe.c
++++ b/dm/games/0100000000010000/hud_probe.c
+@@ -37,6 +37,27 @@
+ //      (c) gate is trivially true. The layout record shows, per pane,
+ //      where the layout actually lives, so the 0131 fix is written from
+ //      measured values, not from another unverified assumption.
++//   5. (0133) for every pane hud_edge matched, one chain record: the
++//      local translation (+0x30/+0x34) of the pane and each ancestor up
++//      to the root (five levels as floats, plus the depth walked).
++//      Log-41 proved the layout (263,71) is in neither the pane's local
++//      nor the immediate parent's (H3) and the full chain
++//      TxtCounter->Capture03->RootPane sums to (0,-100) -- but that proof
++//      joined the type-0 pane records (names + parentage) with the
++//      type-3 parent_local (one level). This record makes the whole
++//      chain explicit in one place, so a layout at level 2+ is visible
++//      without joining records, and the 0132 chain-walk's reconstruction
++//      can be checked level by level.
++//   6. (0133) for every pane hud_edge matched, one fields record: the
++//      pane's and its parent's local scales (+0x48/+0x4c), sizes
++//      (+0x50/+0x54) and origins (+0x5b), and the pane's live global
++//      translation (+0x70) as the probe sees it -- the other fields a
++//      layout could be derived from (a scaled accumulation, a centred
++//      position) if it is in no +0x30. NOTE: the probe runs after
++//      hud_edge in both cuts, so the live global on first sighting is
++//      hud_edge's just-written value (the same numbers as final_m3/
++//      final_m7 in the edge-decision record); the pre-write value is
++//      e_orig in the layout record.
+ //
+ // How it works: the rewriter's two Pane::Calculate cuts call this stub
+ // after hud_edge (same arguments, plus the probe buffer). The stub writes
+@@ -103,6 +124,12 @@ typedef unsigned long uintptr_t;
+ #define HP_REC_EDGE 1
+ #define HP_REC_ASPECT 2
+ #define HP_REC_LAYOUT 3   // (0131) the pane's local transform + the stored original
++#define HP_REC_CHAIN 4    // (0133) the full parent chain's local translations
++#define HP_REC_FIELDS 5   // (0133) local scales, sizes, origins, live global
++// Chain levels stored per record (levels 0..4 as floats in v0..v6 +
++// w0..w2, which hold float bit patterns); a deeper chain stores the
++// first five and reports its full depth in w3.
++#define HUD_PROBE_CHAIN_LEVELS 5
+ // Record field offsets (relative to the record start, 96 bytes total).
+ #define HP_R_TYPE 0
+ #define HP_R_ADDR_LO 4
+@@ -256,11 +283,18 @@ void hud_probe(void *pane, const float *aspect_ptr, void *table, void *probe_buf
+         int entry_index = (int)(((uintptr_t)ent - (uintptr_t)table) / HUD_EDGE_ENTRY);
+         slot = (entry_index - idx) / HUD_EDGE_N;
+     }
+-    // How many records: one pane record, plus one edge-decision record
+-    // and one layout record (0131) when matched. All must fit, or none
+-    // is written and the pane stays un-seen (it retries next frame, when
+-    // the host has flushed).
+-    int need = matched ? 3 : 1;
++    // How many records: one pane record, plus one edge-decision record,
++    // one layout record (0131), one chain record (0133) and one fields
++    // record (0133) when matched -- five per matched pane, one per
++    // unmatched pane. All must fit, or none is written and the pane
++    // stays un-seen (it retries next frame, when the host has flushed).
++    // The 13-record cap is unchanged (the record buffer is 13 x 96
++    // bytes to the end of the state page); a matched pane now takes five
++    // slots, so a flush carries the aspect record plus two matched
++    // panes (and unmatched panes in the remaining slots), and the rest
++    // defer to the next flush -- the host flushes every present, so a
++    // 5-second stand-still still logs every pane.
++    int need = matched ? 5 : 1;
+     u32 rc = hdr[HP_REC_COUNT / 4];
+     if (rc + (u32)need > HUD_PROBE_REC_CAP) return;
+ 
+@@ -388,6 +422,100 @@ void hud_probe(void *pane, const float *aspect_ptr, void *table, void *probe_buf
+         rc++;
+     }
+ 
++    // The chain record (0133), for a matched pane only: the local
++    // translations (+0x30/+0x34) of the pane and each ancestor up to the
++    // root. Levels 0..4 are stored as floats (v0..v6, then w0..w2 which
++    // hold float bit patterns); w3 packs the depth walked (bits 0-7),
++    // the element index (bits 8-15) and the slot (bits 16-23). A depth
++    // over 5 means the chain continues past the stored levels (the host
++    // print flags it TRUNCATED); log-41's chains are at most four levels
++    // (TxtGuide01 -> PicStrap -> All -> RootPane), so five covers every
++    // chain the device has shown. The walk mirrors hud_edge_chain_origin
++    // (a NULL or unaligned parent stops it, 8 levels max) but reads the
++    // locals instead of summing them, so the 0132 reconstruction can be
++    // checked level by level. Levels at or beyond the depth are zero.
++    if (matched) {
++        float clx[HUD_PROBE_CHAIN_LEVELS];
++        float cly[HUD_PROBE_CHAIN_LEVELS];
++        int depth = 0;
++        void *p = pane;
++        for (int i = 0; i < 8 && p && !((uintptr_t)p & 7u); i++) {
++            if (i < HUD_PROBE_CHAIN_LEVELS) {
++                clx[i] = *(const float *)((const char *)p + 0x30);
++                cly[i] = *(const float *)((const char *)p + 0x34);
++            }
++            depth++;
++            p = *(void **)((const char *)p + 0x18);
++        }
++        volatile char *rec = (volatile char *)probe_buf + HP_REC_OFF + rc * HUD_PROBE_REC_SIZE;
++        hp_put_u32(rec, HP_R_TYPE, HP_REC_CHAIN);
++        hp_put_u32(rec, HP_R_ADDR_LO, (u32)(uintptr_t)pane);
++        hp_put_u32(rec, HP_R_ADDR_HI, (u32)((uintptr_t)pane >> 32));
++        hud_probe_copy_name(rec + HP_R_NAME, (const char *)pane + 0xb8, 20);
++        if (parent_ok) hud_probe_copy_name(rec + HP_R_PNAME, (const char *)parent + 0xb8, 20);
++        else rec[HP_R_PNAME] = 0;
++        for (int i = 0; i < HUD_PROBE_CHAIN_LEVELS; i++) {
++            float x = i < depth ? clx[i] : 0.0f;
++            float y = i < depth ? cly[i] : 0.0f;
++            hp_put_f32(rec, HP_R_V0 + i * 8, x);
++            hp_put_f32(rec, HP_R_V0 + i * 8 + 4, y);
++        }
++        hp_put_u32(rec, HP_R_W3, (u32)depth | ((u32)idx << 8) | ((u32)slot << 16));
++        rc++;
++    }
++
++    // The fields record (0133), for a matched pane only: the pane's and
++    // its parent's local scales (+0x48/+0x4c), sizes (+0x50/+0x54) and
++    // origins (+0x5b), and the pane's live global translation (+0x70
++    // m[3]/m[7]) as the probe sees it. These are the other fields a
++    // layout could be derived from if it is in no +0x30: a scaled
++    // accumulation (a parent scale != 1), or a position centred in the
++    // parent (size/origin). The parent's values are 0 when there is no
++    // parent. w0..w2 hold float bit patterns (live global y, parent size
++    // w/h); w3 packs the pane origin (bits 0-7), the parent origin (bits
++    // 8-15), the element index (bits 16-23) and the slot (bits 24-31).
++    // NOTE on the live global: the probe runs after hud_edge in both
++    // cuts, so on first sighting this is hud_edge's just-written value
++    // (the same numbers as final_m3/final_m7 in the edge-decision
++    // record); the pre-write value is e_orig in the layout record
++    // (type 3). A game recomposition on a later frame is absorbed by
++    // hud_edge's recomputed path and is not separately visible here.
++    if (matched) {
++        float sx = *(const float *)((const char *)pane + 0x48);
++        float sy = *(const float *)((const char *)pane + 0x4c);
++        float psx = 0.0f, psy = 0.0f, pw = 0.0f, ph = 0.0f;
++        unsigned char porigin = 0;
++        if (parent_ok) {
++            psx = *(const float *)((const char *)parent + 0x48);
++            psy = *(const float *)((const char *)parent + 0x4c);
++            pw = *(const float *)((const char *)parent + 0x50);
++            ph = *(const float *)((const char *)parent + 0x54);
++            porigin = *(const unsigned char *)((const char *)parent + 0x5b);
++        }
++        float w = *(const float *)((const char *)pane + 0x50);
++        float h = *(const float *)((const char *)pane + 0x54);
++        unsigned char origin = *(const unsigned char *)((const char *)pane + 0x5b);
++        volatile char *rec = (volatile char *)probe_buf + HP_REC_OFF + rc * HUD_PROBE_REC_SIZE;
++        hp_put_u32(rec, HP_R_TYPE, HP_REC_FIELDS);
++        hp_put_u32(rec, HP_R_ADDR_LO, (u32)(uintptr_t)pane);
++        hp_put_u32(rec, HP_R_ADDR_HI, (u32)((uintptr_t)pane >> 32));
++        hud_probe_copy_name(rec + HP_R_NAME, (const char *)pane + 0xb8, 20);
++        if (parent_ok) hud_probe_copy_name(rec + HP_R_PNAME, (const char *)parent + 0xb8, 20);
++        else rec[HP_R_PNAME] = 0;
++        hp_put_f32(rec, HP_R_V0, sx);
++        hp_put_f32(rec, HP_R_V1, sy);
++        hp_put_f32(rec, HP_R_V2, psx);
++        hp_put_f32(rec, HP_R_V3, psy);
++        hp_put_f32(rec, HP_R_V4, w);
++        hp_put_f32(rec, HP_R_V5, h);
++        hp_put_f32(rec, HP_R_V6, g[3]);   // live global x (post-hud_edge; see note above)
++        hp_put_f32(rec, HP_R_W0, g[7]);   // live global y (float bits in a u32 slot)
++        hp_put_f32(rec, HP_R_W1, pw);     // parent size w (float bits)
++        hp_put_f32(rec, HP_R_W2, ph);     // parent size h (float bits)
++        hp_put_u32(rec, HP_R_W3, (u32)origin | ((u32)porigin << 8) | ((u32)idx << 16) | ((u32)slot << 24));
++        rc++;
++    }
++
+     hdr[HP_REC_COUNT / 4] = rc;
+     // Mark seen only after both records were written, so a deferred pane
+     // (buffer full) retries next frame instead of being lost.
+diff --git a/dm/games/0100000000010000/patches.py b/dm/games/0100000000010000/patches.py
+index d750541..60104e7 100644
+--- a/dm/games/0100000000010000/patches.py
++++ b/dm/games/0100000000010000/patches.py
+@@ -162,33 +162,52 @@ HUD_EDGE_WORDS = (
+ # (+0x30/+0x34), the parent's local translation, and the stored original's
+ # translation (e_orig[3]/e_orig[7]) after hud_edge -- the evidence 0130
+ # needs, because 0130 had zero effect on device (log-38 identical to
+-# log-37). Gated by the environment
++# log-37); and (0133) for every pane hud_edge matched, a chain record
++# (type 4): the local translations (+0x30/+0x34) of the pane and each
++# ancestor up to the root (five levels as floats, plus the depth walked),
++# and a fields record (type 5): the pane's and its parent's local scales
++# (+0x48/+0x4c), sizes (+0x50/+0x54) and origins (+0x5b), and the pane's
++# live global translation (+0x70) as the probe sees it -- the fields that
++# could hold the (263,71) layout, which log-41 proved is in no +0x30 in
++# the chain (H3). A matched pane now takes five records (pane, edge,
++# layout, chain, fields); the 13-record cap is unchanged, so a flush
++# carries the aspect record plus two matched panes and the rest defer.
++# Gated by the environment
+ # variable DM_HUD_PROBE=1 (the host sets the buffer's enabled flag from
+ # it). Delete after use; never ship.
+ HUD_PROBE_WORDS = (
+     "f100001ffa40182454000500f100005ffa401864540004a0b9400065528848a472aa0a446b0400bf54000160b9000064528001a5b900047f52802004"
+-    "b900087fb9000c7fb900107fb9001465b9001864b9001c7fb9400464340002847940b00436380244b940106435000084b9400866710030df54001a69"
++    "b900087fb9000c7fb900107fb9001465b9001864b9001c7fb9400464340002847940b00436380244b940106435000084b9400866710030df54002b69"
+     "b9400c699100806a340001a9aa0a03e18b294d4514000003eb05003f540000c0f940002491002021eb00009f54ffff61d65f03c07103fd3f54ffffc8"
+-    "aa0203e791400c45aa0203e11400000491020021eb0100bf54002140b9407c24aa0103e634ffff64f9400024eb04001f54ffff01cb020022b94078cc"
+-    "5295556152800064d347fc4272a555414b0c00429b217c41d360fc214b827c22b940086e0b0e00817100343f54fffc68a9bf7bfd52800010910003fd"
+-    "f9400c0fb400006ff24009ff1a9f17f00b0e05cdd360fc129102e008d2800001531b69a4531b69ad912080848b04006b91003171b824687fb9000560"
+-    "b90009721400000538216a2491000421f1004c3f540000603861690435ffff64910030213821697f34001af09102e1f19100817ed280000114000005"
+-    "38216bc491000421f1004c3f5400006038616a2435ffff64910080213821697fbd405000d360fde17940b004bd003560bd405400bd003960bd407c00"
+-    "bd003d60bd408c00bd004160bd407000bd004560bd408400bd004960b9004d7f39416c11b9005171b9005564b900596fb9005d61b40018862d4d0cc2"
+-    "bd4070c4b94074cb350014300f0004005280001e1e204001110181a45280003191208084d28000018b040065910030a7b8246871b90004a0b90008b2"
+-    "14000005382168e491000421f1004c3f540000603861690435ffff6491003021382168bf340015109102e1f1910080a7d280000114000005382168e4"
+-    "91000421f1004c3f5400006038616a2435ffff6491008021382168bfbd0034a2bd0038a3bd003ca4bd0040a1bd0044a0bd407c00bd0048a0bd408c00"
+-    "bd004ca0b90050acb90054a2b90058abb9005cbe2d460803340011502d4601e1110301a4912080845280006b8b040065d2800001910030a7b824686b"
+-    "b90004a0b90008b214000005382168e491000421f1004c3f540000603861690435ffff6491003021382168bf34000e909102e1f1910080a7d2800001"
+-    "14000005382168e491000421f1004c3f5400006038616a2435ffff6491008021382168bfbd0034a311000dcebd0038a2bd003ca1bd0040a0bd4014c0"
+-    "bd0044a0bd4024c0bd0048a0b9004cbfb90050acb90054a2b90058bfb9005cbf2a0903e1b900086e11000529f8217940a8c17bfdb9000c69d65f03c0"
+-    "bd400021528cccc172a7f4c11e2700201e2020305400044a0f0004000b0604c152800044531b6821112080218b214065b8214864910030a1910080a4"
+-    "b90004bfb90008bfd503201f3900003f9100042139004c3feb04003f54ffff81bd0034a1110004c6bd0038a052800021b9003cbfb90040bfb90044bf"
+-    "b90048bfb9004cbfb90050bfb90054bfb90058bfb9005cbfb9000866b900106117ffff08529999a172a801811e2700201e2020305400004917ffffda"
+-    "5291c7211e2e100372a7fc611e27002052a884011e2700221e2018201e2338001e22080017ffffd1910200e7eb0700bf54ffec20b9407ce134ffff81"
+-    "f94000e1eb0f003f54ffff212d4d00e1529e5941b94074e472ae29211e2700257100009f1a9f07e11e2520201a9f17fe2a1e083e321f03de17ffff53"
+-    "3900817f17ffff3512800002d28000062a0203ec5280002417ffff03390080bf17ffff980f0004001e20400117ffff76390080bf17ffff64110005ce"
+-    "17ffff9f"
++    "aa0203e791400c45aa0203e11400000491020021eb05003f54003240b9407c24aa0103e634ffff64f9400024eb04001f54ffff01cb020022b94078cb"
++    "52955561528000a4d347fc4272a555414b0b00429b217c41d360fc214b827c22b940086d0b0401a17100343f54fffc68a9bc7bfd5280000e910003fd"
++    "f9400c0cb400006cf240099f1a9f17ee0b0d05b0d360fc0f9102e008d2800001531b6a04531b6a10912080848b04007191003232b824687fb9000620"
++    "b9000a2f1400000538216a4491000421f1004c3f540000603861690435ffff649100302138216a3f34002bee9102e1849100823ed280000114000005"
++    "38216bd291000421f1004c3f540000603861689235ffff729100802138216a3fbd405000d360fd817940b004bd003620bd405400bd003a20bd407c00"
++    "bd003e20bd408c00bd004220bd407000bd004620bd408400bd004a20b9004e3f39416c12b9005232b9005624b9005a2cb9005e21b4002ac62d4d0cc2"
++    "bd4070c4b94074d13500252e0f0004005280001e1e204001110182045280003291208084d28000018b040065910030a7b8246872b90004a0b90008af"
++    "14000005382168e491000421f1004c3f540000603861690435ffff6491003021382168bf3400266e9102e184910080b2d28000011400000538216a47"
++    "91000421f1004c3f540000603861688735ffff6791008021382168bfbd0034a2bd0038a3bd003ca4bd0040a1bd0044a0bd407c00bd0048a0bd408c00"
++    "bd004ca0b90050abb90054a2b90058b1b9005cbe2d460803340023ce2d4601811103020491208084528000718b040065d2800001910030a7b8246871"
++    "b90004a0b90008af14000005382168e491000421f1004c3f540000603861690435ffff6491003021382168bf3400210e9102e184910080b1d2800001"
++    "1400000538216a2791000421f1004c3f540000603861688735ffff6791008021382168bfbd0034a3bd0038a2bd003ca1bd0040a0bd4014c0bd0044a0"
++    "bd4024c0bd0048a0b9004cbfb90050abb90054a2b90058bfb9005cbff240081f54001e81aa0003e5d28000211400000491000421f24008bf54000241"
++    "d37ef424910043e78b070091510004269100a3e78b0700842a0103e7710010df540000882d4600a1bc1fc080bc1fc221f9400ca52a0103e6f10000bf"
++    "7a47182054fffdad110482045280009191208084d28000018b04007291003245b8246871b9000640b9000a4f14000005382168a491000421f1004c3f"
++    "540000603861690435ffff649100302138216a5f3400182e9102e18491008251d28000011400000538216a2591000421f1004c3f5400006038616885"
++    "35ffff659100802138216a5f9100d245d28000210f000400d37ef424910043f18b11009e9100a3f18b110084510004311e2040016b1100df5400006d"
++    "bc5fc081bc5fc3c0bd0000a091000421bd0004a1910020a5f100183f54fffde153103c412a0b20212d4918072a070021b9005e413400126e39416d91"
++    "2d4911852d4a018153185e3111060204528000a79120808439416c108b040065d28000012d4a0803b8246867b90004a0910030a6b90008af14000005"
++    "382168c491000421f1004c3f540000603861690435ffff6491003021382168bf34000f0e9102e184910080a7d280000114000005382168e691000421"
++    "f1004c3f540000603861688635ffff6691008021382168bfbd0034a753081c41bd0038a62a0b4021bd003ca52a110202bd0040a4110015adbd0044a3"
++    "2a020021bd0048a2bd407c02bd004ca2bd408c02bd0050a2bd0054a1bd0058a0b9005ca12a0903e1b900086d11000529f8217940b9000c69a8c47bfd"
++    "d65f03c0bd400021528cccc172a7f4c11e2700201e2020305400044a0f0004000b0604c152800044531b6821112080218b214065b8214864910030a1"
++    "910080a4b90004bfb90008bfd503201f3900003f9100042139004c3feb04003f54ffff81bd0034a1110004c6bd0038a052800021b9003cbfb90040bf"
++    "b90044bfb90048bfb9004cbfb90050bfb90054bfb90058bfb9005cbfb9000866b900106117fffe80529999a172a801811e2700201e20203054000049"
++    "17ffffda5291c7211e2e100372a7fc611e27002052a884011e2700221e2018201e2338001e22080017ffffd1910200e7eb0500ff54ffdb20b9407ce1"
++    "34ffff81f94000e1eb0c003f54ffff212d4d00e1529e5941b94074e472ae29211e2700257100009f1a9f07e11e2520201a9f17fe2a1e083e321f03de"
++    "17fffecb3900823f17fffead12800002d28000062a0203eb5280002417fffe7b390080bf17ffff940f000400528000111e2040011e2040041e204005"
++    "17ffff6d390080bf17fffed93900825f17ffff4b390080bf17ffff040f0004001e20400117fffee2110005ad17ffff95528000075280000617ffff22"
+ )
+ 
+ # The HUD edge-anchor hook (0118): Pane::Calculate (main+0x909494, the vtable's
+@@ -288,7 +307,7 @@ def _hud_edge_frame_step(ctx):
+ FRAME_STEP = {BUILD_141: _hud_edge_frame_step}
+ 
+ BINDING = [
+-    {'what': "HUD edge anchor, v11 (hud_edge.c: entry + 0x13c cuts, compass 'PicStrap', lives 'Life'/'TxtLife', coins 'TxtCounterSh'/'TxtCounter', regional coins 'PicIconSh'/'PicIcon'/'TxtTotalShine' under a 'Counter', moons 'Counter'/'TxtTotalShine', hints 'TxtGuide01', matched by pane name only; the auto edge offset from the screen aspect -- iPhone 19.5:9 +140 out, iPhone Duo 1.43:1 -126 in, iPad 4:3 -160 in, 16:9 0 -- plus the launcher's manual settings from the DM_HUD_* environment variables (hud_manual.c, state page +0x200), which are a delta from the auto edge anchor (0128: the editor shows the element at its edge-anchored default and records the drag from there, so the manual offset is ADDED to the edge -- dragging in the editor moves the element by the same amount in the game, and a manual element still follows the aspect), and a hide that pushes the pane off-screen; the compass takes an extra +128 on its edge anchor (0128: its dial is centred in the 340-wide 'PicStrap' strip, so the plain edge puts the strip at the screen edge but the dial ~128 short of it -- the extra brings the dial, and the hints text in the strip, to the edge); a dirty flag so a moved container carries its children, an orig/mod table with the applied transform so a fixed offset never drifts, sixteen slots per HUD element (0126: log-20 shows TEN panes matching coins and eight slots thrashed, so the numbers drifted off-screen in V1.3.16); no settings UI in the game itself; 0123 regroups the moon icon + 020 into the coins element, splits the '+ menu / - map' hints into their own element, and adds parent compensation so a matched child of a matched parent (moon icon under the moons Counter, hints under the compass strip) is moved once, not twice; 0127 splits the two kinds of coins into two separately adjustable elements (coins, regional coins, moons), so the state page grows to 18 floats and the manual/hidden masks move to state +0x248/+0x24C; the white bar under the counts has no matching pane name and stays put, and the launcher editor no longer draws it; 0129 adds a diagnostic-only probe (hud_probe.c, state page +0x3300, gated by DM_HUD_PROBE=1) that logs every pane's name/parent/size/flags/global matrix on first sighting, the aspect and edge exactly as hud_edge reads and computes them, and, for every pane hud_edge matched, the decision it took (element index, slot, tdx/tdy/tk, hidden, the parent's table entry and whether it is a fresh sentinel, and the translation actually in the pane matrix) -- it moves no pane and changes no behaviour, and is deleted after use, never shipped; 0130 fixes the coin/regional numbers vanishing on device (log-36/37): a static leaf pane's +0x70 matrix is never composed by the game, so the stored original was (0,0) and the offset was written as an absolute position (TxtCounter final_m3 = tdx, -124/-140, off-screen) -- the original's translation is now rebuilt from the pane's local transform (+0x30) plus its parent's layout when the live matrix was never composed; the parent subtraction in hud_edge_unparent is kept, because a dynamic child's matrix does carry its parent's move (removing it would put TxtGuide01 at 1063, not 795); and the 'same transform' early return is gated on the child actually having inherited the parent's move, so a static child sharing its parent's transform is still moved; 0131 adds a layout record to the probe (type 3): for every pane hud_edge matched, the pane's own local translation (+0x30/+0x34), the parent's local translation, and the stored original's translation (e_orig[3]/e_orig[7]) after hud_edge -- the evidence 0130 needs, because 0130 had zero effect on device (log-38 identical to log-37): TxtCounter's local +0x30 is (0,0) on device, so the layout (263,71) is most likely in the parent Capture02/03's local transform, which 0130 never reads, and for the regional group the fallback never triggers and the (c) gate is trivially true; 0132 (log-41) confirms H3 -- the layout (263,71) is in neither the pane's local nor the immediate parent's local: the full chain (TxtCounter -> Capture03 -> RootPane) is visible in the log and sums to (0,-100), not (263,71), so the layout is not in the +0x30 chain at all -- and rebuilds the stored original from the FULL parent chain (the sum of the local translations (+0x30) from the pane up to the root, never any +0x70), when the pane has a matched parent (the unparent subtraction is spurious for a static child that never inherited its parent's move) or when its live matrix was never composed; and the 'same transform' early return now only applies when the original came from that chain-walk, so the regional panes (whose layouts (-52,10) and (55,0) ARE in the chain) are rebuilt correctly and move instead of being spuriously left unmoved (log-41: PicIconSh e_orig 88 and TxtTotalShine e_orig 195 were both constructed as g - pm_dx); the coins numbers still land off-screen in x (-140) with this fix alone, because their (263,71) layout is not in the chain -- a further probe must find where it lives", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
++    {'what': "HUD edge anchor, v12 (hud_edge.c: entry + 0x13c cuts, compass 'PicStrap', lives 'Life'/'TxtLife', coins 'TxtCounterSh'/'TxtCounter', regional coins 'PicIconSh'/'PicIcon'/'TxtTotalShine' under a 'Counter', moons 'Counter'/'TxtTotalShine', hints 'TxtGuide01', matched by pane name only; the auto edge offset from the screen aspect -- iPhone 19.5:9 +140 out, iPhone Duo 1.43:1 -126 in, iPad 4:3 -160 in, 16:9 0 -- plus the launcher's manual settings from the DM_HUD_* environment variables (hud_manual.c, state page +0x200), which are a delta from the auto edge anchor (0128: the editor shows the element at its edge-anchored default and records the drag from there, so the manual offset is ADDED to the edge -- dragging in the editor moves the element by the same amount in the game, and a manual element still follows the aspect), and a hide that pushes the pane off-screen; the compass takes an extra +128 on its edge anchor (0128: its dial is centred in the 340-wide 'PicStrap' strip, so the plain edge puts the strip at the screen edge but the dial ~128 short of it -- the extra brings the dial, and the hints text in the strip, to the edge); a dirty flag so a moved container carries its children, an orig/mod table with the applied transform so a fixed offset never drifts, sixteen slots per HUD element (0126: log-20 shows TEN panes matching coins and eight slots thrashed, so the numbers drifted off-screen in V1.3.16); no settings UI in the game itself; 0123 regroups the moon icon + 020 into the coins element, splits the '+ menu / - map' hints into their own element, and adds parent compensation so a matched child of a matched parent (moon icon under the moons Counter, hints under the compass strip) is moved once, not twice; 0127 splits the two kinds of coins into two separately adjustable elements (coins, regional coins, moons), so the state page grows to 18 floats and the manual/hidden masks move to state +0x248/+0x24C; the white bar under the counts has no matching pane name and stays put, and the launcher editor no longer draws it; 0129 adds a diagnostic-only probe (hud_probe.c, state page +0x3300, gated by DM_HUD_PROBE=1) that logs every pane's name/parent/size/flags/global matrix on first sighting, the aspect and edge exactly as hud_edge reads and computes them, and, for every pane hud_edge matched, the decision it took (element index, slot, tdx/tdy/tk, hidden, the parent's table entry and whether it is a fresh sentinel, and the translation actually in the pane matrix) -- it moves no pane and changes no behaviour, and is deleted after use, never shipped; 0130 fixes the coin/regional numbers vanishing on device (log-36/37): a static leaf pane's +0x70 matrix is never composed by the game, so the stored original was (0,0) and the offset was written as an absolute position (TxtCounter final_m3 = tdx, -124/-140, off-screen) -- the original's translation is now rebuilt from the pane's local transform (+0x30) plus its parent's layout when the live matrix was never composed; the parent subtraction in hud_edge_unparent is kept, because a dynamic child's matrix does carry its parent's move (removing it would put TxtGuide01 at 1063, not 795); and the 'same transform' early return is gated on the child actually having inherited the parent's move, so a static child sharing its parent's transform is still moved; 0131 adds a layout record to the probe (type 3): for every pane hud_edge matched, the pane's own local translation (+0x30/+0x34), the parent's local translation, and the stored original's translation (e_orig[3]/e_orig[7]) after hud_edge -- the evidence 0130 needs, because 0130 had zero effect on device (log-38 identical to log-37): TxtCounter's local +0x30 is (0,0) on device, so the layout (263,71) is most likely in the parent Capture02/03's local transform, which 0130 never reads, and for the regional group the fallback never triggers and the (c) gate is trivially true; 0132 (log-41) confirms H3 -- the layout (263,71) is in neither the pane's local nor the immediate parent's local: the full chain (TxtCounter -> Capture03 -> RootPane) is visible in the log and sums to (0,-100), not (263,71), so the layout is not in the +0x30 chain at all -- and rebuilds the stored original from the FULL parent chain (the sum of the local translations (+0x30) from the pane up to the root, never any +0x70), when the pane has a matched parent (the unparent subtraction is spurious for a static child that never inherited its parent's move) or when its live matrix was never composed; and the 'same transform' early return now only applies when the original came from that chain-walk, so the regional panes (whose layouts (-52,10) and (55,0) ARE in the chain) are rebuilt correctly and move instead of being spuriously left unmoved (log-41: PicIconSh e_orig 88 and TxtTotalShine e_orig 195 were both constructed as g - pm_dx); the coins numbers still land off-screen in x (-140) with this fix alone, because their (263,71) layout is not in the chain -- a further probe must find where it lives; 0133 extends the probe with two records per matched pane (type 4 chain, type 5 fields) to find it: the chain record logs the local translations (+0x30/+0x34) of the pane and each ancestor up to the root (five levels as floats, plus the depth walked -- log-41's chains are at most four levels, so five covers them; a deeper chain reports its depth and truncates), and the fields record logs the pane's and its parent's local scales (+0x48/+0x4c), sizes (+0x50/+0x54) and origins (+0x5b), and the pane's live global translation (+0x70) as the probe sees it -- the fields that could hold the (263,71) layout, which log-41 proved is in no +0x30 in the chain (H3); the live global is read after hud_edge, so on first sighting it is hud_edge's just-written value and the pre-write value is e_orig in the layout record", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
+      'why': "Pane::Calculate and the pane layout are this build's nn::ui2d code, found by the HUDLOG diagnostic run (log-17) and confirmed by disassembly of DmIOS; the edge offset comes from the screen aspect the loader already writes to state page + 0x58 (log-28). The manual settings come from the launcher's HUD editor (HudEditor.swift) through the same environment-variable channel the launcher already uses for its other settings (DM_SCREEN_ASPECT), so the game reads nothing new: the host copies them to state page +0x200 once per present. This replaces the cancelled draggable HUD (0113): it keeps no user-adjustable state in the game, reuses the 0118 pane-name hook, and its only tree walk is the bounded flag-only mark-dirty, so the 0113 crash class (a name/match walk reading a pane through a bad pointer) is structurally absent. V1.3.14 (build #45) showed the drift on device: with no manual settings at all (log-30: 'HUD manual: no DM_HUD_* set, auto edge anchor only') the coin/moon numbers vanished and the moon dots were wrong, because four panes share the coins element and two slots could not hold them; the table is the only state the stub keeps, so giving each pane its own slot removes the drift at its source.",
+      'blocked': 'the stubs have no function-matched form yet'},
+ ]
+diff --git a/dm/host/hud_manual.c b/dm/host/hud_manual.c
+index 6d7e5f3..e75fb5e 100644
+--- a/dm/host/hud_manual.c
++++ b/dm/host/hud_manual.c
+@@ -84,6 +84,14 @@ static int hud_parse(const char *s, float *dx, float *dy, float *k, int *hidden)
+ //   layout (0131): v0/v1=pane local +0x30/+0x34, v2/v3=parent local
+ //     +0x30/+0x34, v4/v5=e_orig[3]/e_orig[7] after hud_edge, w0=idx,
+ //     w1=slot.
++//   chain (0133): v0..v6 + w0..w2 (float bit patterns) = the local
++//     translations (+0x30/+0x34) of the pane and its ancestors, levels
++//     0..4; w3 = depth (bits 0-7) | idx (bits 8-15) | slot (bits 16-23).
++//     A depth over 5 means the chain continues past the stored levels.
++//   fields (0133): v0/v1=pane local scale +0x48/+0x4c, v2/v3=parent
++//     local scale, v4/v5=pane size, v6=live global x (+0x70 m[3]),
++//     w0=live global y (float bits), w1/w2=parent size w/h (float
++//     bits), w3=pane origin | parent origin<<8 | idx<<16 | slot<<24.
+ #define HUD_PROBE_OFF 0x3300
+ #define HUD_PROBE_MAGIC 0x50524245u
+ #define HUD_PROBE_REC_OFF 0x820
+@@ -166,6 +174,41 @@ static void dm_hud_probe_tick(void) {
+             uint32_t slot = *(uint32_t *)(rec + 84);
+             LOG("[hudprobe] layout pane '%s' idx=%d slot=%d local=(%.1f,%.1f) parent_local=(%.1f,%.1f) e_orig=(%.1f,%.1f)",
+                 name, (int)idx, (int)slot, lx, ly, plx, ply, eo3, eo7);
++        } else if (type == 4) {
++            // Chain (0133): levels 0..4 as floats (v0..v6, w0..w2 hold
++            // float bit patterns); w3 packs depth | idx<<8 | slot<<16.
++            // Levels at or beyond the depth are zero-filled by the stub
++            // and are not real; a depth over 5 means the chain continues
++            // past the stored levels.
++            float c[10];
++            for (int k = 0; k < 7; k++) c[k] = *(float *)(rec + 52 + k * 4);
++            for (int k = 0; k < 3; k++) c[7 + k] = *(float *)(rec + 80 + k * 4);
++            uint32_t w3 = *(uint32_t *)(rec + 92);
++            uint32_t depth = w3 & 0xffu;
++            uint32_t idx = (w3 >> 8) & 0xffu;
++            uint32_t slot = (w3 >> 16) & 0xffu;
++            LOG("[hudprobe] chain pane '%s' idx=%d slot=%d depth=%d chain=(%.1f,%.1f) (%.1f,%.1f) (%.1f,%.1f) (%.1f,%.1f) (%.1f,%.1f)%s",
++                name, (int)idx, (int)slot, (int)depth,
++                c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9],
++                depth > 5 ? " TRUNCATED" : "");
++        } else if (type == 5) {
++            float sx = *(float *)(rec + 52);
++            float sy = *(float *)(rec + 56);
++            float psx = *(float *)(rec + 60);
++            float psy = *(float *)(rec + 64);
++            float w = *(float *)(rec + 68);
++            float h = *(float *)(rec + 72);
++            float lgx = *(float *)(rec + 76);
++            float lgy = *(float *)(rec + 80);
++            float pw = *(float *)(rec + 84);
++            float ph = *(float *)(rec + 88);
++            uint32_t w3 = *(uint32_t *)(rec + 92);
++            uint32_t origin = w3 & 0xffu;
++            uint32_t porigin = (w3 >> 8) & 0xffu;
++            uint32_t idx = (w3 >> 16) & 0xffu;
++            uint32_t slot = (w3 >> 24) & 0xffu;
++            LOG("[hudprobe] fields pane '%s' idx=%d slot=%d scale=(%.3f,%.3f) parent_scale=(%.3f,%.3f) size=%.0fx%.0f parent_size=%.0fx%.0f origin=0x%02x parent_origin=0x%02x live_global=(%.1f,%.1f)",
++                name, (int)idx, (int)slot, sx, sy, psx, psy, w, h, pw, ph, origin, porigin, lgx, lgy);
+         }
+     }
+     hdr[2] = 0;   // reset the record count; the stub appends from 0 again
+-- 
+2.43.0
+
