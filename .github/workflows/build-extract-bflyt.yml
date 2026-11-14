@@ -1,0 +1,130 @@
+# 只提奥德赛 HUD 的 .bflyt 布局文件，不编 IPA。
+# 下 NSP（Google Drive）→ nx_extract 解出 RomFS.img → 递归收全部 *.bflyt → 打包 bflyt.zip 当产物。
+# .bflyt 在 NSP 的 romfs 里（Layout/ 等目录），HUD 每个 pane 的位置/尺寸都在里面；
+# (263,71) 的来源要靠这些文件验证，见 REPORT-HUD-SOURCE.md。
+# 跑完在 Artifacts 里下 odyssey-bflyt。
+name: Extract Odyssey .bflyt layouts (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      drive_base_id:
+        description: "Google Drive 文件 ID：本体 NSP（链接里 /d/ 后面那串）"
+        required: true
+        default: "18WXMdiLFF6FXuvcn5eSnkl5BJltpzCwZ"
+      drive_update_id:
+        description: "Google Drive 文件 ID：更新 NSP v393216（链接里 /d/ 后面那串）"
+        required: true
+        default: "1M-8AIkLR-5gAvFfxEqJ0TMDNRsIggK-G"
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: xcode-27
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync engine
+        run: |
+          set -euo pipefail
+          python3 tools/engine.py sync
+          du -sh engine
+
+      - name: Install build tools
+        run: |
+          set -euo pipefail
+          brew bundle --file=Brewfile
+
+      - name: Python venv and packages
+        run: |
+          set -euo pipefail
+          python3 -m venv .venv
+          .venv/bin/python -m pip install -U pip
+          .venv/bin/python -m pip install lz4 capstone fonttools zbic nsz "backports.zstd; python_version < '3.14'" gdown
+
+      - name: Download NSPs from Google Drive
+        env:
+          BASE_ID: ${{ inputs.drive_base_id }}
+          UPDATE_ID: ${{ inputs.drive_update_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/game"
+          .venv/bin/python -m gdown "$BASE_ID" -O "$RUNNER_TEMP/game/base.nsp"
+          .venv/bin/python -m gdown "$UPDATE_ID" -O "$RUNNER_TEMP/game/update.nsp"
+          ls -lh "$RUNNER_TEMP/game/"
+          # 本体约 5.2GB、更新约 379MB；下到确认页/小文件就直接失败，别往下走
+          test "$(stat -f%z "$RUNNER_TEMP/game/base.nsp")" -gt 1000000000
+          test "$(stat -f%z "$RUNNER_TEMP/game/update.nsp")" -gt 100000000
+
+      - name: Write prod.keys from secret
+        env:
+          PROD_KEYS: ${{ secrets.PROD_KEYS }}
+        run: |
+          set -euo pipefail
+          test -n "$PROD_KEYS"
+          printf '%s' "$PROD_KEYS" > "$RUNNER_TEMP/prod.keys"
+          chmod 600 "$RUNNER_TEMP/prod.keys"
+          wc -l "$RUNNER_TEMP/prod.keys"
+
+      - name: Build nx_extract
+        run: |
+          set -euo pipefail
+          # engine/scripts/build_ipa_from_nsp.py 的 build_nx_extract() 同款：
+          # dotnet build engine/dm/tools/nx_extract，产物是 nx_extract 可执行文件。
+          # Brewfile 已装 dotnet-sdk（cask "dotnet-sdk"）。
+          dotnet build engine/dm/tools/nx_extract -c Release -o "$RUNNER_TEMP/nx_extract" -v quiet -nologo
+          test -x "$RUNNER_TEMP/nx_extract/nx_extract"
+
+      - name: Extract RomFS.img from NSPs
+        run: |
+          set -euo pipefail
+          # build_ipa_from_nsp.py 的 extract() 同款调用：
+          # nx_extract <prod.keys> <本体> <更新> <输出目录> --romfs-image --app <本体 title ID>
+          # 输出目录里得 RomFS.img（更新合并后的最新版）+ ExeFS/。
+          mkdir -p "$RUNNER_TEMP/extract"
+          "$RUNNER_TEMP/nx_extract/nx_extract" "$RUNNER_TEMP/prod.keys" "$RUNNER_TEMP/game/base.nsp" "$RUNNER_TEMP/game/update.nsp" "$RUNNER_TEMP/extract" --romfs-image --app 0100000000010000
+          test -f "$RUNNER_TEMP/extract/RomFS.img"
+          ls -lh "$RUNNER_TEMP/extract/RomFS.img"
+
+      - name: Collect all .bflyt files
+        run: |
+          set -euo pipefail
+          # engine/dm/tools/romfs.py 的 read-only RomFS 视图：不解开整个 RomFS，
+          # 只按路径读出 *.bflyt（build_ipa_from_nsp.py 用同款 rglob 找 *.pak/*.utoc）。
+          # 不猜单个路径：递归收全部 *.bflyt，相对路径保留在 zip 里。
+          .venv/bin/python - <<'EOF'
+          import os
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, 'engine/dm/tools')
+          import romfs as rfs
+          src = rfs.source(Path(os.environ['RUNNER_TEMP']) / 'extract')
+          found = sorted(src.rglob('*.bflyt'))
+          print(f'{len(found)} .bflyt files')
+          if not found:
+              raise SystemExit('no .bflyt files found in RomFS.img')
+          out = Path('bflyt')
+          for p in found:
+              rel = p.relative_to(src)
+              print(rel)
+              dest = out / rel
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              dest.write_bytes(p.read_bytes())
+          EOF
+          find bflyt -type f | wc -l
+
+      - name: Zip .bflyt files
+        run: |
+          set -euo pipefail
+          zip -r bflyt.zip bflyt
+          ls -lh bflyt.zip
+
+      - name: Upload .bflyt archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: odyssey-bflyt
+          path: bflyt.zip
+          if-no-files-found: error
