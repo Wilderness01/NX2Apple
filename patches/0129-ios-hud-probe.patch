@@ -1,0 +1,589 @@
+From fef84a9c584a9b42948fd992926fcfd6055f7dbe Mon Sep 17 00:00:00 2001
+From: verify <verify@example.invalid>
+Date: Sat, 14 Nov 2026 01:07:04 +0000
+Subject: [PATCH] 0129: diagnostic-only HUD probe (logs pane names,
+ aspect/edge, and hud_edge decisions)
+
+V1.3.18's HUD is one edge (140) from where 0128 should have put it, and
+log-35 ruled hiding out as the trigger, so the prime suspect is that
+hud_edge reads edge=0 (the aspect not reaching it, or out of range). This
+probe logs, per pane on first sighting (gated by DM_HUD_PROBE=1):
+
+- the pane's name, parent, size, origin, flags and global matrix;
+- the aspect and the edge exactly as hud_edge reads and computes them
+  (state +0x58), the direct test of the edge=0 hypothesis;
+- for every pane hud_edge matched, the decision it took: element index,
+  slot, tdx/tdy/tk, hidden, the parent's table entry (and whether it is
+  a fresh sentinel), and the translation actually in the pane matrix.
+
+It moves no pane and changes no behaviour: hud_probe.c writes compact
+binary records into a probe buffer at state +0x3300 (after the hud_edge
+table; the state page is 0x4000 bytes), and hud_manual.c's
+dm_hud_probe_tick formats them into [hudprobe] log lines once per
+present. Deduped per pane address (256), 13 records per flush, first
+sighting only. Deleted after use, never shipped.
+---
+ dm/games/0100000000010000/hud_probe.c | 333 ++++++++++++++++++++++++++
+ dm/games/0100000000010000/patches.py  |  68 +++++-
+ dm/host/hud_manual.c                  |  95 ++++++++
+ 3 files changed, 495 insertions(+), 1 deletion(-)
+ create mode 100644 dm/games/0100000000010000/hud_probe.c
+
+diff --git a/dm/games/0100000000010000/hud_probe.c b/dm/games/0100000000010000/hud_probe.c
+new file mode 100644
+index 0000000..311fa8a
+--- /dev/null
++++ b/dm/games/0100000000010000/hud_probe.c
+@@ -0,0 +1,333 @@
++// hud_probe.c -- diagnostic probe (0129). Adds logging only; changes no HUD behavior.
++//
++// The user authorised this probe ("directly do the probe") after V1.3.18
++// (0128) still showed a broken HUD on device: the coin/regional numbers do
++// not render at all, and the compass/hints do not reach the edge. A
++// user-side control test ruled hiding OUT as the trigger (log-35: hidden
++// mask 0x11 -> 0x00, numbers still missing), so the prime hypothesis is
++// that hud_edge reads edge = 0 (the aspect never reaches it, or it is out
++// of range), so the manual base is 0 and tdx degenerates to the old
++// manual_dx -- which matches the diagnosis that the icons sit exactly one
++// edge (140) away from where 0128 should have put them.
++//
++// This probe answers, from the device, in one log:
++//   1. every pane's name, parent, size, origin, flags and global matrix
++//      (first sighting only) -- to identify the moon dots and the visible
++//      hints text, whose real pane names are still unknown (TxtGuide01 is
++//      disproven; the dots have no name in any dump so far);
++//   2. the aspect and the edge exactly as hud_edge reads/computes them
++//      (from the aspect_ptr hud_edge is passed, state +0x58 -- NOT the
++//      screen-shape code, which already says 140 but reads a different
++//      path) -- the direct test of the edge = 0 hypothesis;
++//   3. for every pane hud_edge matched, the decision it actually took:
++//      element index, slot, tdx/tdy/tk, hidden, the parent's table entry
++//      (pm_dx/pm_dy, whether the parent entry is a fresh sentinel) and
++//      the translation actually written back to the pane matrix
++//      (final_m3/final_m7) -- so a corrupted number-pane matrix, a stale
++//      parent, or an off-screen push is visible, not guessed.
++//
++// How it works: the rewriter's two Pane::Calculate cuts call this stub
++// after hud_edge (same arguments, plus the probe buffer). The stub writes
++// compact binary records into a probe buffer in the frame-step state page
++// (state +0x3300, 3328 bytes: a 32-byte header, a 256-address seen-table,
++// and 13 records of 96 bytes). The host (hud_manual.c,
++// dm_hud_probe_tick, once per present) formats the records into
++// "[hudprobe] ..." log lines and resets the record count. The stub never
++// writes text and never calls a log function: it only reads pane memory
++// and writes the probe buffer, so it cannot disturb the game. It is gated
++// by the environment variable DM_HUD_PROBE=1 (the host sets the buffer's
++// enabled flag from it; the stub returns immediately when the flag is 0).
++// Dedup is by pane address (first sighting only, 256 addresses); a full
++// record buffer just defers (the pane stays un-seen and retries next
++// frame), and the host flushes every present, so a 5-second stand-still
++// logs every pane. Delete after use; never ship.
++//
++// All probe-buffer accesses are volatile: the buffer is shared with the
++// host (which sets the enabled flag and drains the records), so the
++// compiler must emit each access exactly as written -- and, as a side
++// effect, it cannot vectorise the header initialisation or combine
++// adjacent stores into a literal-pool load, which would break the
++// relocation-free requirement below.
++//
++// Compiled with: aarch64-linux-gnu-gcc -O2 -ffreestanding -fno-builtin
++//   -fno-stack-protector -fno-jump-tables -fno-asynchronous-unwind-tables -c
++// (same flags as hud_edge.c). The function takes everything through its
++// arguments -- no static data, no literal pool, no external calls -- so
++// the emitted words are position-independent and relocation-free and can be
++// dropped into the rewriter's patch area verbatim:
++//   x0 = the pane (nn::ui2d::Pane *), x1 = the aspect (a pointer to state
++//   page + 0x58), x2 = the edge table (state page + 0x300), x3 = the probe
++//   buffer (state page + 0x3300).
++
++typedef unsigned int u32;
++typedef unsigned long long u64;
++typedef unsigned long uintptr_t;
++
++// The probe buffer (state + 0x3300, 3328 bytes: the frame-step state page
++// is 0x4000 bytes and the hud_edge table ends at +0x3300, so +0x3300..+0x4000
++// is free). Header 32 bytes, seen-table 256 x 8 bytes, record buffer
++// 13 x 96 bytes: 32 + 2048 + 1248 = 3328, exactly the free region.
++#define HUD_PROBE_MAGIC 0x50524245u   // "PRBE"
++#define HUD_PROBE_HDR_SIZE 32
++#define HUD_PROBE_SEEN_CAP 256
++#define HUD_PROBE_REC_CAP 13
++#define HUD_PROBE_REC_SIZE 96
++// Header offsets (relative to probe_buf).
++#define HP_MAGIC 0
++#define HP_ENABLED 4
++#define HP_REC_COUNT 8
++#define HP_SEEN_COUNT 12
++#define HP_ASPECT_LOGGED 16
++#define HP_REC_CAP 20
++#define HP_SEEN_CAP 24
++#define HP_RESERVED 28
++// Seen-table at +32 (256 x 8 = 2048 bytes, ends +2080); record buffer at
++// +2080 (13 x 96 = 1248 bytes, ends +3328).
++#define HP_SEEN_OFF 32
++#define HP_REC_OFF 2080
++
++// Record types.
++#define HP_REC_PANE 0
++#define HP_REC_EDGE 1
++#define HP_REC_ASPECT 2
++// Record field offsets (relative to the record start, 96 bytes total).
++#define HP_R_TYPE 0
++#define HP_R_ADDR_LO 4
++#define HP_R_ADDR_HI 8
++#define HP_R_NAME 12        // char[20]
++#define HP_R_PNAME 32       // char[20]
++#define HP_R_V0 52
++#define HP_R_V1 56
++#define HP_R_V2 60
++#define HP_R_V3 64
++#define HP_R_V4 68
++#define HP_R_V5 72
++#define HP_R_V6 76
++#define HP_R_W0 80
++#define HP_R_W1 84
++#define HP_R_W2 88
++#define HP_R_W3 92
++
++// The hud_edge table (must match hud_edge.c): 96 entries of 128 bytes,
++// sixteen slots per element; entry +0 the pane, +104/+108/+112 the applied
++// dx/dy/k, +116 the hidden flag, +120 the element index, +124 the valid flag.
++#define HUD_EDGE_N 6
++#define HUD_EDGE_ENTRY 128
++#define HUD_EDGE_SLOTS_PER_ELEM 16
++
++// Store a u32 / float into the probe buffer (volatile: one access, exactly
++// as written -- no vectorising, no combining, no literal pool).
++static inline __attribute__((always_inline)) void hp_put_u32(volatile char *base, int off, u32 v) {
++    *(volatile u32 *)(base + off) = v;
++}
++static inline __attribute__((always_inline)) void hp_put_f32(volatile char *base, int off, float v) {
++    *(volatile float *)(base + off) = v;
++}
++
++// Copy a pane name (a C string) into dst, at most max-1 chars, always
++// NUL-terminated. The source is read byte by byte so a short or
++// unterminated name cannot run past the buffer.
++static inline __attribute__((always_inline)) void hud_probe_copy_name(volatile char *dst, const char *src, int max) {
++    int i = 0;
++    if (src) {
++        for (; i < max - 1; i++) {
++            char c = src[i];
++            if (c == 0) break;
++            dst[i] = c;
++        }
++    }
++    dst[i] = 0;
++}
++
++// Find the hud_edge table entry for a pane (the same linear scan
++// hud_edge.c uses). Returns 0 when the pane has no entry (never matched,
++// or its slot was reclaimed).
++static inline __attribute__((always_inline)) char *hud_probe_find_entry(void *table, void *pane) {
++    for (int i = 0; i < HUD_EDGE_N * HUD_EDGE_SLOTS_PER_ELEM; i++) {
++        char *e = (char *)table + i * HUD_EDGE_ENTRY;
++        if (*(u32 *)(e + 124) != 0 && *(uintptr_t *)(e + 0) == (uintptr_t)pane) return e;
++    }
++    return 0;
++}
++
++// The edge offset from an aspect, exactly as hud_edge.c computes it:
++// valid aspects are 1.3 to 2.2; anything else is 16:9 (edge 0). Clamped
++// to +/-200.
++static inline __attribute__((always_inline)) float hud_probe_edge(float aspect) {
++    float edge = 0.0f;
++    if (aspect >= 1.3f && aspect <= 2.2f) {
++        edge = 640.0f * (aspect / 1.7777778f - 1.0f);
++        if (edge > 200.0f) edge = 200.0f;
++        if (edge < -200.0f) edge = -200.0f;
++    }
++    return edge;
++}
++
++void hud_probe(void *pane, const float *aspect_ptr, void *table, void *probe_buf) {
++    if (!pane || !aspect_ptr || !table || !probe_buf) return;
++    volatile u32 *hdr = (volatile u32 *)probe_buf;
++    // Initialise the header the first time (the state page starts zeroed).
++    // The enabled flag is left 0 here; the host sets it from DM_HUD_PROBE.
++    if (hdr[HP_MAGIC / 4] != HUD_PROBE_MAGIC) {
++        hdr[HP_MAGIC / 4] = HUD_PROBE_MAGIC;
++        hdr[HP_ENABLED / 4] = 0;
++        hdr[HP_REC_COUNT / 4] = 0;
++        hdr[HP_SEEN_COUNT / 4] = 0;
++        hdr[HP_ASPECT_LOGGED / 4] = 0;
++        hdr[HP_REC_CAP / 4] = HUD_PROBE_REC_CAP;
++        hdr[HP_SEEN_CAP / 4] = HUD_PROBE_SEEN_CAP;
++        hdr[HP_RESERVED / 4] = 0;
++    }
++    if (hdr[HP_ENABLED / 4] == 0) return;   // DM_HUD_PROBE != 1: do nothing
++
++    // Flags bit 7 is set by Pane::Calculate's epilogue, so it tells whether
++    // this pane has ever calculated (same guard hud_edge.c uses). On a
++    // pane's very first frame its matrix is still zero; skip it -- the
++    // +0x13c cut catches it after the game computes it, and the entry cut
++    // catches it from the next frame on. Logging a zero matrix would
++    // misidentify the pane's position.
++    unsigned short pflags = *(const unsigned short *)((const char *)pane + 0x58);
++    if (!(pflags & 0x80u)) return;
++
++    // The aspect / edge summary, once, from the aspect_ptr hud_edge itself
++    // is passed (state +0x58) -- not the screen-shape code. This is the
++    // direct test of the edge = 0 hypothesis: if hud_edge reads a valid
++    // aspect the edge here is 140 on iPhone 19.5:9; if it reads 0 or an
++    // out-of-range aspect the edge here is 0.
++    if (hdr[HP_ASPECT_LOGGED / 4] == 0) {
++        u32 rc = hdr[HP_REC_COUNT / 4];
++        if (rc < HUD_PROBE_REC_CAP) {
++            float aspect = *aspect_ptr;
++            float edge = hud_probe_edge(aspect);
++            volatile char *rec = (volatile char *)probe_buf + HP_REC_OFF + rc * HUD_PROBE_REC_SIZE;
++            hp_put_u32(rec, HP_R_TYPE, HP_REC_ASPECT);
++            hp_put_u32(rec, HP_R_ADDR_LO, 0);
++            hp_put_u32(rec, HP_R_ADDR_HI, 0);
++            for (int i = 0; i < 20; i++) { rec[HP_R_NAME + i] = 0; rec[HP_R_PNAME + i] = 0; }
++            hp_put_f32(rec, HP_R_V0, aspect);
++            hp_put_f32(rec, HP_R_V1, edge);
++            hp_put_f32(rec, HP_R_V2, 0.0f);
++            hp_put_f32(rec, HP_R_V3, 0.0f);
++            hp_put_f32(rec, HP_R_V4, 0.0f);
++            hp_put_f32(rec, HP_R_V5, 0.0f);
++            hp_put_f32(rec, HP_R_V6, 0.0f);
++            hp_put_u32(rec, HP_R_W0, 0);
++            hp_put_u32(rec, HP_R_W1, 0);
++            hp_put_u32(rec, HP_R_W2, 0);
++            hp_put_u32(rec, HP_R_W3, 0);
++            hdr[HP_REC_COUNT / 4] = rc + 1;
++            hdr[HP_ASPECT_LOGGED / 4] = 1;
++        }
++        // No room: leave aspect_logged clear so it retries next call.
++    }
++
++    // Dedup by pane address (first sighting only). A pane the hook sees
++    // again (the entry cut and the +0x13c cut both visit it, and every
++    // frame after) is skipped.
++    volatile u64 *seen = (volatile u64 *)((char *)probe_buf + HP_SEEN_OFF);
++    u32 sc = hdr[HP_SEEN_COUNT / 4];
++    for (u32 i = 0; i < sc; i++) {
++        if (seen[i] == (uintptr_t)pane) return;
++    }
++    if (sc >= HUD_PROBE_SEEN_CAP) return;   // seen-table full: stop, do not flood
++
++    // Is this pane matched by hud_edge (does it have a table entry)? The
++    // entry gives the element index, the slot, and the transform hud_edge
++    // actually applied -- read from the table, never recomputed here, so
++    // the decision logged is the decision taken.
++    char *ent = hud_probe_find_entry(table, pane);
++    int matched = ent != 0;
++    int idx = -1, slot = -1;
++    if (matched) {
++        idx = (int)(*(u32 *)(ent + 120));
++        int entry_index = (int)(((uintptr_t)ent - (uintptr_t)table) / HUD_EDGE_ENTRY);
++        slot = (entry_index - idx) / HUD_EDGE_N;
++    }
++    // How many records: one pane record, plus one edge-decision record
++    // when matched. Both must fit, or neither is written and the pane
++    // stays un-seen (it retries next frame, when the host has flushed).
++    int need = matched ? 2 : 1;
++    u32 rc = hdr[HP_REC_COUNT / 4];
++    if (rc + (u32)need > HUD_PROBE_REC_CAP) return;
++
++    // The pane's own fields (offsets confirmed in hud_edge.c): name +0xb8,
++    // parent +0x18 (parent name via the parent's +0xb8), size +0x50/+0x54,
++    // origin +0x5b, flags +0x58, global matrix +0x70 (m[3]/m[7]
++    // translation, m[0]/m[5] scale).
++    void *parent = *(void **)((const char *)pane + 0x18);
++    int parent_ok = parent != 0 && (((uintptr_t)parent & 7u) == 0);
++    const float *g = (const float *)((const char *)pane + 0x70);
++    {
++        volatile char *rec = (volatile char *)probe_buf + HP_REC_OFF + rc * HUD_PROBE_REC_SIZE;
++        hp_put_u32(rec, HP_R_TYPE, HP_REC_PANE);
++        hp_put_u32(rec, HP_R_ADDR_LO, (u32)(uintptr_t)pane);
++        hp_put_u32(rec, HP_R_ADDR_HI, (u32)((uintptr_t)pane >> 32));
++        hud_probe_copy_name(rec + HP_R_NAME, (const char *)pane + 0xb8, 20);
++        if (parent_ok) hud_probe_copy_name(rec + HP_R_PNAME, (const char *)parent + 0xb8, 20);
++        else rec[HP_R_PNAME] = 0;
++        hp_put_f32(rec, HP_R_V0, *(const float *)((const char *)pane + 0x50));   // w
++        hp_put_f32(rec, HP_R_V1, *(const float *)((const char *)pane + 0x54));   // h
++        hp_put_f32(rec, HP_R_V2, g[3]);   // global x
++        hp_put_f32(rec, HP_R_V3, g[7]);   // global y
++        hp_put_f32(rec, HP_R_V4, g[0]);   // global sx
++        hp_put_f32(rec, HP_R_V5, g[5]);   // global sy
++        hp_put_f32(rec, HP_R_V6, 0.0f);
++        hp_put_u32(rec, HP_R_W0, (u32)(*(const unsigned char *)((const char *)pane + 0x5b)));   // origin
++        hp_put_u32(rec, HP_R_W1, (u32)(*(const unsigned short *)((const char *)pane + 0x58)));  // flags
++        hp_put_u32(rec, HP_R_W2, (u32)(uintptr_t)parent);   // paddr low
++        hp_put_u32(rec, HP_R_W3, (u32)((uintptr_t)parent >> 32));   // paddr high
++        rc++;
++    }
++
++    // The edge decision, for a matched pane only: the element index and
++    // slot (from the entry), the transform hud_edge applied (from the
++    // entry's stored dx/dy/k/hidden), the parent's table entry (its
++    // applied dx/dy, whether it is hidden, and whether its entry is the
++    // fresh 1e30f sentinel -- a stale parent is visible here), and the
++    // translation actually in the pane matrix now (final_m3/final_m7 --
++    // hud_edge already wrote the modified matrix back to the pane, so
++    // this is where the pane really renders, including any +10000 push).
++    if (matched) {
++        float tdx = *(const float *)(ent + 104);
++        float tdy = *(const float *)(ent + 108);
++        float tk = *(const float *)(ent + 112);
++        u32 hidden = *(const u32 *)(ent + 116);
++        float pm_dx = 0.0f, pm_dy = 0.0f;
++        int pm_hidden = 0, has_parent = 0, pm_sentinel = 0;
++        if (parent_ok) {
++            char *pe = hud_probe_find_entry(table, parent);
++            if (pe) {
++                has_parent = 1;
++                pm_dx = *(const float *)(pe + 104);
++                pm_dy = *(const float *)(pe + 108);
++                pm_hidden = (*(const u32 *)(pe + 116) != 0);
++                pm_sentinel = (*(const float *)(pe + 104) == 1e30f);
++            }
++        }
++        volatile char *rec = (volatile char *)probe_buf + HP_REC_OFF + rc * HUD_PROBE_REC_SIZE;
++        hp_put_u32(rec, HP_R_TYPE, HP_REC_EDGE);
++        hp_put_u32(rec, HP_R_ADDR_LO, (u32)(uintptr_t)pane);
++        hp_put_u32(rec, HP_R_ADDR_HI, (u32)((uintptr_t)pane >> 32));
++        hud_probe_copy_name(rec + HP_R_NAME, (const char *)pane + 0xb8, 20);
++        if (parent_ok) hud_probe_copy_name(rec + HP_R_PNAME, (const char *)parent + 0xb8, 20);
++        else rec[HP_R_PNAME] = 0;
++        hp_put_f32(rec, HP_R_V0, tdx);
++        hp_put_f32(rec, HP_R_V1, tdy);
++        hp_put_f32(rec, HP_R_V2, tk);
++        hp_put_f32(rec, HP_R_V3, pm_dx);
++        hp_put_f32(rec, HP_R_V4, pm_dy);
++        hp_put_f32(rec, HP_R_V5, g[3]);   // final_m3 (translation now in the pane matrix)
++        hp_put_f32(rec, HP_R_V6, g[7]);   // final_m7
++        hp_put_u32(rec, HP_R_W0, (u32)idx);
++        hp_put_u32(rec, HP_R_W1, (u32)slot);
++        hp_put_u32(rec, HP_R_W2, hidden);
++        hp_put_u32(rec, HP_R_W3, (u32)(pm_hidden | (has_parent << 1) | (pm_sentinel << 2)));
++        rc++;
++    }
++
++    hdr[HP_REC_COUNT / 4] = rc;
++    // Mark seen only after both records were written, so a deferred pane
++    // (buffer full) retries next frame instead of being lost.
++    seen[sc] = (uintptr_t)pane;
++    hdr[HP_SEEN_COUNT / 4] = sc + 1;
++}
+diff --git a/dm/games/0100000000010000/patches.py b/dm/games/0100000000010000/patches.py
+index f3c38d0..7225684 100644
+--- a/dm/games/0100000000010000/patches.py
++++ b/dm/games/0100000000010000/patches.py
+@@ -126,6 +126,50 @@ HUD_EDGE_WORDS = (
+     "54ffa8e1f9400c075280008b2a0b03e517fffd70b940c0047101a09f54fff680d65f03c0"
+ )
+ 
++# hud_probe, compiled from hud_probe.c (hud_probe at +0) with the same
++# flags as hud_edge. A diagnostic-only stub (0129): it writes compact
++# binary records into a probe buffer in the frame-step state page (state +
++# 0x3300, after the hud_edge table) and changes nothing about the HUD -- no
++# pane is moved, no transform is applied, no slot is taken. The host
++# (hud_manual.c dm_hud_probe_tick, once per present) formats the records
++# into "[hudprobe] ..." log lines. It takes everything through its
++# arguments, so these words are position-independent and relocation-free:
++#   x0 = the pane, x1 = the aspect (state + 0x58), x2 = the table (state +
++#   0x300), x3 = the probe buffer (state + 0x3300).
++# What it logs (first sighting per pane address, 256 addresses; the host
++# flushes the 13-record buffer every present, so a 5-second stand-still
++# logs every pane): the pane's name, parent, size, origin, flags and
++# global matrix; the aspect and the edge exactly as hud_edge reads and
++# computes them (the direct test of the edge = 0 hypothesis -- V1.3.18's
++# icons sit exactly one edge (140) from where 0128 should have put them,
++# and log-35 ruled hiding out as the trigger); and, for every pane hud_edge
++# matched, the decision it actually took (element index, slot, tdx/tdy/tk,
++# hidden, the parent's table entry and whether it is a fresh sentinel, and
++# the translation actually in the pane matrix). Gated by the environment
++# variable DM_HUD_PROBE=1 (the host sets the buffer's enabled flag from
++# it). Delete after use; never ship.
++HUD_PROBE_WORDS = (
++    "f100001ffa40182454000500f100005ffa401864540004a0b9400065528848a472aa0a446b0400bf54000160b9000064528001a5b900047f52802004"
++    "b900087fb9000c7fb900107fb9001465b9001864b9001c7fb9400464340002847940b00436380244b940106435000084b9400866710030df54001489"
++    "b9400c689100806a340001a8aa0a03e18b284d4514000003eb05003f540000c0f940002491002021eb00009f54ffff61d65f03c07103fd1f54ffffc8"
++    "aa0203e791400c45aa0203e11400000491020021eb0100bf54001b40b9407c24aa0103e634ffff64f9400024eb04001f54ffff01cb020022b94078ce"
++    "5295556152800044d347fc4272a555414b0e00429b217c41d360fc214b827c22b940086f0b0401e17100343f54fffc68a9bf7bfd52800010910003fd"
++    "f9400c0cb400006cf240099f1a9f17f00b0f05e9d360fc119102e00bd2800001531b6924531b6932912080848b0400699100312db824687fb9000520"
++    "b900093114000005382169a491000421f1004c3f540000603861696435ffff64910030213821693f340014f09102e18d9100813ed280000114000005"
++    "38216bc491000421f1004c3f54000060386169a435ffff64910080213821693fbd405000d360fd817940b004bd003520bd405400bd003920bd407c00"
++    "bd003d20bd408c00bd004120bd407000bd004520bd408400bd004920b9004d3f39416c0db900512db9005524b900592cb9005d21b40011e62d4d0cc2"
++    "bd4070c4b94074c935000e300f000400528000071e204001110182445280002d91208084d28000018b040065910030a6b824686db90004a0b90008b1"
++    "14000005382168c491000421f1004c3f540000603861696435ffff6491003021382168bf34000e709102e18d910080a6d280000114000005382168c4"
++    "91000421f1004c3f54000060386169a435ffff6491008021382168bfbd0034a2110009efbd0038a3bd003ca4bd0040a1bd0044a0bd407c00bd0048a0"
++    "bd408c00bd004ca0b90050aeb90054a2b90058a9b9005ca72a0803e1b900086f11000508f8217940a8c17bfdb9000c68d65f03c0bd400021528cccc1"
++    "72a7f4c11e2700201e2020305400042a0f0004000b0604c152800044531b6821112080218b214065b8214864910030a1910080a4b90004bfb90008bf"
++    "3900003f9100042139004c3feb04003f54ffff81bd0034a1110004c6bd0038a052800021b9003cbfb90040bfb90044bfb90048bfb9004cbfb90050bf"
++    "b90054bfb90058bfb9005cbfb9000866b900106117ffff38529999a172a801811e2700201e2020305400004917ffffdb5291c7211e2e100372a7fc61"
++    "1e27002052a884011e2700221e2018201e2338001e22080017ffffd2910200e7eb0700bf54fff220b9407ce134ffff81f94000e1eb0c003f54ffff21"
++    "2d4d00e1529e5941b94074e472ae29211e2700257100009f1a9f07e11e2520201a9f17e72a070827321f00e717ffff833900813f17ffff6512800002"
++    "d28000062a0203ee5280002417ffff33390080bf17ffff99110005ef17ffffa5"
++)
++
+ # The HUD edge-anchor hook (0118): Pane::Calculate (main+0x909494, the vtable's
+ # slot 19) recomputes every pane's global matrix and then its children's. TWO cuts
+ # call the same hud_edge, because one cut misses static panes: the +0x13c cut
+@@ -164,6 +208,10 @@ def _hud_edge_frame_step(ctx):
+     hx = ''.join(HUD_EDGE_WORDS)
+     for i in range(0, len(hx), 8):
+         emit(int(hx[i:i + 8], 16))
++    probe_code = here()
++    px = ''.join(HUD_PROBE_WORDS)
++    for i in range(0, len(px), 8):
++        emit(int(px[i:i + 8], 16))
+     # The +0x13c cut: `orr w22, wzr, #0x1` at Pane::Calculate+0x13c (main+ offsets:
+     # fs_site/fs_put/B take IMG offsets, not DmIOS file offsets, which are +0xf4000).
+     fs_site(0x9095d0, 'f6030032')
+@@ -174,6 +222,15 @@ def _hud_edge_frame_step(ctx):
+     emit(ADRP(2, here(), FS_STATE_OFF)); emit(ADDI(2, 2, 0x300))   # x2 = state + 0x300 (table)
+     emit(ADRP(3, here(), FS_STATE_OFF)); emit(ADDI(3, 3, 0x200))   # x3 = state + 0x200 (the manual params, hud_manual.c)
+     emit(B(here(), hud_code) | 0x80000000)    # bl hud_edge
++    # Probe (0129): call hud_probe with the same pane/aspect/table, plus the
++    # probe buffer. x0-x3 are caller-saved, so re-set them all (hud_edge may
++    # have clobbered them); x8/x9 stay saved on the stack until after this
++    # call, and x19 (the pane) is callee-saved, so it is still live.
++    emit(0xaa1303e0)                          # mov x0, x19 (the pane)
++    emit(ADRP(1, here(), FS_STATE_OFF)); emit(ADDI(1, 1, 0x58))    # x1 = state + 0x58 (the aspect)
++    emit(ADRP(2, here(), FS_STATE_OFF)); emit(ADDI(2, 2, 0x300))   # x2 = state + 0x300 (table)
++    emit(ADRP(3, here(), FS_STATE_OFF + 0x3000)); emit(ADDI(3, 3, 0x300))  # x3 = state + 0x3300 (probe buffer; 0x3300 does not fit one ADDI, so take the +0x3000 page and add 0x300)
++    emit(B(here(), probe_code) | 0x80000000)  # bl hud_probe
+     emit(LDP_POST(8, 9, 31, 16))              # ldp x8, x9, [sp], #0x10 (restore the flags)
+     emit(0x320003f6)                          # orr w22, wzr, #0x1 (the replaced instruction)
+     emit(B(here(), 0x9095d4))                 # back to the hook site + 4
+@@ -192,6 +249,15 @@ def _hud_edge_frame_step(ctx):
+     emit(ADRP(2, here(), FS_STATE_OFF)); emit(ADDI(2, 2, 0x300))   # x2 = state + 0x300 (table)
+     emit(ADRP(3, here(), FS_STATE_OFF)); emit(ADDI(3, 3, 0x200))   # x3 = state + 0x200 (the manual params, hud_manual.c)
+     emit(B(here(), hud_code) | 0x80000000)    # bl hud_edge
++    # Probe (0129): call hud_probe with the same pane/aspect/table, plus the
++    # probe buffer. x0-x3 are caller-saved, so re-set them all (hud_edge may
++    # have clobbered them); x1/x2/x3 stay saved on the stack until after
++    # this call, and x19 (the pane) is callee-saved, so it is still live.
++    emit(0xaa1303e0)                          # mov x0, x19 (the pane)
++    emit(ADRP(1, here(), FS_STATE_OFF)); emit(ADDI(1, 1, 0x58))    # x1 = state + 0x58 (the aspect)
++    emit(ADRP(2, here(), FS_STATE_OFF)); emit(ADDI(2, 2, 0x300))   # x2 = state + 0x300 (table)
++    emit(ADRP(3, here(), FS_STATE_OFF + 0x3000)); emit(ADDI(3, 3, 0x300))  # x3 = state + 0x3300 (probe buffer; 0x3300 does not fit one ADDI, so take the +0x3000 page and add 0x300)
++    emit(B(here(), probe_code) | 0x80000000)  # bl hud_probe
+     emit(LDP_POST(3, 8, 31, 16))              # ldp x3, x8, [sp], #0x10
+     emit(LDP_POST(1, 2, 31, 16))              # ldp x1, x2, [sp], #0x10
+     emit(0x7940b268)                          # ldrh w8, [x19, #0x58] (the replaced instruction)
+@@ -201,7 +267,7 @@ def _hud_edge_frame_step(ctx):
+ FRAME_STEP = {BUILD_141: _hud_edge_frame_step}
+ 
+ BINDING = [
+-    {'what': "HUD edge anchor, v7 (hud_edge.c: entry + 0x13c cuts, compass 'PicStrap', lives 'Life'/'TxtLife', coins 'TxtCounterSh'/'TxtCounter', regional coins 'PicIconSh'/'PicIcon'/'TxtTotalShine' under a 'Counter', moons 'Counter'/'TxtTotalShine', hints 'TxtGuide01', matched by pane name only; the auto edge offset from the screen aspect -- iPhone 19.5:9 +140 out, iPhone Duo 1.43:1 -126 in, iPad 4:3 -160 in, 16:9 0 -- plus the launcher's manual settings from the DM_HUD_* environment variables (hud_manual.c, state page +0x200), which are a delta from the auto edge anchor (0128: the editor shows the element at its edge-anchored default and records the drag from there, so the manual offset is ADDED to the edge -- dragging in the editor moves the element by the same amount in the game, and a manual element still follows the aspect), and a hide that pushes the pane off-screen; the compass takes an extra +128 on its edge anchor (0128: its dial is centred in the 340-wide 'PicStrap' strip, so the plain edge puts the strip at the screen edge but the dial ~128 short of it -- the extra brings the dial, and the hints text in the strip, to the edge); a dirty flag so a moved container carries its children, an orig/mod table with the applied transform so a fixed offset never drifts, sixteen slots per HUD element (0126: log-20 shows TEN panes matching coins and eight slots thrashed, so the numbers drifted off-screen in V1.3.16); no settings UI in the game itself; 0123 regroups the moon icon + 020 into the coins element, splits the '+ menu / - map' hints into their own element, and adds parent compensation so a matched child of a matched parent (moon icon under the moons Counter, hints under the compass strip) is moved once, not twice; 0127 splits the two kinds of coins into two separately adjustable elements (coins, regional coins, moons), so the state page grows to 18 floats and the manual/hidden masks move to state +0x248/+0x24C; the white bar under the counts has no matching pane name and stays put, and the launcher editor no longer draws it)", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
++    {'what': "HUD edge anchor, v8 (hud_edge.c: entry + 0x13c cuts, compass 'PicStrap', lives 'Life'/'TxtLife', coins 'TxtCounterSh'/'TxtCounter', regional coins 'PicIconSh'/'PicIcon'/'TxtTotalShine' under a 'Counter', moons 'Counter'/'TxtTotalShine', hints 'TxtGuide01', matched by pane name only; the auto edge offset from the screen aspect -- iPhone 19.5:9 +140 out, iPhone Duo 1.43:1 -126 in, iPad 4:3 -160 in, 16:9 0 -- plus the launcher's manual settings from the DM_HUD_* environment variables (hud_manual.c, state page +0x200), which are a delta from the auto edge anchor (0128: the editor shows the element at its edge-anchored default and records the drag from there, so the manual offset is ADDED to the edge -- dragging in the editor moves the element by the same amount in the game, and a manual element still follows the aspect), and a hide that pushes the pane off-screen; the compass takes an extra +128 on its edge anchor (0128: its dial is centred in the 340-wide 'PicStrap' strip, so the plain edge puts the strip at the screen edge but the dial ~128 short of it -- the extra brings the dial, and the hints text in the strip, to the edge); a dirty flag so a moved container carries its children, an orig/mod table with the applied transform so a fixed offset never drifts, sixteen slots per HUD element (0126: log-20 shows TEN panes matching coins and eight slots thrashed, so the numbers drifted off-screen in V1.3.16); no settings UI in the game itself; 0123 regroups the moon icon + 020 into the coins element, splits the '+ menu / - map' hints into their own element, and adds parent compensation so a matched child of a matched parent (moon icon under the moons Counter, hints under the compass strip) is moved once, not twice; 0127 splits the two kinds of coins into two separately adjustable elements (coins, regional coins, moons), so the state page grows to 18 floats and the manual/hidden masks move to state +0x248/+0x24C; the white bar under the counts has no matching pane name and stays put, and the launcher editor no longer draws it; 0129 adds a diagnostic-only probe (hud_probe.c, state page +0x3300, gated by DM_HUD_PROBE=1) that logs every pane's name/parent/size/flags/global matrix on first sighting, the aspect and edge exactly as hud_edge reads and computes them, and, for every pane hud_edge matched, the decision it took (element index, slot, tdx/tdy/tk, hidden, the parent's table entry and whether it is a fresh sentinel, and the translation actually in the pane matrix) -- it moves no pane and changes no behaviour, and is deleted after use, never shipped", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
+      'why': "Pane::Calculate and the pane layout are this build's nn::ui2d code, found by the HUDLOG diagnostic run (log-17) and confirmed by disassembly of DmIOS; the edge offset comes from the screen aspect the loader already writes to state page + 0x58 (log-28). The manual settings come from the launcher's HUD editor (HudEditor.swift) through the same environment-variable channel the launcher already uses for its other settings (DM_SCREEN_ASPECT), so the game reads nothing new: the host copies them to state page +0x200 once per present. This replaces the cancelled draggable HUD (0113): it keeps no user-adjustable state in the game, reuses the 0118 pane-name hook, and its only tree walk is the bounded flag-only mark-dirty, so the 0113 crash class (a name/match walk reading a pane through a bad pointer) is structurally absent. V1.3.14 (build #45) showed the drift on device: with no manual settings at all (log-30: 'HUD manual: no DM_HUD_* set, auto edge anchor only') the coin/moon numbers vanished and the moon dots were wrong, because four panes share the coins element and two slots could not hold them; the table is the only state the stub keeps, so giving each pane its own slot removes the drift at its source.",
+      'blocked': 'the stubs have no function-matched form yet'},
+ ]
+diff --git a/dm/host/hud_manual.c b/dm/host/hud_manual.c
+index 186d4dd..edad974 100644
+--- a/dm/host/hud_manual.c
++++ b/dm/host/hud_manual.c
+@@ -63,9 +63,104 @@ static int hud_parse(const char *s, float *dx, float *dy, float *k, int *hidden)
+     return 1;
+ }
+ 
++// The HUD probe buffer (0129, diagnostic only): the rewriter's hud_probe
++// stub writes compact binary records into the frame-step state page at
++// +0x3300 (the hud_edge table ends there; the state page is 0x4000 bytes,
++// so +0x3300..+0x4000 is free). Layout, matching hud_probe.c:
++//   +0x00: u32 magic ("PRBE"), +0x04: u32 enabled (DM_HUD_PROBE=1),
++//   +0x08: u32 rec_count, +0x0C: u32 seen_count, +0x10: u32 aspect_logged,
++//   +0x14: u32 rec_cap, +0x18: u32 seen_cap, +0x1C: u32 reserved;
++//   +0x20: seen-table, 256 x u64 pane addresses;
++//   +0x820: record buffer, 13 records of 96 bytes.
++// A record (96 bytes): +0 u32 type (0 pane, 1 edge-decision, 2 aspect),
++// +4/+8 pane address (lo/hi), +12 char name[20], +32 char pname[20],
++// +52..+76 seven floats v0..v6, +80..+92 four u32 w0..w3.
++//   pane: v0=w, v1=h, v2=gx, v3=gy, v4=gsx, v5=gsy, w0=origin, w1=flags,
++//     w2/w3=paddr lo/hi.
++//   edge-decision: v0=tdx, v1=tdy, v2=tk, v3=pm_dx, v4=pm_dy, v5=final_m3,
++//     v6=final_m7, w0=idx, w1=slot, w2=hidden,
++//     w3=parent_hidden | has_parent<<1 | pm_sentinel<<2.
++//   aspect: v0=aspect, v1=edge.
++#define HUD_PROBE_OFF 0x3300
++#define HUD_PROBE_MAGIC 0x50524245u
++#define HUD_PROBE_REC_OFF 0x820
++#define HUD_PROBE_REC_SIZE 96
++#define HUD_PROBE_REC_CAP 13
++
++static int g_hud_probe_enabled = -1;   // -1 = not checked yet
++
++// Drain the probe buffer into the log, once per present. Called from
++// dm_hud_manual_frame_tick (which runs once per present) so it runs even
++// when the DM_HUD_* settings did not change. The stub only appends while
++// there is room and the host resets the count after logging, so a record
++// is logged exactly once. The enabled flag is set from DM_HUD_PROBE every
++// present, so the stub starts as soon as the variable is present.
++static void dm_hud_probe_tick(void) {
++    uint8_t *st = dm_fps_state;
++    if (!st) return;
++    if (g_hud_probe_enabled < 0) {
++        const char *e = getenv("DM_HUD_PROBE");
++        g_hud_probe_enabled = (e && e[0] == '1' && e[1] == '\0') ? 1 : 0;
++    }
++    uint8_t *pb = st + HUD_PROBE_OFF;
++    uint32_t *hdr = (uint32_t *)pb;
++    hdr[1] = (uint32_t)g_hud_probe_enabled;   // enabled flag for the stub
++    if (!g_hud_probe_enabled) return;
++    if (hdr[0] != HUD_PROBE_MAGIC) return;   // stub has not initialised yet
++    uint32_t rc = hdr[2];
++    if (rc == 0) return;
++    if (rc > HUD_PROBE_REC_CAP) rc = HUD_PROBE_REC_CAP;
++    for (uint32_t i = 0; i < rc; i++) {
++        char *rec = (char *)pb + HUD_PROBE_REC_OFF + i * HUD_PROBE_REC_SIZE;
++        uint32_t type = *(uint32_t *)(rec + 0);
++        uint32_t alo = *(uint32_t *)(rec + 4);
++        uint32_t ahi = *(uint32_t *)(rec + 8);
++        char *name = rec + 12;
++        char *pname = rec + 32;
++        name[19] = '\0'; pname[19] = '\0';   // the stub terminates, this is belt and braces
++        if (type == 0) {
++            float w = *(float *)(rec + 52);
++            float h = *(float *)(rec + 56);
++            float gx = *(float *)(rec + 60);
++            float gy = *(float *)(rec + 64);
++            float gsx = *(float *)(rec + 68);
++            float gsy = *(float *)(rec + 72);
++            uint32_t origin = *(uint32_t *)(rec + 80);
++            uint32_t flags = *(uint32_t *)(rec + 84);
++            uint32_t plo = *(uint32_t *)(rec + 88);
++            uint32_t phi = *(uint32_t *)(rec + 92);
++            LOG("[hudprobe] pane '%s' addr=0x%08x%08x parent='%s' paddr=0x%08x%08x size=%.0fx%.0f origin=0x%02x flags=0x%04x global=(%.1f,%.1f) gscale=(%.3f,%.3f)",
++                name, ahi, alo, pname, phi, plo, w, h, origin & 0xffu, flags & 0xffffu, gx, gy, gsx, gsy);
++        } else if (type == 1) {
++            float tdx = *(float *)(rec + 52);
++            float tdy = *(float *)(rec + 56);
++            float tk = *(float *)(rec + 60);
++            float pmdx = *(float *)(rec + 64);
++            float pmdy = *(float *)(rec + 68);
++            float fm3 = *(float *)(rec + 72);
++            float fm7 = *(float *)(rec + 76);
++            uint32_t idx = *(uint32_t *)(rec + 80);
++            uint32_t slot = *(uint32_t *)(rec + 84);
++            uint32_t hidden = *(uint32_t *)(rec + 88);
++            uint32_t w3 = *(uint32_t *)(rec + 92);
++            uint32_t parent_hidden = w3 & 1u;
++            uint32_t has_parent = (w3 >> 1) & 1u;
++            uint32_t pm_sentinel = (w3 >> 2) & 1u;
++            LOG("[hudprobe] edge-decision pane '%s' idx=%d slot=%d tdx=%.1f tdy=%.1f tk=%.2f hidden=%d parent_hidden=%d has_parent=%d pm_dx=%.1f pm_dy=%.1f final_m3=%.1f final_m7=%.1f pm_sentinel=%d",
++                name, (int)idx, (int)slot, tdx, tdy, tk, (int)hidden, (int)parent_hidden, (int)has_parent, pmdx, pmdy, fm3, fm7, (int)pm_sentinel);
++        } else if (type == 2) {
++            float aspect = *(float *)(rec + 52);
++            float edge = *(float *)(rec + 56);
++            LOG("[hudprobe] aspect=%.4f edge=%.1f", aspect, edge);
++        }
++    }
++    hdr[2] = 0;   // reset the record count; the stub appends from 0 again
++}
++
+ void dm_hud_manual_frame_tick(void) {
+     uint8_t *st = dm_fps_state;
+     if (!st) return;
++    dm_hud_probe_tick();   // drain the 0129 probe buffer every present (it is a no-op unless DM_HUD_PROBE=1)
+     float dx[DM_HUD_N], dy[DM_HUD_N], k[DM_HUD_N];
+     uint32_t manual = 0, hidden = 0;
+     for (int i = 0; i < DM_HUD_N; i++) {
+-- 
+2.43.0
+
