@@ -1,4 +1,4 @@
-From f75f21f2551679439871283040398bd5e6a5e6bc Mon Sep 17 00:00:00 2001
+From 342c10e09780732471a5e328d782c71c17bde030 Mon Sep 17 00:00:00 2001
 From: seedds <seedds@gmail.com>
 Date: Sat, 14 Nov 2026 05:17:14 +0000
 Subject: [PATCH] 0131: layout probe for the HUD numbers (log-38)
@@ -21,11 +21,25 @@ local +0x30 along the parent chain; H2 (pane local (263,71), e_orig
 (0,0)) means the fallback did not run or the build is stale; H3 (both
 locals (0,0)) means the layout is in no +0x30. Diagnostic only; it
 moves no pane and changes no behaviour.
+
+Fix (log-40 SIGILL): the HUD_PROBE_WORDS table as first generated
+began with 18 words of .eh_frame, not code -- plain objcopy -O binary
+on a relocatable .o overlays the 72-byte .eh_frame (SHF_ALLOC,
+VMA=0) onto the start of .text, so word 0 was 0x00000010 (the
+CIE length), which decodes as udf #16; bl hud_probe executed it
+on the first HUD pane (frame 32). Regenerated with objcopy -O
+binary --only-section=.text (compiled -O2 with
+-fno-asynchronous-unwind-tables -fno-unwind-tables, so no
+.eh_frame is produced at all). Only the first 18 words change;
+words 18-330 are identical. 331 words, probe still at frame-step
+word 818, BINDING still v10. probe_words_test.py (new, untracked)
+disassembles the emitted probe region and asserts zero udf and
+first word 0xf100001f; it fails on the old table (udf #16).
 ---
  dm/games/0100000000010000/hud_probe.c | 69 +++++++++++++++++++++++++--
- dm/games/0100000000010000/patches.py  | 51 ++++++++++++--------
+ dm/games/0100000000010000/patches.py  | 49 +++++++++++--------
  dm/host/hud_manual.c                  | 20 ++++++--
- 3 files changed, 113 insertions(+), 27 deletions(-)
+ 3 files changed, 112 insertions(+), 26 deletions(-)
 
 diff --git a/dm/games/0100000000010000/hud_probe.c b/dm/games/0100000000010000/hud_probe.c
 index 311fa8a..c6362af 100644
@@ -129,7 +143,7 @@ index 311fa8a..c6362af 100644
      // Mark seen only after both records were written, so a deferred pane
      // (buffer full) retries next frame instead of being lost.
 diff --git a/dm/games/0100000000010000/patches.py b/dm/games/0100000000010000/patches.py
-index de31118..b5f676e 100644
+index de31118..4434065 100644
 --- a/dm/games/0100000000010000/patches.py
 +++ b/dm/games/0100000000010000/patches.py
 @@ -156,29 +156,38 @@ HUD_EDGE_WORDS = (
@@ -146,7 +160,7 @@ index de31118..b5f676e 100644
  # variable DM_HUD_PROBE=1 (the host sets the buffer's enabled flag from
  # it). Delete after use; never ship.
  HUD_PROBE_WORDS = (
--    "f100001ffa40182454000500f100005ffa401864540004a0b9400065528848a472aa0a446b0400bf54000160b9000064528001a5b900047f52802004"
+     "f100001ffa40182454000500f100005ffa401864540004a0b9400065528848a472aa0a446b0400bf54000160b9000064528001a5b900047f52802004"
 -    "b900087fb9000c7fb900107fb9001465b9001864b9001c7fb9400464340002847940b00436380244b940106435000084b9400866710030df54001489"
 -    "b9400c689100806a340001a8aa0a03e18b284d4514000003eb05003f540000c0f940002491002021eb00009f54ffff61d65f03c07103fd1f54ffffc8"
 -    "aa0203e791400c45aa0203e11400000491020021eb0100bf54001b40b9407c24aa0103e634ffff64f9400024eb04001f54ffff01cb020022b94078ce"
@@ -165,8 +179,7 @@ index de31118..b5f676e 100644
 -    "1e27002052a884011e2700221e2018201e2338001e22080017ffffd2910200e7eb0700bf54fff220b9407ce134ffff81f94000e1eb0c003f54ffff21"
 -    "2d4d00e1529e5941b94074e472ae29211e2700257100009f1a9f07e11e2520201a9f17e72a070827321f00e717ffff833900813f17ffff6512800002"
 -    "d28000062a0203ee5280002417ffff33390080bf17ffff99110005ef17ffffa5"
-+    "000000100000000000527a01011e7804001f0c1b0000003000000018000000000000052c0e4902009e029d10dea5020179000edd029d100e0e56019e"
-+    "45dedd00029d100e0000019eb9001465b9001864b9001c7fb9400464340002847940b00436380244b940106435000084b9400866710030df54001a69"
++    "b900087fb9000c7fb900107fb9001465b9001864b9001c7fb9400464340002847940b00436380244b940106435000084b9400866710030df54001a69"
 +    "b9400c699100806a340001a9aa0a03e18b294d4514000003eb05003f540000c0f940002491002021eb00009f54ffff61d65f03c07103fd3f54ffffc8"
 +    "aa0203e791400c45aa0203e11400000491020021eb0100bf54002140b9407c24aa0103e634ffff64f9400024eb04001f54ffff01cb020022b94078cc"
 +    "5295556152800064d347fc4272a555414b0c00429b217c41d360fc214b827c22b940086e0b0e00817100343f54fffc68a9bf7bfd52800010910003fd"
