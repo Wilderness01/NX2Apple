@@ -108,3 +108,4 @@
 0147-hud-runtime-layout-aware-matcher.patch
 0148-hud-pad-editor.patch
 0149-hud-overlay-menu-map-hints.patch
+0150-hud-local-matrix-write.patch
