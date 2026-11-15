@@ -1,0 +1,27 @@
+From e7424c2bfcb17497439f7f721b68b79540b17dc4 Mon Sep 17 00:00:00 2001
+From: verify <verify@example.invalid>
+Date: Sun, 15 Nov 2026 08:29:52 +0800
+Subject: [PATCH] 0136: set DM_ROMFS_OVERLAY from the bundle's dm/romfs-overlay
+ when present (HUD .bflyt overlay)
+
+---
+ dm/ios/Sources/main.m | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/dm/ios/Sources/main.m b/dm/ios/Sources/main.m
+index 757d875..07e8bfe 100644
+--- a/dm/ios/Sources/main.m
++++ b/dm/ios/Sources/main.m
+@@ -311,6 +311,9 @@ static int boot_env(void) {
+     if (per_game && [fm fileExistsAtPath:per_game_msl]) msl = per_game_msl;
+     setenv("DM_MSL_DIR", msl.fileSystemRepresentation, 0);
+     setenv("DM_FONT_DIR", [[res stringByAppendingPathComponent:@"dm"] stringByAppendingPathComponent:@"font"].fileSystemRepresentation, 0);   // Shared-font stand-ins (standard.ttf / nintendo_ext.ttf): iOS lacks the macOS font path
++    // HUD .bflyt overlay (0136): when the bundle carries dm/romfs-overlay, its files replace the same RomFS paths at load (hle_fs.c DM_ROMFS_OVERLAY), so the HUD layouts are created at their edge-aligned positions from the modified .bflyt data itself -- no Pane::Calculate hook, no per-frame rewrite. The overlay holds only the six HUD layouts; everything else still comes from the RomFS image.
++    NSString *romfs_overlay = [[res stringByAppendingPathComponent:@"dm"] stringByAppendingPathComponent:@"romfs-overlay"];
++    if ([fm fileExistsAtPath:romfs_overlay]) setenv("DM_ROMFS_OVERLAY", romfs_overlay.fileSystemRepresentation, 0);
+     // Add-on content beside the game data: the launcher's games/<id>/aoc/ holds <index>.img (the layout hle_fs.c aoc_dir reads), because a slim IPA does not carry it. Taken before
+     // Documents/aoc and <App>/aoc (aoc_locate, seedds/nxnative#486) and never over an explicit DM_AOC_DIR: aoc_locate only fills DM_AOC_DIR when this did not.
+     NSString *per_game_aoc = [gdir stringByAppendingPathComponent:@"aoc"];
+-- 
+2.43.0
+

@@ -94,3 +94,7 @@
 0133-ios-hud-layout-probe2.patch
 0134-ios-hud-hexdump-probe.patch
 0135-ios-hud-local-shift.patch
+0136-romfs-overlay.patch
+0137-hud-runtime.patch
+0138-hud-game-editor.patch
+0139-romfs-overlay-ship.patch

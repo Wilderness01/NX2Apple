@@ -1,0 +1,208 @@
+From 17def83128e3a4505498dcd373237a3f5a2478d7 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Sun, 15 Nov 2026 09:10:48 +0800
+Subject: [PATCH] 0138: in-game HUD editor UI -- HudGameEditorView + GameMenu
+ entry, live env updates
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A compact panel presented over the running game (GameMenu -> HUD 设置),
+not the launcher's full editor: no preview photo, no drag -- the live game
+is the preview. Six elements (display order), each with an eye toggle
+(true hide), a 60%-180% size slider, and X/Y steppers (+/-10 layout
+points) for the selected element, plus per-element and global reset. Every
+change saves to UserDefaults AND pushes the env var at once
+(HudSettings.applyOneToEnvironment), so the host -- which re-reads the env
+vars every present -- applies it on the next frame: the HUD in the game
+moves/resizes/hides in real time, no restart. Presented via
+DmHostingController over the topmost view controller (the quit prompt's
+pattern).
+---
+ dm/ios/Sources/GameMenu.swift  |   5 +-
+ dm/ios/Sources/HudEditor.swift | 140 +++++++++++++++++++++++++++++++++
+ 2 files changed, 143 insertions(+), 2 deletions(-)
+
+diff --git a/dm/ios/Sources/GameMenu.swift b/dm/ios/Sources/GameMenu.swift
+index eafa4b0..4a6f0ba 100644
+--- a/dm/ios/Sources/GameMenu.swift
++++ b/dm/ios/Sources/GameMenu.swift
+@@ -20,17 +20,18 @@ private func gameMenuItems() -> [UIMenuElement] {
+     }
+     let layout = UIMenu(title: LauncherText.text("ui.controllerLayout", "Controller layout"), options: .singleSelection, children: layouts)   // a choice's value shows in its submenu: a subtitle would make each row two lines
+     let padSettings = UIAction(title: "按键设置") { _ in dm_gamepad_open_pad_settings() }   // the button editor (DmGamepad.m): the icons' size and where they sit
++    let hudSettings = UIAction(title: "HUD 设置") { _ in dm_hud_open_game_editor() }   // (0137) the in-game HUD editor: size slider, X/Y steppers, true hide, live in the running game
+     var items: [UIMenuElement] = []
+     var placed = false
+     if let m = gameMenuModel {
+         for section in m.sections {
+-            var rows: [UIMenuElement] = section == "Controls" ? [layout, padSettings] : []
++            var rows: [UIMenuElement] = section == "Controls" ? [layout, padSettings, hudSettings] : []
+             if section == "Controls" { placed = true }
+             for s in m.rows(in: section) where (s.kind == "choice" || s.kind == "toggle") && dm_setting_live(s.env, nil) { rows.append(gameMenuRow(m, s)) }
+             if !rows.isEmpty { items.append(UIMenu(options: .displayInline, children: rows)) }
+         }
+     }
+-    if !placed { items.insert(UIMenu(options: .displayInline, children: [layout, padSettings]), at: 0) }
++    if !placed { items.insert(UIMenu(options: .displayInline, children: [layout, padSettings, hudSettings]), at: 0) }
+     items.append(Unmanaged<UIMenu>.fromOpaque(dm_quit_menu()).takeRetainedValue())   // Quit <game>, last and on its own: it opens the quit prompt (front_ios.m)
+     return items
+ }
+diff --git a/dm/ios/Sources/HudEditor.swift b/dm/ios/Sources/HudEditor.swift
+index 542dff4..130791b 100644
+--- a/dm/ios/Sources/HudEditor.swift
++++ b/dm/ios/Sources/HudEditor.swift
+@@ -229,6 +229,18 @@ final class HudSettings: ObservableObject {
+             }
+         }
+     }
++    // (0137) In-game editor: push ONE element's current setting into the
++    // environment right now, so the host (which re-reads the env vars every
++    // present) applies it on the next frame -- the slider moves the HUD in
++    // the running game, no restart. An element with no manual setting is
++    // unset, so the game keeps its overlay base position.
++    func applyOneToEnvironment(_ e: HudElement) {
++        if let s = effective(e) {
++            setenv(e.env, s.encoded, 1)
++        } else {
++            unsetenv(e.env)
++        }
++    }
+ }
+ 
+ // The mockup's text shadow (.num, .hint-row): a dark 1px outline in four
+@@ -812,3 +824,131 @@ struct HudEditorView: View {
+         }
+     }
+ }
++
++// MARK: - In-game HUD editor (0137)
++//
++// A compact panel presented OVER the running game (GameMenu -> "HUD 设置"),
++// not the launcher's full editor: no preview photo, no drag -- the live game
++// is the preview. Every change saves to UserDefaults AND pushes the env var
++// at once (applyOneToEnvironment), so the host applies it on the next
++// present and the HUD in the game moves/resizes/hides in real time.
++// Position is adjusted with X/Y steppers (layout points, +/-10 per tap);
++// size with a 60%-180% slider, like the launcher editor and the button
++// settings. Hide is a TRUE hide (flags bit 0, hud_runtime.c), not off-screen.
++struct HudGameEditorView: View {
++    @ObservedObject var settings: HudSettings
++    @State private var selected: HudElement = .coins
++    @Environment(\.dismiss) private var dismiss
++
++    private func cur(_ el: HudElement) -> HudElementSetting {
++        settings.effective(el) ?? HudElementSetting(dx: 0, dy: 0, k: 1, hidden: false)
++    }
++    private func update(_ el: HudElement, _ s: HudElementSetting) {
++        settings.set(el, s)
++        settings.applyOneToEnvironment(el)
++    }
++    private func statusLine(_ el: HudElement) -> String {
++        let s = cur(el)
++        var parts = ["\(Int(s.k * 100))%"]
++        if s.dx != 0 || s.dy != 0 { parts.append("已移动") }
++        if s.hidden { parts.append("已隐藏") }
++        return parts.joined(separator: " · ")
++    }
++
++    var body: some View {
++        NavigationView {
++            List {
++                Section(header: Text("六个元素（点一行调它）")) {
++                    ForEach(HudElement.displayOrder) { el in
++                        HStack {
++                            Button(action: { selected = el }) {
++                                HStack {
++                                    Text(el.name)
++                                    Spacer()
++                                    Text(statusLine(el))
++                                        .font(.subheadline)
++                                        .foregroundStyle(.secondary)
++                                    if selected == el {
++                                        Image(systemName: "checkmark")
++                                            .foregroundStyle(.blue)
++                                    }
++                                }
++                            }
++                            .buttonStyle(.plain)
++                            Button(action: {
++                                var s = cur(el)
++                                s.hidden.toggle()
++                                update(el, s)
++                            }) {
++                                Image(systemName: cur(el).hidden ? "eye.slash" : "eye")
++                                    .foregroundStyle(cur(el).hidden ? .red : .blue)
++                            }
++                            .buttonStyle(.plain)
++                        }
++                    }
++                }
++                Section(header: Text("大小（\(selected.name)）")) {
++                    let s = cur(selected)
++                    HStack {
++                        Text("60%")
++                        Slider(value: Binding(
++                            get: { s.k },
++                            set: { v in var n = s; n.k = v; update(selected, n) }
++                        ), in: 0.6...1.8, step: 0.05)
++                        Text("\(Int(s.k * 100))%")
++                            .frame(width: 52, alignment: .trailing)
++                    }
++                }
++                Section(header: Text("位置（\(selected.name)，布局点）")) {
++                    let s = cur(selected)
++                    Stepper("横向 X：\(Int(s.dx))", value: Binding(
++                        get: { s.dx },
++                        set: { v in var n = s; n.dx = v; update(selected, n) }
++                    ), in: -640...640, step: 10)
++                    Stepper("纵向 Y：\(Int(s.dy))", value: Binding(
++                        get: { s.dy },
++                        set: { v in var n = s; n.dy = v; update(selected, n) }
++                    ), in: -360...360, step: 10)
++                    Button("恢复 \(selected.name) 默认") {
++                        settings.set(selected, nil)
++                        settings.applyOneToEnvironment(selected)
++                    }
++                    .foregroundStyle(.red)
++                }
++                Section {
++                    Button("全部恢复默认") {
++                        settings.resetAll()
++                        settings.applyToEnvironment()
++                    }
++                    .foregroundStyle(.red)
++                }
++            }
++            .navigationTitle("HUD 设置")
++            .navigationBarTitleDisplayMode(.inline)
++            .toolbar {
++                ToolbarItem(placement: .confirmationAction) {
++                    Button("完成") { dismiss() }
++                }
++            }
++        }
++    }
++}
++
++// The in-game menu's "HUD 设置": present the game editor over the running
++// game. Mirrors the quit prompt's presentation (front_ios.m): walk to the
++// topmost presented view controller and present a DmHostingController.
++@_cdecl("dm_hud_open_game_editor")
++public func dmHudOpenGameEditor() {
++    DispatchQueue.main.async {
++        guard let window = UIApplication.shared.connectedScenes
++            .compactMap({ $0 as? UIWindowScene })
++            .flatMap({ $0.windows })
++            .first(where: { $0.isKeyWindow }),
++            var vc = window.rootViewController else { return }
++        while let p = vc.presentedViewController { vc = p }
++        let editor = HudGameEditorView(settings: HudSettings())
++        let host = DmHostingController(rootView: editor)
++        host.modalPresentationStyle = .pageSheet
++        vc.present(host, animated: true, completion: nil)
++    }
++}
+-- 
+2.43.0
+
