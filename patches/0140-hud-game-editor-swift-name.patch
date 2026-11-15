@@ -1,0 +1,29 @@
+From 7e706690cea94cc71cbc0d89a3a973217b703a4a Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Sun, 15 Nov 2026 19:08:45 +0800
+Subject: [PATCH] 0140: call the HUD editor presenter by its Swift name
+
+GameMenu.swift called dm_hud_open_game_editor(), the @_cdecl C name.
+Swift cannot see a @_cdecl name: it only exports the C symbol, so
+xcodebuild failed with "cannot find 'dm_hud_open_game_editor' in
+scope". Call dmHudOpenGameEditor(), the function's Swift name.
+---
+ dm/ios/Sources/GameMenu.swift | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/dm/ios/Sources/GameMenu.swift b/dm/ios/Sources/GameMenu.swift
+index 4a6f0ba..2495c34 100644
+--- a/dm/ios/Sources/GameMenu.swift
++++ b/dm/ios/Sources/GameMenu.swift
+@@ -20,7 +20,7 @@ private func gameMenuItems() -> [UIMenuElement] {
+     }
+     let layout = UIMenu(title: LauncherText.text("ui.controllerLayout", "Controller layout"), options: .singleSelection, children: layouts)   // a choice's value shows in its submenu: a subtitle would make each row two lines
+     let padSettings = UIAction(title: "按键设置") { _ in dm_gamepad_open_pad_settings() }   // the button editor (DmGamepad.m): the icons' size and where they sit
+-    let hudSettings = UIAction(title: "HUD 设置") { _ in dm_hud_open_game_editor() }   // (0137) the in-game HUD editor: size slider, X/Y steppers, true hide, live in the running game
++    let hudSettings = UIAction(title: "HUD 设置") { _ in dmHudOpenGameEditor() }   // (0137) the in-game HUD editor: size slider, X/Y steppers, true hide, live in the running game
+     var items: [UIMenuElement] = []
+     var placed = false
+     if let m = gameMenuModel {
+-- 
+2.43.0
+
