@@ -1,0 +1,56 @@
+From 0eb4c67268930afcb8a7a677aa7943d7c6c5c080 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Sun, 15 Nov 2026 20:51:24 +0800
+Subject: [PATCH] 0143: compass back on-screen, hide the white bar and the
+ hints in the HUD overlay
+
+---
+ dm/romfs-overlay/LayoutData/CounterCoin.szs   | Bin 43306 -> 43306 bytes
+ .../LayoutData/CounterCollectCoin.szs         | Bin 34810 -> 34810 bytes
+ dm/romfs-overlay/LayoutData/MapMini.szs       | Bin 29626 -> 29626 bytes
+ dm/romfs-overlay/LayoutData/PlayGuide.szs     | Bin 36538 -> 36538 bytes
+ 4 files changed, 0 insertions(+), 0 deletions(-)
+
+diff --git a/dm/romfs-overlay/LayoutData/CounterCoin.szs b/dm/romfs-overlay/LayoutData/CounterCoin.szs
+index e71170a82a04375f6752a8776d31c243f516f9b3..f138140ecc7af52505e32715d5e8494c1cbcbfec 100644
+GIT binary patch
+delta 26
+icmZ2=iD}g(rVSi9EDVhQnI_vUR+z-ZzS%hEyA1$|XbIZ@
+
+delta 26
+icmZ2=iD}g(rVSi9ER2l*nI_vUR+z-ZzS%hEyA1$|cnRD9
+
+diff --git a/dm/romfs-overlay/LayoutData/CounterCollectCoin.szs b/dm/romfs-overlay/LayoutData/CounterCollectCoin.szs
+index 43476dda65847e0e7496f8ffb1440b875e45a95d..6a8f8825eca7f40d6b79f4433a340224030d5e60 100644
+GIT binary patch
+delta 15
+Wcmey>&-AOGX@NH*!)8YBpEdwDBL+7B
+
+delta 15
+Wcmey>&-AOGX@NH*<7P(hpEdwDDF!$I
+
+diff --git a/dm/romfs-overlay/LayoutData/MapMini.szs b/dm/romfs-overlay/LayoutData/MapMini.szs
+index d2966297ff96ccfa34a81581c2c13f571dce67e9..436468eb54da6df64b49dffb9af9c498b776ee01 100644
+GIT binary patch
+delta 70
+zcmdn>oN?E4#tqNR81*(kH}hZwQU(@=Kx(pqMatx3mS_3QT|Q{7Kk%P{VSyt9gWl$a
+XR&FNjdM-e|tn*|+Mv=`-`8!wuu|ODG
+
+delta 70
+zcmdn>oN?E4#tqNR82vUsH}hZwQU(@=Kx(pqMatx3mS_3GT|Q{7Kk%P{VSyt9gWu+b
+XR&FNjel9@1tn*|+Mv=`-`8!wu&VU&k
+
+diff --git a/dm/romfs-overlay/LayoutData/PlayGuide.szs b/dm/romfs-overlay/LayoutData/PlayGuide.szs
+index 3105fe67faf684fb1d81dfec9ef8b46990a09500..a4eb489b2931685cbb8986f0d99d0b5f4ee1c623 100644
+GIT binary patch
+delta 45
+zcmV+|0Mh@uodUX@0<c0y4*&rF0#tZ(NB?zcWMxxmlaT>7lmA2svyewd2mt`I*H7a<
+DnzRw|
+
+delta 45
+zcmV+|0Mh@uodUX@0<c0y4*>xG0#tZ(NB?zcWMxxmlaT>7lmA2svyewd2mt}J*H7a<
+Dn%xoe
+
+-- 
+2.43.0
+
