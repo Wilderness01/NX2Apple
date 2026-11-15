@@ -87,7 +87,7 @@ jobs:
 
       - name: Download NSPs from Google Drive (rclone)
         env:
-          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+          RCLONE_CONF_CONTENT: ${{ secrets.RCLONE_CONFIG }}
           BASE_PATH: ${{ inputs.drive_base_path }}
           UPDATE_PATH: ${{ inputs.drive_update_path }}
         run: |
@@ -95,10 +95,10 @@ jobs:
           # rclone + 自有 Client ID 走 Drive API，不走 gdown 公开链接：
           # 公开下载有单文件配额锁（#50 死在这），API 路线是 GCP 项目每天 1TB 出站，
           # 两个 NSP 约 6GB，远碰不到上限。--transfers 2 --checkers 4 防单秒查询率限制。
-          test -n "$RCLONE_CONFIG"
+          test -n "$RCLONE_CONF_CONTENT"
           brew install rclone
           mkdir -p ~/.config/rclone "$RUNNER_TEMP/game"
-          printf '%s' "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf
+          printf '%s' "$RCLONE_CONF_CONTENT" > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
           rclone copy "gdrive:$BASE_PATH" "$RUNNER_TEMP/game/base.nsp" --transfers 2 --checkers 4 --progress
           rclone copy "gdrive:$UPDATE_PATH" "$RUNNER_TEMP/game/update.nsp" --transfers 2 --checkers 4 --progress
