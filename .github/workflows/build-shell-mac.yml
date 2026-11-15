@@ -100,8 +100,8 @@ jobs:
           mkdir -p ~/.config/rclone "$RUNNER_TEMP/game"
           printf '%s' "$RCLONE_CONF_CONTENT" > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
-          rclone copy "gdrive:$BASE_PATH" "$RUNNER_TEMP/game/base.nsp" --transfers 2 --checkers 4 --progress
-          rclone copy "gdrive:$UPDATE_PATH" "$RUNNER_TEMP/game/update.nsp" --transfers 2 --checkers 4 --progress
+          rclone copyto "gdrive:$BASE_PATH" "$RUNNER_TEMP/game/base.nsp" --transfers 2 --checkers 4 --progress
+          rclone copyto "gdrive:$UPDATE_PATH" "$RUNNER_TEMP/game/update.nsp" --transfers 2 --checkers 4 --progress
           ls -lh "$RUNNER_TEMP/game/"
           # 本体约 5.2GB、更新约 379MB；下到确认页/小文件就直接失败，别往下编
           test "$(stat -f%z "$RUNNER_TEMP/game/base.nsp")" -gt 1000000000
