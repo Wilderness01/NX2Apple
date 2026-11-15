@@ -99,3 +99,5 @@
 0138-hud-game-editor.patch
 0139-romfs-overlay-ship.patch
 0140-hud-game-editor-swift-name.patch
+0141-hud-overlay-szs-in-place.patch
+0142-hud-global-absolute-target.patch
