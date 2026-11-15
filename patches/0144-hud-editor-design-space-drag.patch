@@ -1,0 +1,303 @@
+From 501e037dc89e4ee87323fdf319fe299116ac10d7 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Sun, 15 Nov 2026 20:51:29 +0800
+Subject: [PATCH] 0144: HUD editor drags in 1280x720 design space; in-game
+ editor is a drag editor like the pad settings
+
+---
+ dm/ios/Sources/HudEditor.swift | 227 +++++++++++++++++++++++----------
+ 1 file changed, 159 insertions(+), 68 deletions(-)
+
+diff --git a/dm/ios/Sources/HudEditor.swift b/dm/ios/Sources/HudEditor.swift
+index 130791b..5025d30 100644
+--- a/dm/ios/Sources/HudEditor.swift
++++ b/dm/ios/Sources/HudEditor.swift
+@@ -85,7 +85,11 @@ enum HudElement: Int, CaseIterable, Identifiable {
+     var tagName: String { self == .hints ? "菜单 / 地图" : name }
+     var key: String { "DmHudManual.\(rawValue)" }   // UserDefaults key, one per element
+     // Display order in the editor list and the preview (mockup.html META).
+-    static var displayOrder: [HudElement] { [.coins, .regional, .moons, .lives, .hints, .compass] }
++    // 0144: the hints element is gone from the editor (the user 2026-11-15
++    // 20:40: the "+ menu / - map" hints are hidden in the overlay and not
++    // shown); the .hints case stays in the enum so the raw values and the
++    // UserDefaults keys of the other elements do not shift.
++    static var displayOrder: [HudElement] { [.coins, .regional, .moons, .lives, .compass] }
+ 
+     // The element's rendered size in preview points at scale k, mirroring
+     // mockup.html's em sizing (u = preview.width / 100; coins/moons use a
+@@ -559,17 +563,30 @@ struct HudEditorView: View {
+     }
+ 
+     private func effectiveSetting(_ el: HudElement) -> HudElementSetting? { settings.effective(el) }
+-    private func dragScale(preview: CGSize, layout: CGSize) -> Double { Double(layout.width / max(1, preview.width)) }   // preview points -> layout points
++    // 0144: the manual offset is in the 1280x720 DESIGN space (hud_manual.c
++    // reads dx/dy in that space), not the layout space. The preview is a view
++    // of the LAYOUT (phone 1560x720, iPad 1280x960), so converting a preview
++    // drag with the layout width made the phone's dx 1560/1280 = 22% too large
++    // (log-49: drags of a few hundred preview points became dx 300-600 and
++    // pushed the number panes off-screen) and the iPad's dy 1280/960 = 33%
++    // too large. The design-space scales are 1280/preview.width (x) and
++    // 720/preview.height (y); the y scale equals the old layout scale on the
++    // phone (same aspect), so only the phone's dx and the iPad's dy change.
++    private func dragScale(preview: CGSize) -> CGSize {
++        CGSize(width: 1280 / max(1, preview.width), height: 720 / max(1, preview.height))
++    }
+ 
+     // The element's frame in preview points: the mockup's default position,
+-    // the manual offset (layout points -> preview points, y flipped), clamped
+-    // inside the preview like the mockup does.
++    // the manual offset (design points -> preview points, y flipped), clamped
++    // inside the preview like the mockup does. (0144: the offset is design
++    // space, so it scales by preview.width/1280 and preview.height/720, not
++    // by the layout size.)
+     private func elementFrame(_ el: HudElement, preview: CGSize, layout: CGSize, sizes: [HudElement: CGSize]) -> CGRect {
+         let size = sizes[el] ?? .zero
+         var origin = HudElement.defaultTopLeft(el, preview: preview, sizes: sizes)
+         if let s = effectiveSetting(el) {
+-            origin.x += CGFloat(s.dx) * preview.width / layout.width
+-            origin.y -= CGFloat(s.dy) * preview.height / layout.height
++            origin.x += CGFloat(s.dx) * preview.width / 1280
++            origin.y -= CGFloat(s.dy) * preview.height / 720
+         }
+         let x = min(max(origin.x, 0), max(0, preview.width - size.width))
+         let y = min(max(origin.y, 0), max(0, preview.height - size.height))
+@@ -715,12 +732,14 @@ struct HudEditorView: View {
+                                         DragGesture().onChanged { v in
+                                             selected = el; dragOffset = v.translation
+                                         }.onEnded { v in
+-                                            // The drag (preview points, y down) into layout points (y up): dx as-is, dy negated.
++                                            // The drag (preview points, y down) into design points (y up): dx as-is, dy negated.
+                                             // Start from the EFFECTIVE setting (an element following no fallback starts at 0).
+-                                            let sc = dragScale(preview: preview, layout: layout)
++                                            // (0144: design-space scales, 1280/preview.width and 720/preview.height --
++                                            // the old single layout-width scale made the phone's dx 22% too large.)
++                                            let sc = dragScale(preview: preview)
+                                             var cur = settings.effective(el) ?? HudElementSetting(dx: 0, dy: 0, k: 1, hidden: false)
+-                                            cur.dx += Double(v.translation.width) * sc
+-                                            cur.dy -= Double(v.translation.height) * sc
++                                            cur.dx += Double(v.translation.width) * sc.width
++                                            cur.dy -= Double(v.translation.height) * sc.height
+                                             settings.set(el, cur)
+                                             dragOffset = .zero
+                                         }
+@@ -835,9 +854,21 @@ struct HudEditorView: View {
+ // Position is adjusted with X/Y steppers (layout points, +/-10 per tap);
+ // size with a 60%-180% slider, like the launcher editor and the button
+ // settings. Hide is a TRUE hide (flags bit 0, hud_runtime.c), not off-screen.
++// 0144: the in-game HUD editor, rebuilt as a drag editor like the pad
++// ("按键设置") settings: the five elements are drawn on a preview of the
++// device's own shape, tap one to select it, drag it to move it, a slider for
++// the selected element's own size, and an eye toggle per element to show or
++// hide it. Every change is applied live to the running game (update() calls
++// settings.set + applyOneToEnvironment), so the HUD moves behind the sheet
++// as you drag. The old list + X/Y steppers are gone (the user 2026-11-15
++// 20:26: "做成和按键一样的设置"). The hints element is not shown (0144:
++// hidden in the overlay); the preview reuses HudElementPreview and the
++// launcher's elementFrame math, with the 0144 design-space drag scale
++// (1280/preview.width, 720/preview.height).
+ struct HudGameEditorView: View {
+     @ObservedObject var settings: HudSettings
+     @State private var selected: HudElement = .coins
++    @State private var dragOffset = CGSize.zero   // the in-progress drag, in preview points
+     @Environment(\.dismiss) private var dismiss
+ 
+     private func cur(_ el: HudElement) -> HudElementSetting {
+@@ -847,6 +878,26 @@ struct HudGameEditorView: View {
+         settings.set(el, s)
+         settings.applyOneToEnvironment(el)
+     }
++    // The preview is the device's own shape (the game is running on this
++    // device, so only its shape matters), fitted to the sheet's width.
++    private func previewSize(container: CGSize) -> CGSize {
++        let ratio = HudAspect.device().ratio
++        let w = max(0, container.width - 32)
++        return CGSize(width: w, height: w / CGFloat(ratio))
++    }
++    // The element's frame in preview points (the launcher's elementFrame,
++    // design-space offset: preview.width/1280, preview.height/720).
++    private func elementFrame(_ el: HudElement, preview: CGSize, sizes: [HudElement: CGSize]) -> CGRect {
++        let size = sizes[el] ?? .zero
++        var origin = HudElement.defaultTopLeft(el, preview: preview, sizes: sizes)
++        if let s = settings.effective(el) {
++            origin.x += CGFloat(s.dx) * preview.width / 1280
++            origin.y -= CGFloat(s.dy) * preview.height / 720
++        }
++        let x = min(max(origin.x, 0), max(0, preview.width - size.width))
++        let y = min(max(origin.y, 0), max(0, preview.height - size.height))
++        return CGRect(origin: CGPoint(x: x, y: y), size: size)
++    }
+     private func statusLine(_ el: HudElement) -> String {
+         let s = cur(el)
+         var parts = ["\(Int(s.k * 100))%"]
+@@ -857,70 +908,110 @@ struct HudGameEditorView: View {
+ 
+     var body: some View {
+         NavigationView {
+-            List {
+-                Section(header: Text("六个元素（点一行调它）")) {
+-                    ForEach(HudElement.displayOrder) { el in
+-                        HStack {
+-                            Button(action: { selected = el }) {
+-                                HStack {
+-                                    Text(el.name)
+-                                    Spacer()
+-                                    Text(statusLine(el))
+-                                        .font(.subheadline)
+-                                        .foregroundStyle(.secondary)
+-                                    if selected == el {
+-                                        Image(systemName: "checkmark")
+-                                            .foregroundStyle(.blue)
++            GeometryReader { outer in
++                let preview = previewSize(container: outer.size)
++                ScrollView {
++                    VStack(alignment: .leading, spacing: 16) {
++                        // The preview: a dark backdrop (the game is behind the
++                        // sheet) with the five elements on it, draggable.
++                        GeometryReader { geo in
++                            let pv = geo.size
++                            let unit = pv.width / 100
++                            let sizes = HudElement.allCases.reduce(into: [HudElement: CGSize]()) { m, el in
++                                m[el] = HudElement.previewSize(el, k: settings.effective(el)?.k ?? 1, unit: unit)
++                            }
++                            ZStack {
++                                Color(red: 0.08, green: 0.10, blue: 0.09)
++                                ForEach(HudElement.displayOrder) { el in
++                                    let s = settings.effective(el)
++                                    let hidden = s?.hidden == true
++                                    let frame = elementFrame(el, preview: pv, sizes: sizes)
++                                    HudElementPreview(el: el, k: s?.k ?? 1, unit: unit)
++                                        .opacity(hidden ? 0.38 : 1)
++                                        .saturation(hidden ? 0.35 : 1)
++                                        .overlay {
++                                            if selected == el {
++                                                RoundedRectangle(cornerRadius: 8)
++                                                    .stroke(Color.white.opacity(0.85), lineWidth: 2)
++                                                    .padding(-1.5)
++                                            }
++                                        }
++                                        .position(x: frame.midX, y: frame.midY)
++                                        .offset(el == selected ? dragOffset : .zero)
++                                        .onTapGesture { selected = el }
++                                        .gesture(
++                                            DragGesture().onChanged { v in
++                                                selected = el; dragOffset = v.translation
++                                            }.onEnded { v in
++                                                let scX = 1280 / max(1, pv.width)
++                                                let scY = 720 / max(1, pv.height)
++                                                var n = cur(el)
++                                                n.dx += Double(v.translation.width) * scX
++                                                n.dy -= Double(v.translation.height) * scY
++                                                update(el, n)
++                                                dragOffset = .zero
++                                            }
++                                        )
++                                }
++                            }
++                            .clipShape(RoundedRectangle(cornerRadius: 18))
++                        }
++                        .frame(width: preview.width, height: preview.height)
++                        .frame(maxWidth: .infinity)
++                        // The selected element: tap a chip to pick it, then the
++                        // size slider, the eye toggle and the per-element reset.
++                        HStack(spacing: 8) {
++                            ForEach(HudElement.displayOrder) { el in
++                                Button(action: { selected = el }) {
++                                    HStack(spacing: 4) {
++                                        Text(el.name).font(.system(size: 13, weight: .semibold))
++                                        Image(systemName: cur(el).hidden ? "eye.slash" : "eye")
++                                            .font(.system(size: 11))
++                                            .foregroundStyle(cur(el).hidden ? .red : .blue)
+                                     }
++                                    .padding(.horizontal, 10).padding(.vertical, 6)
++                                    .background(selected == el ? Color.blue.opacity(0.18) : Color.secondary.opacity(0.12))
++                                    .cornerRadius(8)
++                                }
++                                .buttonStyle(.plain)
++                            }
++                        }
++                        .frame(maxWidth: .infinity)
++                        VStack(alignment: .leading, spacing: 12) {
++                            let s = cur(selected)
++                            HStack {
++                                Text("大小")
++                                Slider(value: Binding(
++                                    get: { s.k },
++                                    set: { v in var n = s; n.k = v; update(selected, n) }
++                                ), in: 0.6...1.8, step: 0.05)
++                                Text("\(Int(s.k * 100))%").frame(width: 52, alignment: .trailing)
++                            }
++                            HStack {
++                                Text(statusLine(selected))
++                                    .font(.subheadline).foregroundStyle(.secondary)
++                                Spacer()
++                                Button(action: {
++                                    var n = cur(selected); n.hidden.toggle(); update(selected, n)
++                                }) {
++                                    Label(cur(selected).hidden ? "显示" : "隐藏", systemImage: cur(selected).hidden ? "eye" : "eye.slash")
+                                 }
++                                .buttonStyle(.plain)
++                                Button("恢复 \(selected.name) 默认") {
++                                    settings.set(selected, nil)
++                                    settings.applyOneToEnvironment(selected)
++                                }
++                                .foregroundStyle(.red)
+                             }
+-                            .buttonStyle(.plain)
+-                            Button(action: {
+-                                var s = cur(el)
+-                                s.hidden.toggle()
+-                                update(el, s)
+-                            }) {
+-                                Image(systemName: cur(el).hidden ? "eye.slash" : "eye")
+-                                    .foregroundStyle(cur(el).hidden ? .red : .blue)
++                            Button("全部恢复默认") {
++                                settings.resetAll()
++                                settings.applyToEnvironment()
+                             }
+-                            .buttonStyle(.plain)
++                            .foregroundStyle(.red)
+                         }
+                     }
+-                }
+-                Section(header: Text("大小（\(selected.name)）")) {
+-                    let s = cur(selected)
+-                    HStack {
+-                        Text("60%")
+-                        Slider(value: Binding(
+-                            get: { s.k },
+-                            set: { v in var n = s; n.k = v; update(selected, n) }
+-                        ), in: 0.6...1.8, step: 0.05)
+-                        Text("\(Int(s.k * 100))%")
+-                            .frame(width: 52, alignment: .trailing)
+-                    }
+-                }
+-                Section(header: Text("位置（\(selected.name)，布局点）")) {
+-                    let s = cur(selected)
+-                    Stepper("横向 X：\(Int(s.dx))", value: Binding(
+-                        get: { s.dx },
+-                        set: { v in var n = s; n.dx = v; update(selected, n) }
+-                    ), in: -640...640, step: 10)
+-                    Stepper("纵向 Y：\(Int(s.dy))", value: Binding(
+-                        get: { s.dy },
+-                        set: { v in var n = s; n.dy = v; update(selected, n) }
+-                    ), in: -360...360, step: 10)
+-                    Button("恢复 \(selected.name) 默认") {
+-                        settings.set(selected, nil)
+-                        settings.applyOneToEnvironment(selected)
+-                    }
+-                    .foregroundStyle(.red)
+-                }
+-                Section {
+-                    Button("全部恢复默认") {
+-                        settings.resetAll()
+-                        settings.applyToEnvironment()
+-                    }
+-                    .foregroundStyle(.red)
++                    .padding(.horizontal, 16)
++                    .padding(.vertical, 12)
+                 }
+             }
+             .navigationTitle("HUD 设置")
+-- 
+2.43.0
+
