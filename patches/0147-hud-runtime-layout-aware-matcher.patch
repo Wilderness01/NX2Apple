@@ -1,0 +1,1633 @@
+From 9833c3f105af2f79bdfc0997cb4e7dfb2b870eea Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Sun, 15 Nov 2026 14:41:30 +0000
+Subject: [PATCH] 0147: layout-aware HUD runtime matcher + restore to the
+ .bflyt base
+
+The name-only matcher moved capture CONTENT panes (TxtCounterSh /
+TxtCounter / TxtIconSh / TxtIcon, shared by CounterCoin and
+CounterCollectCoin), which emptied the 128x128 capture texture (R1,
+log-51), and hit the wrong layouts ('Counter' was the moon tower,
+'PicStrap' the BootLoading strip, R2). Only a layout's 'All' container
+is matched now, identified by its direct children: PicMap (compass),
+Life (lives), Shine -> TxtShine (moons), Add + Capture tx 0 / 130
+(coins / regional; All tx nearest -740 / -615 is the fallback, and no
+Capture sibling matches nothing). Restore on mask 1 -> 0 writes the
+local back to e_orig and marks dirty so the game recomposes +0x70;
++0x70 itself is never restored to e_mod, and the entry is released
+once restored and visible. Mask-0 elements take no entry and write
+nothing. The 0118 auto-edge early return is gone (it skipped restore
+on 16:9). 0142 absolute-global write kept; HUD_EDGE_SLOTS_PER_ELEM
+stays 16. hud_edge.c, _hud_edge_frame_step, HUD_EDGE_WORDS and
+HUD_PROBE_WORDS deleted from this profile; HUD_RUNTIME_WORDS
+regenerated from .text only (764 words).
+---
+ dm/games/0100000000010000/hud_edge.c    | 627 ------------------------
+ dm/games/0100000000010000/hud_runtime.c | 452 ++++++++++-------
+ dm/games/0100000000010000/patches.py    | 410 +++-------------
+ 3 files changed, 330 insertions(+), 1159 deletions(-)
+ delete mode 100644 dm/games/0100000000010000/hud_edge.c
+
+diff --git a/dm/games/0100000000010000/hud_edge.c b/dm/games/0100000000010000/hud_edge.c
+deleted file mode 100644
+index f184b5d..0000000
+--- a/dm/games/0100000000010000/hud_edge.c
++++ /dev/null
+@@ -1,627 +0,0 @@
+-// hud_edge.c -- Super Mario Odyssey HUD edge anchor + launcher manual settings (0118 + 0119 + 0120 + 0123 + 0126 + 0127 + 0130 + 0132 + 0135).
+-//
+-// The game's HUD (coins, moons, compass, lives, hints) is laid out for a 1280x720
+-// (16:9) screen, so on a wider screen (iPhone 19.5:9) it sits inset from the
+-// edges, and on a narrower screen (iPhone Duo 1.43:1, iPad 4:3) it would be
+-// cut off at the edges. By default this hook pushes the HUD to the screen
+-// edges, automatically adapting to the screen aspect (0118): the left widgets
+-// (coins, regional coins, moons) move left on a wider screen and right on a narrower one; the
+-// right widgets (compass, lives, hints) move right on a wider screen and left
+-// on a narrower one. A manual setting made in the launcher's HUD editor (0119)
+-// is a delta from that automatic edge anchor (0128): the editor shows the
+-// element at its edge-anchored default and the player drags from there, so the
+-// manual offset is added to the edge -- dragging in the editor moves the
+-// element by the same amount in the game -- while elements with no manual
+-// setting keep following the aspect. A hidden element is moved off-screen, so
+-// it is not drawn. The compass takes one extra offset (0128): its pane
+-// 'PicStrap' is a 340-wide strip and the visible dial is centred in it, so
+-// the plain edge puts the strip at the screen edge but the dial ~128 short
+-// of it; the extra offset brings the dial (and the hints text in the strip)
+-// to the edge, matching the editor, which centres the compass on the lives
+-// column.
+-//
+-// The automatic offset comes from the screen aspect the host already writes
+-// into the frame-step state page (loader.c dm_fps_state_apply, state +0x58:
+-// the ratio r; the iOS front end resolves DM_SCREEN_ASPECT "auto" to the
+-// window's aspect before the host writes the state page, so r is the resolved
+-// aspect by the time the game runs; 0 means 16:9). The offset is:
+-//     edge = 640 * (r / 1.7777778 - 1)
+-// iPhone 19.5:9 (r=2.167): +140 per side (push out). iPhone Duo 1.43:1
+-// (r=1.429): -126 per side (pull in). iPad 4:3 (r=1.333): -160 per side
+-// (pull in). 16:9 (r=0): 0. The sign is uniform: a left widget takes
+-// dx = -edge, a right widget dx = +edge, so a wider screen pushes both
+-// outward and a narrower screen pulls both inward.
+-//
+-// The manual settings come from the launcher, through the host, in the
+-// frame-step state page at +0x200 (hud_manual.c, written by
+-// dm_hud_manual_frame_tick once per present; the launcher sets the
+-// DM_HUD_COMPASS / DM_HUD_LIFE / DM_HUD_COINS / DM_HUD_MOONS / DM_HUD_HINTS
+-// environment variables from the player's editor choices before the game starts):
+-//   +0x200: 15 floats, per element (dx, dy, k): compass, lives, coins,
+-//     moons, hints. dx / dy are layout points (the 1280x720 space), a DELTA
+-//     from the automatic edge anchor (0128): the launcher's editor shows the
+-//     element at its edge-anchored default and records the drag from there,
+-//     so the manual offset is ADDED to the edge -- dragging in the editor
+-//     moves the element by the same amount in the game. A drag down the
+-//     screen is a negative dy (the layout is y-up); the launcher negates its
+-//     y-down drag when it writes the value. k is the element's size, 0.6 to
+-//     1.8 (the editor's slider), 1 is the game's own size.
+-//   +0x240: u32 manual mask (bit i: element i has a manual setting).
+-//   +0x244: u32 hidden mask (bit i: element i is hidden).
+-// The state page starts zeroed, so an unwritten block reads as no manual
+-// setting and nothing hidden, and a zero / non-number k reads as 1.
+-// A manual setting is per element and independent: moving the coins does not
+-// move the moons, and hiding one element leaves the others alone.
+-// (0123 moved the masks from +0x230/+0x234: 15 floats occupy +0x200..+0x23B,
+-// so the old mask slots would have collided with the fifth element's data.)
+-//
+-// The hook runs from the same two rewriter cuts as the old 0113
+-// (Pane::Calculate main+0x909494: the entry cut at +0x20 and the +0x13c cut
+-// at +0x13c), because one cut misses static panes (see the old hud_calc.c
+-// header: the skip path over the +0x13c site). It matches the five HUD
+-// widgets by pane name only -- no subtree walk, no tree search, no
+-// guide/root classification, no camera widening, no log. The only walk is the
+-// dirty-mark for a moved container's children (hud_edge_mark_dirty), which
+-// only sets a flag and uses the v8 single struct-array (no second base
+-// register, so the log-27 sdepth/x18 fault class is structurally absent);
+-// it never reads a pane name and never decides a match.
+-//
+-// (0135) Only the DISPLAYED position moves, and it moves by shifting the
+-// pane's LOCAL translation (+0x30/+0x34) and LOCAL scale (+0x48/+0x4c).
+-// The global matrix (+0x70) is NEVER written: the game composes it from the
+-// local, so the shift reaches the display through the game's own composition.
+-// The old design reconstructed an absolute original global (e_orig) and
+-// wrote (e_orig + tdx) to +0x70, and it failed both ways on device: a static
+-// pane's +0x70 was never composed, so its e_orig was (0,0) and the write
+-// pushed it to -140, off-screen (log-44 criterion (c): the (263,71) layout
+-// is not in the pane struct 0x00-0xFF, so no absolute can be reconstructed);
+-// and a dynamic pane's +0x70 was recomposed by the game after the write, so
+-// the compass stayed visually unmoved (user 2026-11-14 20:45) even though
+-// the log showed live 1248. The local shift needs no stored layout value:
+-// the delta is relative, so the unknown layout term cancels out. After
+-// writing a pane's local, the hook marks the pane itself dirty (flags bit 4
+-// at +0x58) and its descendants dirty, so the game recomposes +0x70 from
+-// the shifted local in the same Calculate call.
+-// A moved pane's original LOCAL is stored in a small table (state +0x300,
+-// 96 128-byte entries, sixteen per element -- up to sixteen layout instances can
+-// match the same element) and the shifted local is always re-derived from that
+-// original, so a fixed offset never accumulates into a drift, and a game
+-// recompute (an animation, a count change, a layout reload) is followed by
+-// re-storing the original. The offset, size and hidden flag the local was
+-// shifted by are also stored per entry, so a settings change or an aspect
+-// change re-applies instead of being ignored, and a manual element is not
+-// re-derived from the automatic offset.
+-//
+-// (0128) A manual setting is a delta from the automatic edge anchor, NOT an
+-// absolute offset from the game's default layout. The old (0119-0127) code
+-// treated it as absolute, replacing the edge -- but the editor shows the
+-// element at its edge-anchored default and records the drag from there, so
+-// a manual element landed one whole edge (140 on iPhone) away from where
+-// the player dragged it (V1.3.17, log-33: coins manual 16,-3 landed at
+-// default+16 instead of edge+16; the moons manual 293,169 likewise). The
+-// manual offset is now ADDED to the edge anchor, so dragging in the editor
+-// moves the element by the same amount in the game, and a manual element
+-// still follows the aspect (as the editor does). An old saved setting (recorded
+-// as a drag from the edge) is now read correctly with no migration.
+-//
+-// Parent compensation (0123, revised 0135): a child of a matched parent
+-// must not be double-shifted. The old design undid the parent's transform
+-// from the child's global matrix (hud_edge_unparent); the local design is
+-// simpler: a pane's displayed shift is its parent's applied shift plus its
+-// own local shift, so the child's local delta is its own target minus the
+-// parent's applied delta (read from the parent's table entry -- a parent
+-// with no entry, or a fresh entry, applied the identity, and the parent's
+-// Calculate runs before the child's, so its entry is already written when
+-// the child is processed). The scale is the ratio: the child's displayed
+-// scale is the parent's applied scale times the child's local scale, so the
+-// local scale is the target scale divided by the parent's k. A child that
+-// wants the same transform as its parent takes a zero local delta and rides
+-// the parent -- the old (c) "same transform" gate is gone, subsumed by the
+-// compensation (a zero effective delta is just the already-correct early
+-// return). A hidden parent's +10000 is in its applied delta, so a child of
+-// a hidden parent is pulled back on-screen by exactly that amount (hiding
+-// the parent does not hide the child); a hidden child of a visible parent
+-// is pushed off-screen.
+-//
+-// What this patch does NOT do (deliberately): no map-camera widen, no
+-// settings/map code, no guide-text hiding, no root stretch. The camera icon
+-// in the top-right is NOT a HUD element -- it is the photo button (a
+-// virtual pad button, positioned by DmGamepad), so it is never matched.
+-// The dots under the moon counter move with the moons element: they are part
+-// of the counter's layout (the 'Counter' group), so the launcher's moons
+-// element draws them with the moon icon and number, and moving the moons
+-// element carries them. The white bar under the counts is drawn with the
+-// coins element in the launcher; its own pane is not matched by name -- no
+-// pane in any log or in the DmIOS string pool matches a wide thin bar under
+-// the counts (the coins group's Capture00-03 are 128x128 squares, WinLine is
+-// a 452x38 line under the guide text), so whether it follows the coins in
+-// the game depends on its parent, which the available logs do not show --
+-// it may stay where the game put it (a known limitation, 0123).
+-// The regional-coins icon and number (PicIconSh / PicIcon / TxtTotalShine under a
+-// 'Counter') are their OWN element (0127: the player splits the two kinds of
+-// coins into two separately adjustable groups -- coins = the coin icon + number,
+-// regional coins = the hexagon icon + number, moons = the dots). The moons element
+-// is the 'Counter' group itself (which carries the dots). A bare
+-// 'TxtTotalShine' whose parent is NOT a 'Counter' stays the moons fallback.
+-// 'PicIcon' also appears elsewhere (the lives cluster, the cursor group),
+-// so it is only matched when its parent is a 'Counter' -- any other parent
+-// is left alone.
+-//
+-// Compiled with: aarch64-linux-gnu-gcc -O2 -ffreestanding -fno-builtin
+-//   -fno-stack-protector -fno-jump-tables -fno-asynchronous-unwind-tables -c
+-// (same flags as the old hud_calc.c). The function takes everything through
+-// its arguments -- no static data, no literal pool, no external calls -- so
+-// the emitted words are position-independent and relocation-free and can be
+-// dropped into the rewriter's patch area verbatim:
+-//   x0 = the pane (nn::ui2d::Pane *), x1 = the aspect (state + 0x58: a float,
+-//   the screen's width / height; 0 = 16:9), x2 = the edge table (state +
+-//   0x300: 96 128-byte entries, sixteen per HUD element), x3 = the manual
+-//   settings (state + 0x200: 18 floats, a u32 manual mask, a u32 hidden
+-//   mask; a NULL pointer reads as no manual setting).
+-//   Element order: 0 compass (right), 1 lives (right), 2 coins (left),
+-//   3 moons (left), 4 hints (right), 5 regional coins (left). The state page starts zeroed, so a table entry with
+-//   pane == 0 is unused.
+-
+-typedef unsigned int u32;
+-typedef unsigned long uintptr_t;
+-
+-#define HUD_EDGE_N 6
+-#define HUD_EDGE_ENTRY 128         // bytes per table entry
+-#define HUD_EDGE_SLOTS_PER_ELEM 16  // table slots per HUD element: up to sixteen layout instances can match the same element (log-20 shows TEN panes matching coins -- 2x TxtCounterSh + 2x TxtCounter + 2x PicIconSh + 2x PicIcon + 2x TxtTotalShine, two Counter groups; eight slots thrashed and the re-init re-derived the original from an already-modified matrix, so the offset drifted off-screen -- 0126; 0120 raised it 2 -> 8 for the four number panes alone)
+-
+-// The manual settings block (state +0x200), as the host writes it.
+-#define HUD_MANUAL_FLOATS 18       // dx, dy, k per element (6 elements)
+-#define HUD_MANUAL_MASK_OFF 72     // byte offset of the manual mask (+0x248; the 18 floats end at +0x247)
+-#define HUD_HIDDEN_MASK_OFF 76     // byte offset of the hidden mask (+0x24C)
+-
+-// A hidden element is pushed this far off-screen (0113 hid its guide text
+-// the same way: a pane already past 5000 is off-screen). The layout is at
+-// most 1560 wide, so +10000 is safely outside it whatever the aspect.
+-#define HUD_HIDE_DX 10000.0f
+-
+-// The compass dial is centred in its 340-wide 'PicStrap' strip, so the plain
+-// edge puts the strip at the screen edge but the dial ~128 short of it (0128:
+-// log-20 gives the strip as 340x720; the V1.3.17 screenshot puts the dial's
+-// centre ~175 from the strip's left edge, i.e. centred, and the editor
+-// centres the compass on the lives column). This extra offset, added to the
+-// compass's edge anchor on every aspect, brings the dial (and the hints text
+-// in the strip) to the edge. It is a property of the strip's layout (the dial
+-// centred in 340), not of the aspect, so it is a constant. The strip's right
+-// edge then sits ~100 past the screen edge -- the strip is transparent there,
+-// only the dial and the hints text are visible.
+-#define HUD_COMPASS_EXTRA 128.0f
+-
+-// The pane names, as little-endian u32s (no string literal: a literal would
+-// sit in .rodata and the code would load its address with an adrp, a
+-// relocation, and the embedded words carry no literal pool).
+-// "PicStrap": "PicS", "trap" (8 letters, the 9th byte is the NUL).
+-#define HUD_E_STRAP0 0x53636950u
+-#define HUD_E_STRAP1 0x70617274u
+-// "Counter": "Coun", "ter\0".
+-#define HUD_E_COUNTER0 0x6e756f43u
+-#define HUD_E_COUNTER1 0x00726574u
+-// "TxtTotalShine": "TxtT", "otal", "Shin", "e\0".
+-#define HUD_E_TSHINE0 0x54747854u
+-#define HUD_E_TSHINE1 0x6c61746fu
+-#define HUD_E_TSHINE2 0x6e696853u
+-#define HUD_E_TSHINE3 0x00000065u
+-// "TxtCounterSh": "TxtC", "ount", "erSh", 0 (12 bytes, the fourth word is the NUL word).
+-#define HUD_E_TCSH0 0x43747854u
+-#define HUD_E_TCSH1 0x746e756fu
+-#define HUD_E_TCSH2 0x68537265u
+-#define HUD_E_TCSH3 0x00000000u
+-// "TxtCounter": "TxtC", "ount", "er\0".
+-#define HUD_E_TC0 0x43747854u
+-#define HUD_E_TC1 0x746e756fu
+-#define HUD_E_TC2 0x00007265u
+-// "TxtLife": "TxtL", "ife\0".
+-#define HUD_E_TLIFE0 0x4c747854u
+-#define HUD_E_TLIFE1 0x00656669u
+-// "Life" ("Life" as one word; the 5th byte is the NUL).
+-#define HUD_E_LIFE0 0x6566694cu
+-// "PicIconSh": "PicI", "conS", "h\0\0\0" (the moon icon's shadow picture,
+-// under the moons 'Counter' group -- coins since 0123).
+-#define HUD_E_PICONSH0 0x49636950u
+-#define HUD_E_PICONSH1 0x536e6f63u
+-#define HUD_E_PICONSH2 0x00000068u
+-// "PicIcon": "PicI", "con\0" (the moon icon itself, under 'Counter').
+-#define HUD_E_PICON0 0x49636950u
+-#define HUD_E_PICON1 0x006e6f63u
+-// "TxtGuide01": "TxtG", "uide", "01\0\0" (the "+ menu / - map" hint text,
+-// under the compass 'PicStrap' strip in log-20 -- hints since 0123).
+-#define HUD_E_TGUIDE0 0x47747854u
+-#define HUD_E_TGUIDE1 0x65646975u
+-#define HUD_E_TGUIDE2 0x00003130u
+-
+-// Bounded compare of a pane name's words against the given words (n words,
+-// the rest of the name unchecked). Same as the old hud_words_eq.
+-static inline __attribute__((always_inline)) int hud_edge_words_eq(const u32 *nw, u32 a, u32 b, u32 c, u32 d, int n) {
+-    if (n >= 1 && nw[0] != a) return 0;
+-    if (n >= 2 && nw[1] != b) return 0;
+-    if (n >= 3 && nw[2] != c) return 0;
+-    if (n >= 4 && nw[3] != d) return 0;
+-    return 1;
+-}
+-
+-// A manual size outside [0.6, 1.8], or not a number, is the editor's bug, not
+-// a request: fall back to 1 (no resize). A zero scale is not a request either
+-// (the state page starts zeroed, so an unwritten k reads as 0 and must mean
+-// identity, never a collapse). The NaN test is k != k (a NaN is not equal to
+-// itself); a negative scale would mirror the widget, which nobody asked for.
+-// (The launcher's slider only writes 0.6 to 1.8; the host clamps too; this is
+-// the third clamp, so a wild environment variable can never collapse a widget.)
+-static inline __attribute__((always_inline)) float hud_edge_clamp_k(float k) {
+-    if (k == 0.0f || k != k) return 1.0f;
+-    if (k < 0.6f) return 0.6f;
+-    if (k > 1.8f) return 1.8f;
+-    return k;
+-}
+-
+-// A manual offset outside the layout is the editor's bug, not a request:
+-// clamp it, so a wild environment variable can never throw a widget off the
+-// screen (hiding is the only way off-screen, and it is explicit).
+-static inline __attribute__((always_inline)) float hud_edge_clamp_off(float v, float lim) {
+-    if (v != v) return 0.0f;
+-    if (v > lim) return lim;
+-    if (v < -lim) return -lim;
+-    return v;
+-}
+-
+-// Find the table entry for a pane (a linear scan over the whole table: 80
+-// entries, no pointer chasing). Returns 0 when the pane has no entry (it
+-// was never matched, or its slot was reclaimed).
+-static inline __attribute__((always_inline)) char *hud_edge_find_entry(void *table, void *pane) {
+-    for (int i = 0; i < HUD_EDGE_N * HUD_EDGE_SLOTS_PER_ELEM; i++) {
+-        char *e = (char *)table + i * HUD_EDGE_ENTRY;
+-        if (*(u32 *)(e + 124) != 0 && *(uintptr_t *)(e + 0) == (uintptr_t)pane) return e;
+-    }
+-    return 0;
+-}
+-
+-// The guards every subtree walk below applies (same as the old v7 guards,
+-// because a layout's child list can go stale while the game unloads it):
+-//  (a) a popped pane is checked for NULL / alignment before it is read;
+-//  (b) a list node is checked (non-NULL, 8-byte aligned, >= 0x10000) before
+-//      child = node - 8 is computed from it;
+-//  (c) a child that is the pane itself, or lies inside the pane's own
+-//      first 0x100 bytes, is never treated as a pane.
+-static inline __attribute__((always_inline)) int hud_edge_node_ok(void *node) {
+-    uintptr_t v = (uintptr_t)node;
+-    return v != 0 && (v & 7u) == 0 && v >= 0x10000;
+-}
+-
+-static inline __attribute__((always_inline)) int hud_edge_child_self(void *p, void *child) {
+-    if (child == p) return 1;
+-    if ((uintptr_t)child <= (uintptr_t)p) return 0;
+-    return (uintptr_t)child - (uintptr_t)p < 0x100;
+-}
+-
+-// The DFS stack: ONE array of {pane, depth} entries (the v8 fix for the
+-// log-27 crash: the old v7 kept two parallel arrays, and the second array's
+-// separate base register was the faulting access). Co-locating pane and depth
+-// in one entry leaves a single array base, so there is no second base
+-// register to lose.
+-typedef struct { void *pane; unsigned char depth; } hud_edge_stack_ent;
+-
+-// Mark every descendant of a pane dirty (flags bit 4 at +0x58), so the game
+-// recomputes their global matrices from this pane's (just-shifted) local.
+-// This is the ONLY subtree walk in this patch, and it only sets a flag: it
+-// never reads a pane name and never decides a match. The parent-changed flag
+-// the game passes to children is 0 on the skip path, so without this a static
+-// container's children never recompute and never follow it. The flag is the
+-// game's own signal (Pane::Calculate sets it when a parent changed and
+-// clears it on recompute), so the game's next Calculate on each descendant
+-// recomputes from the moved parent. Bounded (64 visits, 32 children per
+-// pane, depth 3); the pane itself is never marked here -- hud_edge marks it separately
+-// after writing its local, so the game recomputes this pane's +0x70 from the
+-// shifted local in the same Calculate call. Only called when the hook
+-// actually writes a new local, never on the already-correct early return.
+-static inline __attribute__((always_inline)) void hud_edge_mark_dirty(void *pane) {
+-    if (!pane) return;
+-    hud_edge_stack_ent st[64];
+-    int sp = 0, visits = 0;
+-    st[sp].pane = pane;
+-    st[sp].depth = 3;
+-    sp++;
+-    while (sp > 0 && visits < 64) {
+-        sp--;
+-        void *p = st[sp].pane;
+-        if (!p || ((uintptr_t)p & 7u)) continue;   // (a) never read a popped NULL / unaligned pane
+-        unsigned char depth = st[sp].depth;
+-        void *head = (char *)p + 0x20;
+-        void *node = *(void **)((const char *)p + 0x28);
+-        for (int i = 0; i < 32; i++) {
+-            if (!node || node == head) break;
+-            if (!hud_edge_node_ok(node)) break;     // (b) never follow a bad node
+-            void *child = (char *)node - 8;
+-            if (hud_edge_child_self(p, child)) { node = *(void **)((const char *)child + 0x10); continue; } // (c) skip the self child, keep its siblings
+-            visits++;
+-            *(unsigned short *)((char *)child + 0x58) |= 0x10u;   // flags bit 4: dirty, recompute from the parent
+-            if (depth > 0 && sp < 64) {
+-                st[sp].pane = child;
+-                st[sp].depth = depth - 1;
+-                sp++;
+-            }
+-            node = *(void **)((const char *)child + 0x10);
+-        }
+-    }
+-}
+-
+-// Is the given pane's parent named by these words (exact, n words)? The
+-// parent is read once, directly -- no walk. A NULL parent is never the
+-// container, so a parentless pane takes the fallback.
+-static inline __attribute__((always_inline)) int hud_edge_parent_is(void *pane, u32 a, u32 b, int n) {
+-    void *parent = *(void **)((const char *)pane + 0x18);
+-    if (!parent) return 0;
+-    const u32 *pnw = (const u32 *)((const char *)parent + 0xb8);
+-    if (n >= 1 && pnw[0] != a) return 0;
+-    if (n >= 2 && pnw[1] != b) return 0;
+-    return 1;
+-}
+-
+-void hud_edge(void *pane, const float *aspect_ptr, void *table, const float *params) {
+-    if (!pane || !aspect_ptr || !table) return;
+-    // The edge offset, from the screen aspect the host wrote into the state
+-    // page (state +0x58; 0 = 16:9, unwritten). Valid aspects are 1.3 to 2.2
+-    // (the range loader.c accepts); anything else is 16:9. The offset is
+-    // clamped so a wild aspect can never throw a widget off the screen.
+-    // A manual setting or a hide still applies when the edge is 0 (16:9),
+-    // so the early return below is only the no-manual no-hide no-edge case.
+-    float aspect = *aspect_ptr;
+-    float edge = 0.0f;
+-    if (aspect >= 1.3f && aspect <= 2.2f) {
+-        edge = 640.0f * (aspect / 1.7777778f - 1.0f);
+-        if (edge > 200.0f) edge = 200.0f;
+-        if (edge < -200.0f) edge = -200.0f;
+-    }
+-
+-    // The manual settings (state +0x200; a NULL params pointer, or an
+-    // unwritten block, reads as no manual setting and nothing hidden).
+-    u32 manual_mask = 0, hidden_mask = 0;
+-    if (params) {
+-        const u32 *pu = (const u32 *)params;
+-        manual_mask = pu[HUD_MANUAL_MASK_OFF / 4];
+-        hidden_mask = pu[HUD_HIDDEN_MASK_OFF / 4];
+-    }
+-    // 16:9 with no manual setting and nothing hidden: nothing to do for any
+-    // element (the 0118 early return, kept so the common case costs nothing).
+-    if (edge == 0.0f && manual_mask == 0 && hidden_mask == 0) return;
+-
+-    // Flags bit 7 is set by Pane::Calculate's epilogue, so it tells whether
+-    // this pane has ever calculated. On a pane's very first frame its matrix
+-    // is still zero; skip it (the +0x13c cut catches it after the game
+-    // computes it, and the entry cut catches it from the next frame on).
+-    unsigned short pflags = *(const unsigned short *)((const char *)pane + 0x58);
+-    if (!(pflags & 0x80u)) return;
+-
+-    const char *name = (const char *)pane + 0xb8;
+-    const u32 *nw = (const u32 *)name;
+-
+-    // Which HUD element is this pane, by name only (no subtree walk).
+-    // Moons: the counter group itself, a pane named 'Counter'; a bare
+-    // 'TxtTotalShine' is the fallback for a layout with no 'Counter' group,
+-    // and only when its parent is not a 'Counter' (the group's own number
+-    // follows the group; matching both would move it twice). Life: the
+-    // 'Life' container, or a bare 'TxtLife' whose parent is NOT named
+-    // 'Life'. Coins: 'TxtCounterSh' and its sibling 'TxtCounter', both
+-    // matched by name, so both take the same offset and no twin-write walk
+-    // is needed. Regional coins (0127): the hexagon icon and its number,
+-    // which live UNDER the moons 'Counter' group: a 'PicIconSh' / 'PicIcon' /
+-    // 'TxtTotalShine' whose parent IS a 'Counter' belongs to the regional
+-    // coins element (its own element since 0127, so it can be dragged and
+-    // hidden separately from the coins), and the parent-compensation step
+-    // below keeps it from being moved twice. 'PicIcon' is also used
+-    // elsewhere (the lives cluster, the cursor group), so it is only matched
+-    // when its parent is a 'Counter'.
+-    // Compass: 'PicStrap', the right strip (the dial itself is not a Pane,
+-    // so the strip is the compass; moving the strip moves the whole
+-    // right-hand cluster together). Hints: 'TxtGuide01', the "+ menu / - map"
+-    // text that sits under the same 'PicStrap' strip in log-20 (its own
+-    // element since 0123, so it can be dragged and hidden on its own; the
+-    // parent compensation keeps it from following the compass). The old v1
+-    // actor names (CompassArea / CoinCounter / MoonNum) are NOT matched:
+-    // they are actor / state-machine names, not pane names, and matching
+-    // them never fired.
+-    int idx = -1;
+-    if (nw[0] == HUD_E_STRAP0 && nw[1] == HUD_E_STRAP1 && name[8] == 0) idx = 0;
+-    else if (nw[0] == HUD_E_LIFE0 && name[4] == 0) idx = 1;
+-    else if (hud_edge_words_eq(nw, HUD_E_TLIFE0, HUD_E_TLIFE1, 0, 0, 2)) {
+-        if (!hud_edge_parent_is(pane, HUD_E_LIFE0, 0, 1)) idx = 1;
+-    }
+-    else if (hud_edge_words_eq(nw, HUD_E_TCSH0, HUD_E_TCSH1, HUD_E_TCSH2, HUD_E_TCSH3, 4)) idx = 2;
+-    else if (hud_edge_words_eq(nw, HUD_E_TC0, HUD_E_TC1, HUD_E_TC2, 0, 3)) idx = 2;
+-    else if (hud_edge_words_eq(nw, HUD_E_PICONSH0, HUD_E_PICONSH1, HUD_E_PICONSH2, 0, 3)) {
+-        if (hud_edge_parent_is(pane, HUD_E_COUNTER0, HUD_E_COUNTER1, 2)) idx = 5;
+-    }
+-    else if (hud_edge_words_eq(nw, HUD_E_PICON0, HUD_E_PICON1, 0, 0, 2)) {
+-        if (hud_edge_parent_is(pane, HUD_E_COUNTER0, HUD_E_COUNTER1, 2)) idx = 5;
+-    }
+-    else if (hud_edge_words_eq(nw, HUD_E_COUNTER0, HUD_E_COUNTER1, 0, 0, 2)) idx = 3;
+-    else if (hud_edge_words_eq(nw, HUD_E_TSHINE0, HUD_E_TSHINE1, HUD_E_TSHINE2, HUD_E_TSHINE3, 4)) {
+-        if (hud_edge_parent_is(pane, HUD_E_COUNTER0, HUD_E_COUNTER1, 2)) idx = 5;
+-        else idx = 3;
+-    }
+-    else if (hud_edge_words_eq(nw, HUD_E_TGUIDE0, HUD_E_TGUIDE1, HUD_E_TGUIDE2, 0, 3)) idx = 4;
+-    if (idx < 0) return;   // not a HUD element: leave it alone
+-
+-    // What this element should be, this frame. Priority: hidden first, then
+-    // manual, then the automatic edge anchor (0118). A manual setting is a
+-    // DELTA from the automatic edge anchor (0128): the launcher's editor
+-    // shows the element at its edge-anchored default and records the drag
+-    // from there, so the manual offset is ADDED to the edge -- dragging in
+-    // the editor moves the element by the same amount in the game -- and a
+-    // manual element still follows the aspect (as the editor does). The
+-    // compass's base anchor also carries the extra offset above (its dial is
+-    // centred in the 340-wide strip). A hidden element is pushed off-screen (its
+-    // local x +10000); its manual offset and size do not matter while it is
+-    // hidden, and it comes back to its manual (or automatic) place when it is
+-    // shown again. (0135) All three behaviours are DISPLAYED-position moves
+-    // applied as local deltas -- edge, manual drag, and hide all go through
+-    // the local translation/scale; +0x70 is never written.
+-    int manual = (manual_mask >> idx) & 1u;
+-    int hidden = (hidden_mask >> idx) & 1u;
+-    float tdx = 0.0f, tdy = 0.0f, tk = 1.0f;
+-    float base = (idx == 0 || idx == 1 || idx == 4) ? edge : -edge;
+-    if (idx == 0) base += HUD_COMPASS_EXTRA;   // the dial, centred in the 340 strip
+-    if (hidden) {
+-        tdx = HUD_HIDE_DX;   // +10000: the displayed position moves off-screen
+-        tdy = 0.0f;
+-        tk = 1.0f;
+-    } else if (manual && params) {
+-        tdx = base + hud_edge_clamp_off(params[idx * 3 + 0], 640.0f);
+-        tdy = hud_edge_clamp_off(params[idx * 3 + 1], 360.0f);
+-        tk = hud_edge_clamp_k(params[idx * 3 + 2]);
+-    } else {
+-        // Automatic: left widgets (coins, regional coins, moons) take dx = -edge; right
+-        // widgets (compass, lives, hints) take dx = +edge (the compass also
+-        // takes the extra offset above). A wider screen (edge > 0) pushes
+-        // both outward to the edges; a narrower screen (edge < 0) pulls both
+-        // inward so they stay visible and at the edges. dy is always 0 and
+-        // the scale is always 1: this patch only translates, never resizes.
+-        tdx = base;
+-    }
+-    // (0135) Every behaviour is a DISPLAYED-position move, applied as a
+-    // local delta: edge, manual drag, and hide all go through the local
+-    // translation (+0x30/+0x34) and local scale (+0x48/+0x4c). Hide is a
+-    // local +10000 (the displayed position moves off-screen). +0x70 is
+-    // never written -- no absolute value is written anywhere.
+-    // The parent compensation: this pane's displayed shift is its parent's
+-    // applied shift plus its own local shift, so its effective local delta
+-    // is its own target minus the parent's applied delta (read from the
+-    // parent's table entry). A parent with no entry, or a fresh entry
+-    // (sentinel 1e30f), applied the identity. The parent's Calculate runs
+-    // before the child's, so its entry is already written when the child is
+-    // processed; a stale entry self-corrects on the next frame. The scale
+-    // is the ratio (the child's displayed scale is the parent's applied
+-    // scale times the child's local scale).
+-    float pm_dx = 0.0f, pm_dy = 0.0f, pm_k = 1.0f;
+-    void *parent = *(void **)((const char *)pane + 0x18);
+-    if (parent && !((uintptr_t)parent & 7u)) {
+-        char *pe = hud_edge_find_entry(table, parent);
+-        if (pe) {
+-            float pdx = *(const float *)(pe + 104);
+-            float pk = *(const float *)(pe + 112);
+-            if (pdx != 1e30f && pk != 0.0f && pk == pk) {
+-                pm_dx = pdx;
+-                pm_dy = *(const float *)(pe + 108);
+-                pm_k = pk;
+-            }
+-        }
+-    }
+-    float edx = tdx - pm_dx;
+-    float edy = tdy - pm_dy;
+-    float ek = (pm_k == 1.0f) ? tk : (tk / pm_k);
+-
+-    // The per-element entry: the pane, its original LOCAL translation and
+-    // scale (as the game set them -- the layout's own local, which does not
+-    // depend on what any parent did), and the effective local delta actually
+-    // applied (edx/edy/ek) plus the hidden flag. Sixteen slots per element
+-    // (idx + s * HUD_EDGE_N): up to sixteen layout instances can match the
+-    // same element, and one slot per element cannot hold them all (0120,
+-    // 0126). The stored transform is compared against the target below, so
+-    // a settings change or an aspect change re-applies instead of being
+-    // ignored, and a manual element is not re-derived from the automatic
+-    // offset. A no-op element (effective delta identity, not hidden) never
+-    // takes a slot: the identity early return below fires before any
+-    // allocation, so an unmoved element costs nothing.
+-    // (0135) e_orig's role changed: it no longer holds an original GLOBAL
+-    // matrix (that value does not exist for a static pane -- log-44 (c));
+-    // it holds the original LOCAL: e_orig[3] = local x (+0x30), e_orig[7] =
+-    // local y (+0x34), e_orig[0] = local scale x (+0x48), e_orig[5] =
+-    // local scale y (+0x4c). e_mod (+56) is unused under 0135. The probe
+-    // reads e_orig[3]/[7] and e_dx/e_dy/e_k/e_hidden, so its layout record
+-    // shows the original local and the applied local delta; its live_global
+-    // and final_m3 are the game's pre-shift +0x70 (the probe's first
+-    // sighting runs before the game recomposes it) and must NOT be used to
+-    // judge the displayed position -- the displayed shift is verified by
+-    // the layout record (local minus original local) and the screenshot.
+-    char *ent = 0;
+-    int found = 0;
+-    for (int s = 0; s < HUD_EDGE_SLOTS_PER_ELEM; s++) {
+-        char *e = (char *)table + (idx + s * HUD_EDGE_N) * HUD_EDGE_ENTRY;
+-        if (*(uintptr_t *)(e + 0) == (uintptr_t)pane) { ent = e; found = 1; break; }
+-        if (!ent && *(u32 *)(e + 124) == 0) ent = e;   // first free slot
+-    }
+-    if (!found && !hidden && edx == 0.0f && edy == 0.0f && ek == 1.0f) return;   // no-op: never take a slot
+-    if (!ent) ent = (char *)table + idx * HUD_EDGE_ENTRY;   // all taken: reclaim the first (a reload)
+-    uintptr_t *e_pane = (uintptr_t *)(ent + 0);
+-    float *e_orig = (float *)(ent + 8);
+-    float *e_dx = (float *)(ent + 104);
+-    float *e_dy = (float *)(ent + 108);
+-    float *e_k = (float *)(ent + 112);
+-    u32 *e_hidden = (u32 *)(ent + 116);
+-    if (*e_pane != (uintptr_t)pane) {   // first sighting, or the layout reloaded
+-        *e_pane = (uintptr_t)pane;
+-        *(u32 *)(ent + 120) = (u32)idx;
+-        *(u32 *)(ent + 124) = 1u;
+-        *e_dx = 1e30f;   // sentinel: force a recompute below (the stored transform is stale).
+-        // e_dy / e_k / e_hidden need no sentinel: the early return below
+-        // tests e_dx first (&& short-circuits), so a stale e_dx alone forces
+-        // the recompute that writes all four. (Writing them here as adjacent
+-        // stores would let the compiler merge them into one 64-bit store of
+-        // a constant it loads from .rodata -- a relocation the embedded
+-        // words must not carry. The single 1e30f store is the 0118 pattern,
+-        // which compiles to movz/movk, relocation-free.)
+-        for (int i = 0; i < 12; i++) e_orig[i] = 0.0f;
+-        // Store the original local translation and scale (the game's own
+-        // values, before any shift). (0135) e_orig is the original LOCAL,
+-        // not a global matrix; e_mod is unused.
+-        e_orig[3] = *(const float *)((const char *)pane + 0x30);
+-        e_orig[7] = *(const float *)((const char *)pane + 0x34);
+-        e_orig[0] = *(const float *)((const char *)pane + 0x48);
+-        e_orig[5] = *(const float *)((const char *)pane + 0x4c);
+-    }
+-
+-    // Did the game change the local since the last frame? Compare the
+-    // current local against the stored original plus the stored applied
+-    // delta, and the current local scale against the stored original scale
+-    // times the stored k: if they differ, the game wrote a new local (an
+-    // animation, a count change, a layout reload), so the stored original
+-    // follows it. The current local is the game's own value (an animation
+-    // sets it absolutely from the layout's base, so it does not include our
+-    // delta), so it becomes the new original and the delta is re-applied
+-    // below. If they are the same, the game left our shifted local alone,
+-    // and only a transform change needs a rewrite.
+-    int recomputed = 0;
+-    float cur_lx = *(const float *)((const char *)pane + 0x30);
+-    float cur_ly = *(const float *)((const char *)pane + 0x34);
+-    float cur_sx = *(const float *)((const char *)pane + 0x48);
+-    float cur_sy = *(const float *)((const char *)pane + 0x4c);
+-    if (*e_dx == 1e30f) {
+-        recomputed = 1;   // fresh entry: must write
+-    } else if (cur_lx != e_orig[3] + *e_dx || cur_ly != e_orig[7] + *e_dy ||
+-               cur_sx != e_orig[0] * *e_k || cur_sy != e_orig[5] * *e_k) {
+-        recomputed = 1;
+-        e_orig[3] = cur_lx;
+-        e_orig[7] = cur_ly;
+-        e_orig[0] = cur_sx;
+-        e_orig[5] = cur_sy;
+-    }
+-    if (!recomputed && *e_dx == edx && *e_dy == edy && *e_k == ek && *e_hidden == (u32)hidden) return;   // already correct: nothing to do
+-
+-    // The local shift is always re-derived from the stored original, so a
+-    // fixed offset cannot drift: local = original local + effective delta,
+-    // local scale = original local scale * effective k. Hidden: the local
+-    // x pushed +10000 (the displayed position moves off-screen; the size
+-    // does not matter off-screen). A child that wants the same transform as
+-    // its parent takes a zero effective delta here and rides the parent
+-    // (its local is restored to the original, so nothing is written twice).
+-    *(float *)((char *)pane + 0x30) = e_orig[3] + edx;
+-    *(float *)((char *)pane + 0x34) = e_orig[7] + edy;
+-    *(float *)((char *)pane + 0x48) = e_orig[0] * ek;
+-    *(float *)((char *)pane + 0x4c) = e_orig[5] * ek;
+-    *e_dx = edx;
+-    *e_dy = edy;
+-    *e_k = ek;
+-    *e_hidden = (u32)hidden;
+-
+-    // Mark this pane dirty (flags bit 4 at +0x58), so the game recomposes
+-    // its +0x70 from the shifted local in the same Calculate call (the
+-    // entry cut runs before the flags load, so the flag is visible to the
+-    // skip-path check). Its children are calculated after this hook, so
+-    // they inherit the moved parent -- but only if the game recomputes
+-    // them: mark the descendants dirty too and the game recomputes them
+-    // from the moved parent on the same frame.
+-    *(unsigned short *)((char *)pane + 0x58) |= 0x10u;
+-    hud_edge_mark_dirty(pane);
+-}
+diff --git a/dm/games/0100000000010000/hud_runtime.c b/dm/games/0100000000010000/hud_runtime.c
+index 258766e..8422bc7 100644
+--- a/dm/games/0100000000010000/hud_runtime.c
++++ b/dm/games/0100000000010000/hud_runtime.c
+@@ -1,4 +1,7 @@
+-// hud_edge.c -- Super Mario Odyssey HUD edge anchor + launcher manual settings (0118 + 0119 + 0120 + 0123 + 0126 + 0127 + 0130 + 0132 + 0135).
++// hud_runtime.c -- Super Mario Odyssey in-game HUD editor runtime (0137 + 0142 + 0147).
++// (History: this file started as a copy of hud_edge.c, the 0118 HUD edge anchor;
++// the 0118 auto-edge code is deleted -- the edge anchor now lives in the
++// 0136/0143 .bflyt overlay, and this file applies ONLY manual deltas.)
+ //
+ // The game's HUD (coins, moons, compass, lives, hints) is laid out for a 1280x720
+ // (16:9) screen, so on a wider screen (iPhone 19.5:9) it sits inset from the
+@@ -180,6 +183,57 @@ typedef unsigned long uintptr_t;
+ #define HUD_MANUAL_MASK_OFF 72     // byte offset of the manual mask (+0x248; the 18 floats end at +0x247)
+ #define HUD_HIDDEN_MASK_OFF 76     // byte offset of the hidden mask (+0x24C)
+ 
++// (0147) Layout-aware matcher + restore to the .bflyt base (REPORT-HUD-REDO.md
++// D.4). The old matcher matched panes by NAME only, which is wrong three ways
++// (R1/R2, confirmed by log-51): the coins and regional-coins CONTENT panes
++// ('TxtCounterSh'/'TxtCounter'/'TxtIconSh'/'TxtIcon', under Capture00-03)
++// share names across the two layouts, so dragging one moved both -- and
++// moving content panes is what emptied the 128x128 capture texture (a manual
++// value moved the glyphs out of the texture and restoring never repainted
++// it); 'Counter' matched the moon-tower container (ShineTowerTotalCount),
++// not the regional coins; 'PicStrap' matched the BootLoading strip, not the
++// compass dial. The new matcher only ever matches a layout's 'All' container
++// (the DISPLAY side: All -> Add -> PicCaptureUse shows the capture texture),
++// identified by its DIRECT children, never by its own name alone:
++//   0 compass: All with a 'PicMap' child (MapMini; 'PicMap' exists in no
++//      other of the 215 layouts).
++//   1 lives: All with a 'Life' child (CounterLife, CounterLifeKids,
++//      CounterLifeUp -- the same element in its three states).
++//   2 coins / 5 regional: All with an 'Add' child, told apart by the
++//      'Capture' sibling under the same RootPane: Capture tx == 0 is
++//      CounterCoin, == 130 is CounterCollectCoin (.bflyt constants; the
++//      capture tx never moves, unlike All tx). If a Capture sibling exists
++//      but its tx is neither, All tx falls back (nearest of the overlay
++//      values -740 / -615). No Capture sibling at all means not a coin
++//      layout (MiniGameInfoBalloon has an 'Add' child and no Capture), so
++//      nothing matches.
++//   3 moons: All with a 'Shine' child whose own child is 'TxtShine'
++//      (CounterShine; the other layouts with a 'Shine' pane --
++//      ShineListPosSelect, ListItemParts -- have no 'TxtShine' under it).
++// 'PicStrap', 'Counter', 'TxtGuide01' and 'WinLine' have NO matcher entry
++// any more: the BootLoading strip, the moon tower, the hints text and the
++// white bar are never moved or hidden by this runtime (hints / white bar
++// stay hidden in the overlay instead). Element 4 (hints) keeps its slot in
++// the DM_HUD_* channel but is never matched.
++// Restore (mask bit 1 -> 0): an element with no manual setting takes no
++// table entry and writes nothing -- the .bflyt overlay base shows as-is.
++// A pane that already has an entry has its LOCAL (+0x30/+0x48) written back
++// to e_orig (its first-seen local, i.e. the overlay's default edge position)
++// and is marked dirty (flags bit 4), so the game recomposes +0x70 from the
++// restored local. +0x70 itself is NEVER restored to e_mod (that was the old
++// restore, and it wrote a stale global). Once restored and visible the entry
++// is released, so the next frame is a pure no-op. A hidden element keeps its
++// entry (identity transform + hidden flag) until it is shown again.
++// The 0118 auto-edge early return is gone with it: it returned before the
++// matcher whenever edge == 0 and both masks were 0, so on a 16:9 screen a
++// cleared manual setting was never restored at all. The aspect argument is
++// still taken (the stub passes it) but no longer read: the edge anchor lives
++// in the 0136/0143 overlay, and this runtime applies ONLY manual deltas.
++// (0142) The absolute-global write is unchanged: +0x70 is written from the
++// absolute target (tdx/tdy/tk), the local from the parent-compensated
++// (edx/edy/ek); with one All per element the parent is never matched, so
++// the compensation is the identity in practice, but it is kept.
++
+ // (0142) The GLOBAL matrix (+0x70) is ABSOLUTE (a displayed transform in
+ // layout space), so its write and its recompute check use the ABSOLUTE
+ // target (tdx/tdy/tk), not the parent-compensated effective delta
+@@ -203,78 +257,34 @@ typedef unsigned long uintptr_t;
+ #define HUD_GDY_SLOT 2   // e_orig[2]: absolute global dy last written
+ #define HUD_GK_SLOT 4    // e_orig[4]: absolute global k last written
+ 
+-// A hidden element is pushed this far off-screen (0113 hid its guide text
+-// the same way: a pane already past 5000 is off-screen). The layout is at
+-// most 1560 wide, so +10000 is safely outside it whatever the aspect.
+-#define HUD_HIDE_DX 10000.0f
+-
+-// The compass dial is centred in its 340-wide 'PicStrap' strip, so the plain
+-// edge puts the strip at the screen edge but the dial ~128 short of it (0128:
+-// log-20 gives the strip as 340x720; the V1.3.17 screenshot puts the dial's
+-// centre ~175 from the strip's left edge, i.e. centred, and the editor
+-// centres the compass on the lives column). This extra offset, added to the
+-// compass's edge anchor on every aspect, brings the dial (and the hints text
+-// in the strip) to the edge. It is a property of the strip's layout (the dial
+-// centred in 340), not of the aspect, so it is a constant. The strip's right
+-// edge then sits ~100 past the screen edge -- the strip is transparent there,
+-// only the dial and the hints text are visible.
+-#define HUD_COMPASS_EXTRA 128.0f
+-
+ // The pane names, as little-endian u32s (no string literal: a literal would
+ // sit in .rodata and the code would load its address with an adrp, a
+-// relocation, and the embedded words carry no literal pool).
+-// "PicStrap": "PicS", "trap" (8 letters, the 9th byte is the NUL).
+-#define HUD_E_STRAP0 0x53636950u
+-#define HUD_E_STRAP1 0x70617274u
+-// "Counter": "Coun", "ter\0".
+-#define HUD_E_COUNTER0 0x6e756f43u
+-#define HUD_E_COUNTER1 0x00726574u
+-// "TxtTotalShine": "TxtT", "otal", "Shin", "e\0".
+-#define HUD_E_TSHINE0 0x54747854u
+-#define HUD_E_TSHINE1 0x6c61746fu
+-#define HUD_E_TSHINE2 0x6e696853u
+-#define HUD_E_TSHINE3 0x00000065u
+-// "TxtCounterSh": "TxtC", "ount", "erSh", 0 (12 bytes, the fourth word is the NUL word).
+-#define HUD_E_TCSH0 0x43747854u
+-#define HUD_E_TCSH1 0x746e756fu
+-#define HUD_E_TCSH2 0x68537265u
+-#define HUD_E_TCSH3 0x00000000u
+-// "TxtCounter": "TxtC", "ount", "er\0".
+-#define HUD_E_TC0 0x43747854u
+-#define HUD_E_TC1 0x746e756fu
+-#define HUD_E_TC2 0x00007265u
+-// "TxtLife": "TxtL", "ife\0".
+-#define HUD_E_TLIFE0 0x4c747854u
+-#define HUD_E_TLIFE1 0x00656669u
++// relocation, and the embedded words carry no literal pool). Only the names
++// the 0147 matcher reads are listed here: the 'All' container and the
++// children that identify which layout it belongs to. The old content-pane
++// names ('TxtCounterSh'/'TxtCounter'/'TxtIconSh'/'TxtIcon'/'PicIconSh'/
++// 'PicIcon'/'TxtTotalShine', 'PicStrap', 'Counter', 'TxtGuide01') are
++// deliberately gone -- matching them was the R1/R2 bug.
++// "All" ("All" as one word; the 4th byte is the NUL).
++#define HUD_E_ALL0 0x006c6c41u
+ // "Life" ("Life" as one word; the 5th byte is the NUL).
+ #define HUD_E_LIFE0 0x6566694cu
+-// "PicIconSh": "PicI", "conS", "h\0\0\0" (the moon icon's shadow picture,
+-// under the moons 'Counter' group -- coins since 0123).
+-#define HUD_E_PICONSH0 0x49636950u
+-#define HUD_E_PICONSH1 0x536e6f63u
+-#define HUD_E_PICONSH2 0x00000068u
+-// "PicIcon": "PicI", "con\0" (the moon icon itself, under 'Counter').
+-#define HUD_E_PICON0 0x49636950u
+-#define HUD_E_PICON1 0x006e6f63u
+-// "TxtGuide01": "TxtG", "uide", "01\0\0" (the "+ menu / - map" hint text,
+-// under the compass 'PicStrap' strip in log-20 -- hints since 0123).
+-#define HUD_E_TGUIDE0 0x47747854u
+-#define HUD_E_TGUIDE1 0x65646975u
+-#define HUD_E_TGUIDE2 0x00003130u
+-// 0145 (user 2026-11-15 20:40: coins = icon + number together, regional =
+-// hexagon + number together, moons move on their own): the coins icon glyph
+-// and the moon dots, which the matcher never covered, so the visible pieces
+-// stayed put while only the (invisible) numbers moved.
+-// "TxtIconSh": "TxtI", "conS", "h\0\0\0" (the coins icon's shadow).
+-#define HUD_E_TICONSH0 0x49747854u
+-#define HUD_E_TICONSH1 0x536e6f63u
+-#define HUD_E_TICONSH2 0x00000068u
+-// "TxtIcon": "TxtI", "con\0" (the coins icon itself, the circled "1").
+-#define HUD_E_TICON0 0x49747854u
+-#define HUD_E_TICON1 0x006e6f63u
+-// "TxtShine": "TxtS", "hine" (the moon dots, the two rows of circles).
++// "PicMap": "PicM", "ap\0\0".
++#define HUD_E_PICMAP0 0x4d636950u
++#define HUD_E_PICMAP1 0x00007061u
++// "Shine": "Shin", "e\0\0\0".
++#define HUD_E_SHINE0 0x6e696853u
++#define HUD_E_SHINE1 0x00000065u
++// "TxtShine": "TxtS", "hine" (the moon dots, under 'Shine').
+ #define HUD_E_TSH0 0x53747854u
+ #define HUD_E_TSH1 0x656e6968u
++// "Add" ("Add" as one word; the 4th byte is the NUL).
++#define HUD_E_ADD0 0x00646441u
++// "Capture" (the 7-letter prefix "Capt" + "ure" + digit: the second word's
++// low three bytes are "ure", the top byte is the digit of Capture00-03, so
++// the prefix test masks it out -- see hud_edge_name_is_capture).
++#define HUD_E_CAPT0 0x74706143u
++#define HUD_E_CAPT1 0x00657275u
+ 
+ // Bounded compare of a pane name's words against the given words (n words,
+ // the rest of the name unchecked). Same as the old hud_words_eq.
+@@ -390,33 +400,90 @@ static inline __attribute__((always_inline)) void hud_edge_mark_dirty(void *pane
+     }
+ }
+ 
+-// Is the given pane's parent named by these words (exact, n words)? The
+-// parent is read once, directly -- no walk. A NULL parent is never the
+-// container, so a parentless pane takes the fallback.
+-static inline __attribute__((always_inline)) int hud_edge_parent_is(void *pane, u32 a, u32 b, int n) {
++// Does the given pane have a DIRECT child named by these words (exact, n
++// words)? The child list is the pane's own list (head at +0x20, first node
++// at +0x28, child = node - 8, next node at child +0x10), walked with the
++// same guards as hud_edge_mark_dirty; bounded to 16 children (the HUD
++// layouts have at most 5). A child that fails the guards ends the walk --
++// the list is stale while the game unloads the layout, and a partial walk
++// that finds nothing is a safe "no match".
++static inline __attribute__((always_inline)) int hud_edge_child_named(void *pane, u32 a, u32 b, u32 c, u32 d, int n) {
++    if (!pane) return 0;
++    void *head = (char *)pane + 0x20;
++    void *node = *(void **)((const char *)pane + 0x28);
++    for (int i = 0; i < 16; i++) {
++        if (!node || node == head) break;
++        if (!hud_edge_node_ok(node)) break;     // (b) never follow a bad node
++        void *child = (char *)node - 8;
++        if (hud_edge_child_self(pane, child)) { node = *(void **)((const char *)child + 0x10); continue; } // (c) skip the self child, keep its siblings
++        if (((uintptr_t)child & 7u) != 0) break;
++        if (hud_edge_words_eq((const u32 *)((const char *)child + 0xb8), a, b, c, d, n)) return 1;
++        node = *(void **)((const char *)child + 0x10);
++    }
++    return 0;
++}
++
++// Does the given pane have a direct child named (a1, b1) whose own direct
++// child is named (a2, b2)? Used for the moons: All -> Shine -> TxtShine.
++static inline __attribute__((always_inline)) int hud_edge_child_child_named(void *pane, u32 a1, u32 b1, u32 a2, u32 b2) {
++    if (!pane) return 0;
++    void *head = (char *)pane + 0x20;
++    void *node = *(void **)((const char *)pane + 0x28);
++    for (int i = 0; i < 16; i++) {
++        if (!node || node == head) break;
++        if (!hud_edge_node_ok(node)) break;
++        void *child = (char *)node - 8;
++        if (hud_edge_child_self(pane, child)) { node = *(void **)((const char *)child + 0x10); continue; }
++        if (((uintptr_t)child & 7u) != 0) break;
++        if (hud_edge_words_eq((const u32 *)((const char *)child + 0xb8), a1, b1, 0, 0, 2) &&
++            hud_edge_child_named(child, a2, b2, 0, 0, 2)) return 1;
++        node = *(void **)((const char *)child + 0x10);
++    }
++    return 0;
++}
++
++// Is this name the "Capture" prefix (Capture00-03)? The first word is
++// "Capt" and the second word's low three bytes are "ure"; the top byte is
++// the digit, so it is masked out.
++static inline __attribute__((always_inline)) int hud_edge_name_is_capture(const u32 *nw) {
++    return nw[0] == HUD_E_CAPT0 && (nw[1] & 0x00ffffffu) == HUD_E_CAPT1;
++}
++
++// The local tx (+0x30) of a 'Capture' sibling of the given pane -- the
++// pane's parent's child named Capture*. Returns 1 and writes *out when
++// such a sibling exists, 0 otherwise. The coins layouts carry their
++// Capture00-03 as siblings of 'All' under the same RootPane, so this is
++// the layout discriminator: CounterCoin's Captures are at tx 0,
++// CounterCollectCoin's at tx 130.
++static inline __attribute__((always_inline)) int hud_edge_capture_tx(void *pane, float *out) {
+     void *parent = *(void **)((const char *)pane + 0x18);
+-    if (!parent) return 0;
+-    const u32 *pnw = (const u32 *)((const char *)parent + 0xb8);
+-    if (n >= 1 && pnw[0] != a) return 0;
+-    if (n >= 2 && pnw[1] != b) return 0;
+-    return 1;
++    if (!parent || ((uintptr_t)parent & 7u)) return 0;
++    void *head = (char *)parent + 0x20;
++    void *node = *(void **)((const char *)parent + 0x28);
++    for (int i = 0; i < 16; i++) {
++        if (!node || node == head) break;
++        if (!hud_edge_node_ok(node)) break;
++        void *child = (char *)node - 8;
++        if (hud_edge_child_self(parent, child)) { node = *(void **)((const char *)child + 0x10); continue; }
++        if (((uintptr_t)child & 7u) != 0) break;
++        if (hud_edge_name_is_capture((const u32 *)((const char *)child + 0xb8))) {
++            *out = *(const float *)((const char *)child + 0x30);
++            return 1;
++        }
++        node = *(void **)((const char *)child + 0x10);
++    }
++    return 0;
+ }
+ 
+ void hud_edge(void *pane, const float *aspect_ptr, void *table, const float *params) {
+     if (!pane || !aspect_ptr || !table) return;
+-    // The edge offset, from the screen aspect the host wrote into the state
+-    // page (state +0x58; 0 = 16:9, unwritten). Valid aspects are 1.3 to 2.2
+-    // (the range loader.c accepts); anything else is 16:9. The offset is
+-    // clamped so a wild aspect can never throw a widget off the screen.
+-    // A manual setting or a hide still applies when the edge is 0 (16:9),
+-    // so the early return below is only the no-manual no-hide no-edge case.
+-    float aspect = *aspect_ptr;
+-    float edge = 0.0f;
+-    if (aspect >= 1.3f && aspect <= 2.2f) {
+-        edge = 640.0f * (aspect / 1.7777778f - 1.0f);
+-        if (edge > 200.0f) edge = 200.0f;
+-        if (edge < -200.0f) edge = -200.0f;
+-    }
++    // (0147) The aspect is no longer read: the edge anchor lives in the
++    // 0136/0143 overlay, this runtime applies ONLY manual deltas, and the
++    // old 0118 early return (edge == 0 and both masks 0) is gone -- it
++    // returned before the matcher, so on a 16:9 screen a cleared manual
++    // setting was never restored at all. aspect_ptr is still taken because
++    // the stub passes it, and still NULL-checked above.
++    (void)aspect_ptr;
+ 
+     // The manual settings (state +0x200; a NULL params pointer, or an
+     // unwritten block, reads as no manual setting and nothing hidden).
+@@ -426,9 +493,6 @@ void hud_edge(void *pane, const float *aspect_ptr, void *table, const float *par
+         manual_mask = pu[HUD_MANUAL_MASK_OFF / 4];
+         hidden_mask = pu[HUD_HIDDEN_MASK_OFF / 4];
+     }
+-    // 16:9 with no manual setting and nothing hidden: nothing to do for any
+-    // element (the 0118 early return, kept so the common case costs nothing).
+-    if (edge == 0.0f && manual_mask == 0 && hidden_mask == 0) return;
+ 
+     // Flags bit 7 is set by Pane::Calculate's epilogue, so it tells whether
+     // this pane has ever calculated. On a pane's very first frame its matrix
+@@ -440,102 +504,121 @@ void hud_edge(void *pane, const float *aspect_ptr, void *table, const float *par
+     const char *name = (const char *)pane + 0xb8;
+     const u32 *nw = (const u32 *)name;
+ 
+-    // Which HUD element is this pane, by name only (no subtree walk).
+-    // Moons: the counter group itself, a pane named 'Counter'; a bare
+-    // 'TxtTotalShine' is the fallback for a layout with no 'Counter' group,
+-    // and only when its parent is not a 'Counter' (the group's own number
+-    // follows the group; matching both would move it twice). 0145: 'TxtShine'
+-    // (the two rows of moon dots) joins the moons element, so the dots move
+-    // with it on their own, separate from the coins and the regional coins. Life: the
+-    // 'Life' container, or a bare 'TxtLife' whose parent is NOT named
+-    // 'Life'. Coins: 'TxtCounterSh' and its sibling 'TxtCounter', both
+-    // matched by name, so both take the same offset and no twin-write walk
+-    // is needed. 0145: the coins icon glyph 'TxtIconSh'/'TxtIcon' joins them,
+-    // so the icon and the number move together as one group (the user
+-    // 2026-11-15 20:40: coins = icon + number together); the white bar
+-    // 'WinLine' has no matching name and is hidden in the overlay instead.
+-    // Regional coins (0127): the hexagon icon and its number,
+-    // which live UNDER the moons 'Counter' group: a 'PicIconSh' / 'PicIcon' /
+-    // 'TxtTotalShine' whose parent IS a 'Counter' belongs to the regional
+-    // coins element (its own element since 0127, so it can be dragged and
+-    // hidden separately from the coins), and the parent-compensation step
+-    // below keeps it from being moved twice. 'PicIcon' is also used
+-    // elsewhere (the lives cluster, the cursor group), so it is only matched
+-    // when its parent is a 'Counter'.
+-    // Compass: 'PicStrap', the right strip (the dial itself is not a Pane,
+-    // so the strip is the compass; moving the strip moves the whole
+-    // right-hand cluster together). Hints: 'TxtGuide01', the "+ menu / - map"
+-    // text that sits under the same 'PicStrap' strip in log-20 (its own
+-    // element since 0123, so it can be dragged and hidden on its own; the
+-    // parent compensation keeps it from following the compass). The old v1
+-    // actor names (CompassArea / CoinCounter / MoonNum) are NOT matched:
+-    // they are actor / state-machine names, not pane names, and matching
+-    // them never fired.
++    // (0147) Which HUD element is this pane, by LAYOUT, not by name alone.
++    // Only a layout's 'All' container is ever matched -- the display side.
++    // A content pane ('TxtCounterSh'/'TxtCounter'/'TxtIconSh'/'TxtIcon'
++    // under a Capture, 'PicStrap', 'Counter', 'TxtGuide01', 'WinLine') is
++    // never matched, whatever its name: moving content panes emptied the
++    // capture texture (R1), and the old name matches hit the wrong layouts
++    // (R2: 'Counter' was the moon tower, 'PicStrap' the BootLoading strip).
++    // The layout is identified by the All container's DIRECT children:
++    //   0 compass: a 'PicMap' child (MapMini only, of all 215 layouts).
++    //   1 lives: a 'Life' child (CounterLife / CounterLifeKids /
++    //      CounterLifeUp, the same element in three states).
++    //   3 moons: a 'Shine' child whose own child is 'TxtShine'
++    //      (CounterShine; ShineListPosSelect and ListItemParts have a
++    //      'Shine' pane but no 'TxtShine' under it).
++    //   2 coins / 5 regional: an 'Add' child, told apart by the 'Capture'
++    //      sibling under the same RootPane: tx == 0 is CounterCoin,
++    //      tx == 130 is CounterCollectCoin. A Capture sibling with some
++    //      other tx falls back to All tx (nearest of the overlay values
++    //      -740 / -615); no Capture sibling at all (MiniGameInfoBalloon
++    //      has an 'Add' child and no Capture) matches nothing.
++    // Element 4 (hints) and the white bar have no matcher entry: they stay
++    // hidden in the overlay and are never moved by this runtime.
+     int idx = -1;
+-    if (nw[0] == HUD_E_STRAP0 && nw[1] == HUD_E_STRAP1 && name[8] == 0) idx = 0;
+-    else if (nw[0] == HUD_E_LIFE0 && name[4] == 0) idx = 1;
+-    else if (hud_edge_words_eq(nw, HUD_E_TLIFE0, HUD_E_TLIFE1, 0, 0, 2)) {
+-        if (!hud_edge_parent_is(pane, HUD_E_LIFE0, 0, 1)) idx = 1;
+-    }
+-    else if (hud_edge_words_eq(nw, HUD_E_TCSH0, HUD_E_TCSH1, HUD_E_TCSH2, HUD_E_TCSH3, 4)) idx = 2;
+-    else if (hud_edge_words_eq(nw, HUD_E_TC0, HUD_E_TC1, HUD_E_TC2, 0, 3)) idx = 2;
+-    else if (hud_edge_words_eq(nw, HUD_E_TICONSH0, HUD_E_TICONSH1, HUD_E_TICONSH2, 0, 3)) idx = 2;
+-    else if (hud_edge_words_eq(nw, HUD_E_TICON0, HUD_E_TICON1, 0, 0, 2)) idx = 2;
+-    else if (hud_edge_words_eq(nw, HUD_E_PICONSH0, HUD_E_PICONSH1, HUD_E_PICONSH2, 0, 3)) {
+-        if (hud_edge_parent_is(pane, HUD_E_COUNTER0, HUD_E_COUNTER1, 2)) idx = 5;
+-    }
+-    else if (hud_edge_words_eq(nw, HUD_E_PICON0, HUD_E_PICON1, 0, 0, 2)) {
+-        if (hud_edge_parent_is(pane, HUD_E_COUNTER0, HUD_E_COUNTER1, 2)) idx = 5;
+-    }
+-    else if (hud_edge_words_eq(nw, HUD_E_COUNTER0, HUD_E_COUNTER1, 0, 0, 2)) idx = 3;
+-    else if (hud_edge_words_eq(nw, HUD_E_TSHINE0, HUD_E_TSHINE1, HUD_E_TSHINE2, HUD_E_TSHINE3, 4)) {
+-        if (hud_edge_parent_is(pane, HUD_E_COUNTER0, HUD_E_COUNTER1, 2)) idx = 5;
+-        else idx = 3;
++    if (nw[0] == HUD_E_ALL0) {
++        if (hud_edge_child_named(pane, HUD_E_PICMAP0, HUD_E_PICMAP1, 0, 0, 2)) idx = 0;
++        else if (hud_edge_child_named(pane, HUD_E_LIFE0, 0, 0, 0, 1)) idx = 1;
++        else if (hud_edge_child_child_named(pane, HUD_E_SHINE0, HUD_E_SHINE1, HUD_E_TSH0, HUD_E_TSH1)) idx = 3;
++        else if (hud_edge_child_named(pane, HUD_E_ADD0, 0, 0, 0, 1)) {
++            float captx = 0.0f;
++            if (hud_edge_capture_tx(pane, &captx)) {
++                if (captx == 0.0f) idx = 2;
++                else if (captx == 130.0f) idx = 5;
++                else {
++                    float alltx = *(const float *)((const char *)pane + 0x30);
++                    float d2 = alltx + 740.0f; if (d2 < 0.0f) d2 = -d2;
++                    float d5 = alltx + 615.0f; if (d5 < 0.0f) d5 = -d5;
++                    idx = (d2 <= d5) ? 2 : 5;
++                }
++            }
++        }
+     }
+-    else if (hud_edge_words_eq(nw, HUD_E_TSH0, HUD_E_TSH1, 0, 0, 2)) idx = 3;
+-    else if (hud_edge_words_eq(nw, HUD_E_TGUIDE0, HUD_E_TGUIDE1, HUD_E_TGUIDE2, 0, 3)) idx = 4;
+     if (idx < 0) return;   // not a HUD element: leave it alone
+ 
+-    // What this element should be, this frame. Priority: hidden first, then
+-    // manual, then the automatic edge anchor (0118). A manual setting is a
+-    // DELTA from the automatic edge anchor (0128): the launcher's editor
+-    // shows the element at its edge-anchored default and records the drag
+-    // from there, so the manual offset is ADDED to the edge -- dragging in
+-    // the editor moves the element by the same amount in the game -- and a
+-    // manual element still follows the aspect (as the editor does). The
+-    // compass's base anchor also carries the extra offset above (its dial is
+-    // centred in the 340-wide strip). A hidden element is pushed off-screen (its
+-    // local x +10000); its manual offset and size do not matter while it is
+-    // hidden, and it comes back to its manual (or automatic) place when it is
+-    // shown again. (0135) All three behaviours are DISPLAYED-position moves
+-    // applied as local deltas -- edge, manual drag, and hide all go through
+-    // the local translation/scale; +0x70 is never written.
+-    // (0137) The runtime patch applies ONLY the editor's live adjustments
+-    // on top of whatever base the layout already has. The auto-edge base
+-    // positions come from the 0136 overlay (baked into the .szs .bflyt), NOT
+-    // from this patch -- so there is no "base" term here and no double edge.
+-    // If the overlay is absent, the adjustments are deltas from the game's
+-    // default layout, which is still correct behaviour for an editor.
+-    // Priority: hidden first (true hide via flags bit 0, applied below),
+-    // then manual. No manual setting means identity (no-op).
++    // What this element should be, this frame. (0137) The runtime applies
++    // ONLY the editor's manual adjustments on top of whatever base the
++    // layout already has. The auto-edge base positions come from the 0136
++    // overlay (baked into the .szs .bflyt), NOT from this patch -- so there
++    // is no "base" term here and no double edge. If the overlay is absent,
++    // the adjustments are deltas from the game's default layout, which is
++    // still correct behaviour for an editor. Priority: hidden first (true
++    // hide via flags bit 0, applied below), then manual. No manual setting
++    // means identity (no-op) -- see the restore block just below, which is
++    // the only thing that runs when the manual mask bit is 0.
+     int manual = (manual_mask >> idx) & 1u;
+     int hidden = (hidden_mask >> idx) & 1u;
++    // (0147) Restore: the manual mask bit is 0 for this element. An element
++    // with no manual setting takes no table entry and writes nothing -- the
++    // .bflyt overlay base shows as-is. A pane that already HAS an entry
++    // (its manual setting was just cleared) has its LOCAL (+0x30/+0x48)
++    // written back to e_orig -- its first-seen local, i.e. the overlay's
++    // default edge position -- and is marked dirty (flags bit 4), so the
++    // game recomposes +0x70 from the restored local in the same Calculate
++    // call. +0x70 itself is NEVER written here: restoring it to e_mod
++    // would write a stale global (the old restore bug). Once restored and
++    // visible the entry is released, so the next frame is a pure no-op; a
++    // hidden element keeps its entry (identity transform + hidden flag)
++    // until it is shown again. This block runs before the no-op early
++    // return below, so a restore is never skipped.
++    if (!manual) {
++        char *old = hud_edge_find_entry(table, pane);
++        if (old) {
++            float *o_orig = (float *)(old + 8);
++            float cur_lx = *(const float *)((const char *)pane + 0x30);
++            float cur_ly = *(const float *)((const char *)pane + 0x34);
++            float cur_sx = *(const float *)((const char *)pane + 0x48);
++            float cur_sy = *(const float *)((const char *)pane + 0x4c);
++            unsigned short oflags = *(const unsigned short *)((const char *)pane + 0x58);
++            int vis_ok = hidden ? ((oflags & 0x0001u) == 0) : ((oflags & 0x0001u) != 0);
++            if (cur_lx != o_orig[3] || cur_ly != o_orig[7] || cur_sx != o_orig[0] || cur_sy != o_orig[5] || !vis_ok) {
++                *(float *)((char *)pane + 0x30) = o_orig[3];
++                *(float *)((char *)pane + 0x34) = o_orig[7];
++                *(float *)((char *)pane + 0x48) = o_orig[0];
++                *(float *)((char *)pane + 0x4c) = o_orig[5];
++                // +0x70 is NOT restored: the dirty flag below lets the game
++                // recompose it from the restored local.
++                unsigned short *opf = (unsigned short *)((char *)pane + 0x58);
++                if (hidden) *opf = (unsigned short)(*opf & (unsigned short)~0x0001u);
++                else *opf = (unsigned short)(*opf | 0x0001u);
++                *opf |= 0x10u;
++                hud_edge_mark_dirty(pane);
++                *(float *)(old + 104) = 0.0f;
++                *(float *)(old + 108) = 0.0f;
++                *(float *)(old + 112) = 1.0f;
++                *(u32 *)(old + 116) = (u32)hidden;
++                o_orig[HUD_GDX_SLOT] = 0.0f;
++                o_orig[HUD_GDY_SLOT] = 0.0f;
++                o_orig[HUD_GK_SLOT] = 1.0f;
++            }
++            if (!hidden) {
++                *(uintptr_t *)(old + 0) = 0;
++                *(u32 *)(old + 124) = 0;
++            }
++        } else if (!hidden) {
++            return;   // no entry, nothing to restore, nothing to hide
++        }
++        // Hidden with no entry yet: fall through with the identity target
++        // below, which takes an entry and applies the hide.
++        if (old) return;
++    }
+     float tdx = 0.0f, tdy = 0.0f, tk = 1.0f;
+     if (manual && params) {
+         tdx = hud_edge_clamp_off(params[idx * 3 + 0], 640.0f);
+         tdy = hud_edge_clamp_off(params[idx * 3 + 1], 360.0f);
+         tk = hud_edge_clamp_k(params[idx * 3 + 2]);
+     }
+-    // (0137) `base` and HUD_COMPASS_EXTRA are unused here: the edge anchor
+-    // lives in the 0136 overlay. They are kept in the file (the defines)
+-    // only so this file still shares the 0135 table/matching code verbatim.
+-    // (0137) Every behaviour is a DISPLAYED-position move, applied as a
+-    // GLOBAL-matrix delta: the +0x70 m[3]/m[7] are shifted by the effective
+-    // delta and m[0]/m[1]/m[4]/m[5] are scaled by the effective k, always
+-    // re-derived from the stored ORIGINAL global (e_mod). The local
+-    // (+0x30/+0x34, +0x48/+0x4c) is still written exactly as 0135 did, as
+-    // a fallback for any path that recomposes from the local. Hide is a
+-    // TRUE hide (flags bit 0 cleared), not a +10000 offset.
+     // The parent compensation: this pane's displayed shift is its parent's
+     // applied shift plus its own global shift, so its effective global delta
+     // is its own target minus the parent's applied delta (read from the
+@@ -677,19 +760,20 @@ void hud_edge(void *pane, const float *aspect_ptr, void *table, const float *par
+ 
+     // The local shift is always re-derived from the stored original, so a
+     // fixed offset cannot drift: local = original local + effective delta,
+-    // local scale = original local scale * effective k. Hidden: the local
+-    // x pushed +10000 (the displayed position moves off-screen; the size
+-    // does not matter off-screen). A child that wants the same transform as
+-    // its parent takes a zero effective delta here and rides the parent
+-    // (its local is restored to the original, so nothing is written twice).
++    // local scale = original local scale * effective k. (Hide does NOT move
++    // the local off-screen any more: 0137 hides with flags bit 0 below, so
++    // a hidden pane keeps its target local and comes back to it when shown.)
++    // A child that wants the same transform as its parent takes a zero
++    // effective delta here and rides the parent (its local is restored to
++    // the original, so nothing is written twice).
+     *(float *)((char *)pane + 0x30) = e_orig[3] + edx;
+     *(float *)((char *)pane + 0x34) = e_orig[7] + edy;
+     *(float *)((char *)pane + 0x48) = e_orig[0] * ek;
+     *(float *)((char *)pane + 0x4c) = e_orig[5] * ek;
+     // (0137) The GLOBAL matrix (+0x70) is written directly, re-derived
+-    // from the stored original global: m[3]/m[7] shift by the effective
+-    // delta, and the linear part scales by the effective k. This is the
+-    // write that reaches the display -- it runs at the +0x13c cut, after
++    // from the stored original global: m[3]/m[7] shift by the ABSOLUTE
++    // target (0142) and the linear part scales by the absolute k. This is
++    // the write that reaches the display -- it runs at the +0x13c cut, after
+     // the game's global is final, so it is what Draw renders and what the
+     // children compose from. (A static pane's +0x70 may be stale; the
+     // local write above is the fallback for that path.)
+diff --git a/dm/games/0100000000010000/patches.py b/dm/games/0100000000010000/patches.py
+index b425268..72589ba 100644
+--- a/dm/games/0100000000010000/patches.py
++++ b/dm/games/0100000000010000/patches.py
+@@ -1,362 +1,76 @@
+ # Super Mario Odyssey (0100000000010000): the rewriter's patches of this game's own builds.
+ # dm/tools/patch_nso.py loads every profile's patches.py and applies those of a module's
+ # NSO build ID; CUTS, OBS and FRAME_STEP as described there ("Registered patches").
+-# Only FRAME_STEP is used here: the HUD edge-anchor hook (0118). There are no word
+-# cuts and no observation gates.
++# Only FRAME_STEP is used here: the in-game HUD editor runtime (hud_runtime.c,
++# 0147). There are no word cuts and no observation gates.
+ from nso_asm import ADDI, ADRP, B, LDP_POST, STP_PRE
+ 
+ BUILD_141 = 'b424be150a8e7d78701cbe7a439d9ebf'   # main 1.4.1 (game.tsv v393216)
+ 
+-# hud_edge, compiled from hud_edge.c (hud_edge at +0) with
+-# aarch64-none-linux-gnu-gcc -O2 -ffreestanding -fno-builtin -fno-stack-protector
+-# -fno-jump-tables -fno-asynchronous-unwind-tables -c -- the same flags 0113's
+-# hud_calc used. The function takes everything through its arguments (no static
+-# data, no literal pool, no external calls), so these words are position-independent
+-# and relocation-free and can be dropped into the rewriter's patch area verbatim:
+-#   x0 = the pane, x1 = the aspect (a pointer to state page + 0x58: the screen
+-#   aspect ratio r, written there by dm_fps_state_apply in loader.c -- 0 when the
+-#   screen is 16:9, the window's aspect otherwise, so "auto" already resolves to
+-#   the real aspect before the hook runs), x2 = table (state page + 0x300, 40
+-#   128-byte entries, eight per HUD element), x3 = the manual params (a pointer to
+-#   state page + 0x200, written there by dm_host's hud_manual.c from the launcher's
+-#   DM_HUD_* environment variables: 15 floats -- dx, dy, k per element in the
+-#   order below -- at +0x200..+0x240, a u32 manual mask at +0x240 and a u32 hidden
+-#   mask at +0x244). No log buffer: nothing is logged.
+-# Element order: 0 compass, 1 life, 2 coins, 3 moons, 4 hints.
+-# What it does, per pane: it matches the five HUD elements by pane NAME only
+-# ('PicStrap' = compass, 'Life' = lives, 'TxtCounterSh' / 'TxtCounter' = coins,
+-# 'Counter' / 'TxtTotalShine' = moons, 'TxtLife' = lives, 'TxtGuide01' = hints)
+-# and, per element, applies the HIGHEST-priority transform that applies:
+-#   hidden (the hidden-mask bit) first: the pane is pushed +10000 off-screen, so
+-#     it is not rendered (0113 hid its guide text the same way). A hidden element
+-#     stays hidden whatever the aspect or the manual setting says.
+-#   a manual setting (the manual-mask bit) second: the launcher's setting, an
+-#     ABSOLUTE offset (dx, dy) and scale (k) from the game's base layout, so it
+-#     replaces the auto-edge offset instead of adding to it, and the element
+-#     keeps its position when the aspect changes. k scales the pane about its
+-#     centre (the 0113 hud_calc math), so a resize never drifts the pane.
+-#   the auto edge anchor third (0118): a FIXED horizontal offset computed from
+-#     the aspect at runtime:
+-#       edge = 640 * (aspect / 1.7777778 - 1), clamped to [-200, +200] UI px.
+-#       aspect 2.167 (iPhone 19.5:9): edge +140 -- coins/moons move LEFT (-140),
+-#         compass/lives move RIGHT (+140), to the screen edges.
+-#       aspect 1.429 (iPhone Duo 1.43:1): edge -126 -- the HUD is laid out for 16:9,
+-#         so on the narrower screen it would be cut off; coins/moons move RIGHT (+126),
+-#         compass/lives move LEFT (-126), pulled in to the edges.
+-#       aspect 1.333 (iPad 4:3): edge -160 -- coins/moons +160, compass/lives -160.
+-#       aspect 1.778 (16:9) or 0: edge 0, a no-op. The dy is always 0 and the scale
+-#       is never touched: translation only, never a resize. See hud_edge.c for the
+-#       layouts and the design (orig/mod table, no-drift, game-recompute follow,
+-#       the dirty flag so a moved container carries its children, the bounded
+-#       mark-dirty walk). The table stores the APPLIED transform (dx/dy/k/hidden)
+-#       per entry, and a frame only rewrites a pane when the target transform
+-#       differs -- so a settings change or an aspect change re-applies, and an
+-#       unchanged frame is a no-op.
+-#   (0123) the coins / moons regrouping and the hints element: the moon icon and
+-#       number ('PicIconSh' / 'PicIcon' / 'TxtTotalShine' whose parent IS a
+-#       'Counter') now belong to the COINS element -- the launcher editor groups
+-#       the hexagon icon + 020 with the coins -- while the moons element is the
+-#       'Counter' group itself (which carries the dots). A bare 'TxtTotalShine'
+-#       whose parent is NOT a 'Counter' stays the moons fallback. 'PicIcon' is
+-#       only matched when its parent is a 'Counter' (it is also used by the lives
+-#       cluster and the cursor group). The hints element is 'TxtGuide01', the
+-#       "+ menu / - map" text under the compass 'PicStrap' strip. (0127) the two
+-#       kinds of coins split into two elements: the hexagon icon + 020 are their
+-#       OWN element (regional coins, index 5) now, so coins, regional coins and
+-#       moons can each be dragged and hidden separately; the state page grows to
+-#       18 floats and the masks move to +0x248/+0x24C. (0135) A matched pane
+-#       whose parent is also matched gets PARENT COMPENSATION in local space:
+-#       its displayed shift is its parent's applied shift plus its own local
+-#       shift, so its local delta is its own target minus the parent's
+-#       applied delta (read from the parent's table entry), and its local
+-#       scale is its target scale divided by the parent's k -- so it is
+-#       moved once, not twice, and a child that wants the same transform as
+-#       its parent takes a zero local delta and rides the parent. The hook
+-#       shifts the pane's LOCAL translation (+0x30/+0x34) and LOCAL scale
+-#       (+0x48/+0x4c) and never writes the global matrix (+0x70): the game
+-#       composes it from the local, so the shift reaches the display through
+-#       the game's own composition (the old absolute reconstruction failed
+-#       both ways on device -- a static pane's +0x70 was never composed, so
+-#       its original was (0,0) and the write pushed it off-screen, log-44
+-#       criterion (c); a dynamic pane's +0x70 was recomposed after the
+-#       write, so the compass stayed visually unmoved). After writing a
+-#       pane's local the hook marks the pane itself dirty (flags bit 4 at
+-#       +0x58) and its descendants dirty, so the game recomposes +0x70 from
+-#       the shifted local in the same Calculate call. Edge, manual drag and
+-#       hide are all displayed-position moves through the local delta; hide
+-#       is a local +10000 (off-screen). The stored original is the pane's
+-#       original LOCAL, not a global matrix.
+-#       The white bar under the counts has no matching
+-#       pane name (no Bar/Line pane in any log or in the DmIOS string pool),
+-#       so it is not moved: a known limitation, see hud_edge.c.
+-HUD_EDGE_WORDS = (
+-    "f100003ffa401844fa40180454000460bd400020528cccc172a7f4c11e2700211e212010540003ca0f00040052800021b40004632949106a7100015f"
+-    "7a40082454000060340002a45280000a7940b00836380248b940b801528d2a0572aa6c656b05003f540004e0528d298672acacc66b06003f54002680"
+-    "528f0a8572a98e856b05003f54002681b940bc01515958217119a42154000460d65f03c0529999a172a801811e2700211e212010540000a90f000400"
+-    "52800021b5fffbe3d65f03c05291c7211e2e100272a7fc611e27002152a884011e2118001e2700211e2238001e2108001e2020081a9f17e1b5fffa43"
+-    "54fffd40528000045280000a17ffffd4b940bc05528e4e8172ae0c216b0100bf54fffc413943000134002701d65f03c0f9400c05b4000085b940b8a1"
+-    "6b06003f54fffb4052800026d280100b53017d4ad34104872a0603e98b0b004b35000607f100007f1a9f07e16a01015f540023600b0604c193407c21"
+-    "bc6178611e2120205400268152a884041e2700821e2220305400258c52b884041e2700821e22203054002504910004211e212800d37ef424bc617863"
+-    "1e2320605400248152a876811e2700211e2120705400238c52b876811e2700211e212070540023048b040061bd4004211e2020281e21142054002361"
+-    "5293334172a7e3211e2700221e22203054002004528cccc172a7fcc11e2700221e22203054001f6c140000060f0004035288000172a8c3811e2e1001"
+-    "1e27002091400c44b40003a5f24008bf54000361aa0203e11400000491020021eb04003f540002c0b9407c2334ffff83f9400023eb0300bf54ffff21"
+-    "bd407022529e5943bd40682572ae29231e2700641e2020481e2414a41e221440540001011e2e1006bd406c241e2538001e2620401e24386354000040"
+-    "1e221821531960c1d37908c68b0600438b060084aa0303e5f861c841eb00003f54000f20b9407c6135000e01910c00a1eb01009f540001a0f94180a2"
+-    "aa0103e5eb02001f540000c11400006ff9400022aa0103e5eb00005f54000d60910c0021eb01009f54ffff41340016c7f9400061eb00003f54000cc0"
+-    "529e5942a900fc7f72ae29221e270042a901fc7f52800022a902fc7fbd006862bd403002f9000060290f0869bd001462bd403404bd002464bd404804"
+-    "bd000864bd404c04bd001c641e222802d11003ff321c0108528000625280000452800001d29fffe5f90003e0bd003002bd402462390023e21e232842"
+-    "bd003402bd4008621e210842bd004802bd401c621e210842bd004c022d0d0c60bd007061b90074677900b008b4000060f240081f540001407100fc9f"
+-    "7a40d824540000ad51000421937c7c20f8606be017fffff7911003ffd65f03c0f940140291008003f100005ffa42106454fffe60f240085ffa450040"
+-    "54fffe09937c7c26910023ea52800407d29fffeb38666949d1002046eb0000c8540001c0eb06001f54000062f103fd1f540001497940a0487100fc3f"
+-    "937c7c2c5100052d321c01087900a048110004847a40d92454000b41f9400442710004e754fffb00f100005ffa42106454fffaa0f240085ffa4b0040"
+-    "54fffa4917ffffe7910c00a5eb05009f54000e60f94000a1aa0503e3eb01001f54fff121aa0503e317ffff99bd406865529e594172ae29211e270024"
+-    "bd4014671e2420a0bd403002bd4034042d494006540011401e2728b11e22222054000301bd402471bd406c721e312a511e24222054000261bd400871"
+-    "bd4070731e310a711e262220540001c1bd401c711e310a711e302220540001411e2322401e2040e21e2004a01e21066054fff1c1b94074616b07003f"
+-    "54fff161d65f03c0bd000866bd001462bd001c70bd00246417ffff853942f00135ffda81f9400c0517fffef9528f0a8572a86e856b05003f540008a1"
+-    "b940bc05528eade172ae8dc16b0100bf54ffd921b940c001528e4ca572ad0a656b05003f54000481b940c40135ffd841f9400c051e21400052800046"
+-    "53027d4ad34208872a0603e9d280200b8b0b004b17fffee611000421f82c6be6382c694d17ffffa40f0004031e2e100117ffff141e2020080f000404"
+-    "1e2e10021e2404601e22042054ffe8c1d65f03c01e20404117ffff0b0f02646112000087f9400c05aa0203eb52800006528000091e21280017fffece"
+-    "528e4ca56b05003f54fffba0d65f03c01e20402317fffee81e20404117fffed80f00040317fffee40f00040117fffed41e2e100117fffef5350000e7"
+-    "1e2020080f0004041e2e10021e2404601e22042054ffd180aa0b03e317ffff24528d2a0572a92c656b05003f54000421b940bc01528dec6572aa6dc5"
+-    "6b05003f54000300515b9821713d8c2154ffcfc1f9400c05b4ffcf85b940b8a6528de86172adcea16b0100df54ffcee1b940bca1515c98217115d021"
+-    "54ffce61528000a61e21400053057d4ad34514872a0603e9d280500b17ffffb21e2040e217ffff19b940c0017101a03f54fffd40d65f03c0528de865"
+-    "72adcea56b05003f540001a1b940bc01515c98217115d02154ffcbc1f9400c05528000661e21400053037d4ad3430c872a0603e9d280300b17ffff9c"
+-    "528f0a8572aa8e856b05003f54000361b940bc05528e8de172ad8c216b0100bf54ffc9a1b940c005528d0a6172adcd216b0100bf54ffc901b940c401"
+-    "7101943f54ffc8a1f9400c05b4fffce5b940b8a6528de86172adcea16b0100df54fffc41b940bca6528cae8172a00e416b0100df54fff8e017ffffdc"
+-    "528f0a8572a8ee856b05003f54ffc681b940bc05528d2ea172acac816b0100bf54ffc5e1b940c005528626016b0100bf54ffc561f9400c0552800086"
+-    "d280400b53047d4ad34410872a0603e98b0b004b17fffe50"
+-)
+-
+-# hud_runtime, compiled from hud_runtime.c (0137, in-game editor runtime):
+-# same flags as hud_edge.c. Writes the pane GLOBAL matrix (+0x70) directly
++# hud_runtime, compiled from hud_runtime.c (0137 in-game editor runtime, 0147
++# layout-aware matcher + restore to the .bflyt base) with
++# aarch64-linux-gnu-gcc -O2 -ffreestanding -fno-builtin -fno-stack-protector
++# -fno-jump-tables -fno-unwind-tables -fno-asynchronous-unwind-tables -c,
++# and objcopy -O binary --only-section=.text (never plain -O binary: the
++# 0131 .eh_frame lesson -- .eh_frame would overlay the start of .text and
++# the first word would decode as udf). Writes the pane GLOBAL matrix (+0x70) directly
+ # at the +0x13c cut (after the game finalises it) and the local as fallback;
+ # hide is a TRUE hide (flags bit 0 cleared), not +10000. Applies ONLY the
+ # editor manual deltas on top of the 0136 overlay base -- no auto-edge here.
+ HUD_RUNTIME_WORDS = (
+-    "f100003ffa401844fa40180454000440bd400020528cccc172a7f4c11e2700211e212010540003aa52800024b4000443294914617100003f7a400884"
+-    "54000060340002a5528000017940b00636380246b940b804528d2a0772aa6c676b07009f540004c0528d298872acacc86b08009f54002580528f0a87"
+-    "72a98e876b07009f54002601b940bc04515958847119a484540004a0d65f03c0529999a172a801811e2700211e2120105400008952800024b5fffc03"
+-    "d65f03c05291c7211e2e100272a7fc611e27002152a884011e2118001e2700211e2238001e2108001e2020081a9f17e4b5fffa6354fffd6052800005"
+-    "5280000117ffffd5b940bc07528e4e8472ae0c246b0400ff54fffc613943000435fffc24f9400c07aa0203e4528000091400000af9400c07b4000087"
+-    "b940b8e46b08009f54fffb0053017c2153017ca59102004452800029f100007f120000a81a9f07e56a05003f54002c200b09052193407c21bc617864"
+-    "1e24208054002dc152a884051e2700a01e20209054002c4c52b884051e2700a01e20209054002bc491000421d37ef425bc6178631e23206054002be1"
+-    "52a876811e2700201e20207054002aec52b876811e2700201e20207054002a648b050061bd4004211e2020281e21142054002a015293334172a7e321"
+-    "1e2700201e20203054001fe4528cccc172a7fcc11e2700201e20203054001f4cb4002647f24008ff54002601aa0203e191400c431400000491020021"
+-    "eb01007f540001e0b9407c2534ffff85f9400025eb0500ff54ffff21bd407022529e5945bd40682572ae29251e2700a01e2020481e2014a41e221440"
+-    "540027601e2040671e2040851e20402253196121d37909258b0500478b050063aa0703e5f861c841eb00003f540021e0b9407ce1350020a1910c00a1"
+-    "eb01007f540001a0f94180a2aa0103e5eb00005f540000c114000105f9400022aa0103e5eb00005f54002020910c0021eb01007f54ffff41350000e8"
+-    "1e2020a80f0004061e2e10001e2604e01e20044054ffed80f10000ff9a870084aa0403e2f8438441eb00003f540004004f000400529e594172ae2921"
+-    "1e2700269101c00352800025bd006886d28000013c8080803c8180803c8280803c8380803c8480803c858080bd403000f9000080b9007889bd001480"
+-    "bd403400b9007c85bd002480bd404800bd000880bd404c00bd001c80d503201fbc616860bc21684091001021f100c03f54ffff81bd406890529e5941"
+-    "72ae29211e270026bd4014801e262200bd403011bd4034062d494c12bd407c14bd408c15540004801e202a161e3122c0540019c1bd402496bd406c97"
+-    "1e362af61e2622c054001921bd400896bd4070981e360b161e3222c054001881bd401c961e360b161e3322c0540018012d41c891bd4044861e262a26"
+-    "1e3420c054001b21bd4054861e262a461e3520c054001aa11e252200540001011e2722e0540000c11e22230054000081b94074816b08003f54001be0"
+-    "1e2028a0d11003ff121f38c1320000c27100011f910003e51a81004252800067bd003000321c0042bd4024805280000352800001d29fffe6f90003e0"
+-    "1e272800390023e7bd003400bd4008801e220800bd004800bd401c801e220800bd004c00bd4038801e210800bd007000bd403c801e210800bd007400"
+-    "bd4044801e242800bd007c00bd4048801e210800bd008000bd404c801e210800bd008400bd4054801e232800bd008c002d018c84bd0018812d0d1c85"
+-    "bd007082b90074887900b002b4000060f240081f540007a07100fc7f7a40d8245400070d51000421937c7c20f86068a017fffff73942f00435ffdb84"
+-    "f9400c0753017c2153017ca5910200445280002917ffff03528f0a8772a86e876b07009f54001461b940bc08528eade772ae8dc76b07011f54000280"
+-    "528f0a8772a8ee876b07009f54ffd921b940bc07528d2ea472acac846b0400ff54ffd881b940c007528626046b0400ff54ffd801f9400c0753047c21"
+-    "53047ca5910800445280008917fffee7b940c004528e4ca772ad0a676b07009f54000b61b940c40435ffd664f9400c0753027c2153027ca591040044"
+-    "5280004917fffeda1e20400117ffff06911003ffd65f03c0f940140291008004f100005ffa42108454fff800f240085ffa46004054fff7a9937c7c27"
+-    "910023eb52800408d29fffec3867696ad1002047eb0000e954000240eb07001f54000062f103fd3f540001c97940a0497100fc3f937c7c2d910003ef"
+-    "321c01297900a0495100054e110004637a40d9445400008011000421f82d69e7382d696ef94004427100050854fff420f100005ffa42108454fff3c0"
+-    "f240085ffa4c004054fff36917ffffe3910c00a5eb05007f540004a0f94000a1aa0503e7eb00003f54ffde81d503201faa0503e417ffff0b1e204067"
+-    "1e2040851e20402291400c4317fffee40f0004031e2e10011e20406417fffec61e204220bd000892bd001491bd001c93bd00248617ffff4e1e204004"
+-    "17fffea21e20400317fffead1e2e100117fffeba0f00040317fffea90f00040417fffe9a528e4ca76b07009f54fff4c0d65f03c0d280000717fffee3"
+-    "1e2e1000bd406c271e2538851e2020401e273867540003c01e22182217fffec21e313a941e323ab59101c003d2800001bd004494bd005495d503201f"
+-    "121d782571000cbf54000100bc617860bc21784091000421f100303f54ffff21bd40148017ffff259100042117fffff51e24222054ffe4211e322060"
+-    "54ffe3e1bd4018861e2120c054ffe381d65f03c01e20402217fffea5528f0a8772a92e876b07009f54000141b940bc04528dec6772aa6dc76b07009f"
+-    "54000a20515b9884713d8c8454ffee40d65f03c0528d2a0772a92c676b07009f540003a1b940bc04528dec6772aa6dc76b07009f54000280515b9884"
+-    "713d8c8454ffc2e1f9400c07b4ffc2a7b940b8e8528de86472adcea46b04011f54ffc201b940bce4515c98847115d08454ffc18153057c2153057ca5"
+-    "910a0044528000a917fffe34b940c0047101a09f54fffdc0d65f03c0528de86772adcea76b07009f54000161b940bc04515c98847115d08454ffbf61"
+-    "f9400c0753037c2153037ca5910600445280006917fffe22528f0a8772aa8e876b07009f540003e1b940bc07528e8de472ad8c246b0400ff54ffbd81"
+-    "b940c007528d0a6472adcd246b0400ff54ffbce1b940c4047101949f54ffbc81f9400c07b4fffd27b940b8e8528de86472adcea46b04011f54fffc81"
+-    "b940bce8528cae8472a00e446b04011f54fff9a017ffffdeb940c0047101a09f54ffe440d65f03c0528f0a8772aa6e876b07009f54ffe061b940bc07"
+-    "528d2d0472acadc46b0400ff54fffa00d65f03c0"
++    "f100003ffa401844fa40180454000240b4000243294914647940b006363801c6b940b801515b18217131042154000141f940140191008007f100003f"
++    "fa471024540000a0f240083fd29fffe8fa480020540000a8d65f03c0528000055280000417ffffeeaa0103e85280020ad1002109eb09001f54003920"
++    "eb00013f54000089cb000129f103fd3f54003889b940b10b528d2a0972a9ac696b09017f540037e1b940b50b528e0c296b09017f5400376152800008"
++    "120000a7d11003ff1200008991400c4537000e64aa0203e191400c451400000491020021eb05003f54000d60b9407c2434ffff84f9400024eb04001f"
++    "54ffff21bd4014202d4608012d491003340040e71e21200054000581bd4024211e212040540005212a2603e212000042bd4008211e232020540000e1"
++    "bd401c21520000421e2420201a9f07e32a02006234002862bd003000bd402420bd003400bd400820bd004800bd401c20bd004c00350003a7320000c3"
++    "910003e5321c0063528000665280000452800002d29fffe8f90003e0390023e67900b003d503201fb4000060f240081f540002207100fc9f7a40d844"
++    "5400246d51000442937c7c40f86068a017fffff7bd003000bd402420bd003400bd400820bd004800bd401c20bd004c00121f38c317ffffe4f9401403"
++    "91008006f100007ffa4310c454fffd80f240087ffa48006054fffd29937c7c4b910023e95280040ad29fffee386b692dd100206bcb00016ceb0b001f"
++    "5400022054000062f103fd9f540001c97940a06c7100fc5f937c7c4f910003f1321c018c7900a06c510005b0110004847a40d9a45400008011000442"
++    "f82f6a2b382f6930f94004637100054a54fff9a0f100007ffa4310c454fff940f240087ffa4e006054fff8e917ffffe334001e87d503201ff100007f"
++    "1a9f07e16a09003f540026a00b08050193407c21bc6178641e2420805400368152a884041e2700801e2020905400358c52b884041e2700801e202090"
++    "5400350491000421d37ef424bc6178621e2220405400356152a876811e2700201e202050540033ac52b876811e2700201e202050540033248b040061"
++    "bd4004211e2020281e211420540033815293334172a7e3211e2700201e20203054003264528cccc172a7fcc11e2700201e202030540031ccd503201f"
++    "f9400c04b40002e4f240089f540002a1aa0203e11400000491020021eb0100bf54000200b9407c2334ffff83f9400023eb03009f54ffff21bd407023"
++    "529e5943bd40682572ae29231e2700601e2020681e2014a41e23146054003480d503201f1e2040471e2040851e20402353196103d37909048b040049"
++    "8b0400a4aa0903e1f863c842eb00005f54003400aa0903e5b9407ca234001982910c0021eb04003f54003200f9400022aa0103e5eb02001f54ffff01"
++    "aa0103e2aa0203e3f8438461eb00003f540004004f000400529e594172ae29211e2700269101c00452800025bd006846d28000013c8080403c818040"
++    "3c8280403c8380403c8480403c858040bd403000f9000040b9007848bd001440bd403400b9007c45bd002440bd404800bd000840bd404c00bd001c40"
++    "d503201fbc616880bc21686091001021f100c03f54ffff81bd406850529e594172ae29211e270026bd4014401e262200bd403011bd4034062d494c12"
++    "bd407c15bd408c14540004801e202a161e3122c0540015e1bd402456bd406c571e362af61e2622c054001541bd400856bd4070581e360b161e3222c0"
++    "540014a1bd401c561e360b161e3322c0540014212d419851bd4044521e322a321e35224054002a61bd4054521e3228d21e342240540029e11e252200"
++    "540001011e2722e0540000c11e23230054000081b94074416b07003f540034001e2028a0121f38c1320000c5710000ff1a8100a5910003e4321c00a5"
++    "52800068bd00300052800003bd40244052800001d29fffe6f90003e0390023e81e272800bd003400bd4008401e230800bd004800bd401c401e230800"
++    "bd004c00bd4038401e210800bd007000bd403c401e210800bd007400bd4044401e242800bd007c00bd4048401e210800bd008000bd404c401e210800"
++    "bd008400bd4054401e222800bd008c002d018844bd0018412d0d1c45bd007043b90074477900b005d503201fb4000060f240081f540002807100fc7f"
++    "7a40d824540001ed51000421937c7c20f860688017fffff70f0004001e2e1001b9007427bd001821bd007021fc00c020fd00342035000067f900003f"
++    "b9007c3f911003ffd65f03c0f940140291008005f100005ffa4210a454fffd20f240085ffa46004054fffcc9937c7c27910023e952800408d29fffec"
++    "3867692bd1002047eb0000ea54000240eb07001f54000062f103fd5f540001c97940a04a7100fc3f937c7c2d910003ef321c014a7900a04a5100056e"
++    "110004637a40d9645400008011000421f82d69e7382d692ef94004427100050854fff940f100005ffa4210a454fff8e0f240085ffa4c004054fff889"
++    "17ffffe3910c0023eb04007f540001a0f9418021aa0303e2eb00003f540000c117ffff36f9400061aa0303e2eb00003f54ffe640910c0063eb04007f"
++    "54ffff41350000e71e2020a80f0004061e2e10001e2604e01e20046054fff7c0f10000bf9a8910a217ffff250f0004021e2e10011e20404417fffef3"
++    "1e204220bd000852bd001451bd001c53bd00244617ffff6df94005087100054a54000100f100011ffa4810e4540000a0f240091fd29fffe9fa490100"
++    "54ffc588aa0103e85280020ad1002109528d298bcb00012c72acaccbeb09001f54000100eb00013f54000069f103fd9f54000089b940b1096b0b013f"
++    "54000a00f94005087100054a54000100f100011fd29fffe9fa4810e454000080f240091ffa49010054fffd48aa0103e852800209d100210aeb0a001f"
++    "540002e0eb00015f54000089cb00014bf103fd7f54000249b940b10c528d0a6b72adcd2b6b0b019f540001a1b940b50b7101957f54000141f940110b"
++    "9100610ef100017ffa4b11c4540000a0f240097fd29fffecfa4c0160540010e8f94005087100052954000100f100011ffa4810e4540000a0f240091f"
++    "d29fffeafa4a010054fffbc852800208d1002029528c882acb00012b72a00c8aeb09001f54000100eb00013f54000069f103fd7f54000089b940b029"
++    "6b0a013f54000560f940042171000508540015e0f100003fd29fffe9fa4110e454ffba60f240083ffa49002054fffd48d65f03c01e21200054000141"
++    "bd4024211e212040540000e1120000c217fffdfb53017c8453017ca55280002817fffddcbd003000bd402420bd003400bd400820bd004800bd401c20"
++    "bd004c0017fffe001e20400217fffe671e20400417fffe581e20400117fffe730f00040417fffe541e2e100117fffe6f0f00040217fffe5df9400c01"
++    "b40005e1f240083f54ffb581f940142791008028f10000fffa47110454ffb4e0f24008ffd29fffe9fa4900e054ffb4695280020bd10020eaeb0a003f"
++    "5400014054000082cb01014af103fd5f540000c9b940b0ec528c286a72ae8e0a6b0a019f54000980f94004e77100056b54000dc0f10000fffa471104"
++    "54ffb200f24008fffa4900e054fffd88d65f03c0d280000517ffff471e2e1000bd406c271e2538851e2020601e27384754000ba01e23182317fffe5a"
++    "aa0903e217fffe6bd65f03c01e313ab51e263a949101c004d2800001bd004455bd005454d503201f121d782571000cbf54000100bc617880bc217860"
++    "91000421f100303f54ffff21bd40144017fffeab9100042117fffff55280020dd100216ceb0c015f540001e054000082cb0a018cf103fd9f54000169"
++    "b940b16f528f0a8c72aa6e8c6b0c01ff540000c1b940b56f528d2d0c72acadcc6b0c01ff54000180f940056b710005ad54ffecc0f100017ffa4b11c4"
++    "54ffec60f240097fd29fffecfa4c016054ffebe917ffffe553037c8453037ca55280006817fffd63b940b4ea528e4eac72a00cac12005d4a6b0c015f"
++    "54fff601bd4028e11e202028540002c052a860411e2700201e202020540001c0bd40300152a887211e2700205147d0211e2700221e2028201e222821"
++    "1e202018540003241e202038540003041e202030540000aa53057c8453057ca5528000a817fffd4553027c8453027ca55280004817fffd41d65f03c0"
++    "1e20402317fffdfed65f03c01e24222054ffcc011e26204054ffcbc1bd4018461e2120c054ffcb6117fffe9e1e2140001e21402117ffffe8"
+ )
+ 
+-# hud_probe, compiled from hud_probe.c (hud_probe at +0) with the same
+-# flags as hud_edge. A diagnostic-only stub (0129): it writes compact
+-# binary records into a probe buffer in the frame-step state page (state +
+-# 0x3300, after the hud_edge table) and changes nothing about the HUD -- no
+-# pane is moved, no transform is applied, no slot is taken. The host
+-# (hud_manual.c dm_hud_probe_tick, once per present) formats the records
+-# into "[hudprobe] ..." log lines. It takes everything through its
+-# arguments, so these words are position-independent and relocation-free:
+-#   x0 = the pane, x1 = the aspect (state + 0x58), x2 = the table (state +
+-#   0x300), x3 = the probe buffer (state + 0x3300).
+-# What it logs (first sighting per pane address, 256 addresses; the host
+-# flushes the 13-record buffer every present, so a 5-second stand-still
+-# logs every pane): the pane's name, parent, size, origin, flags and
+-# global matrix; the aspect and the edge exactly as hud_edge reads and
+-# computes them (the direct test of the edge = 0 hypothesis -- V1.3.18's
+-# icons sit exactly one edge (140) from where 0128 should have put them,
+-# and log-35 ruled hiding out as the trigger); and, for every pane hud_edge
+-# matched, the decision it actually took (element index, slot, tdx/tdy/tk,
+-# hidden, the parent's table entry and whether it is a fresh sentinel, and
+-# the translation actually in the pane matrix); and (0131) for every pane
+-# hud_edge matched, a layout record: the pane's own local translation
+-# (+0x30/+0x34), the parent's local translation, and the stored original's
+-# translation (e_orig[3]/e_orig[7]) after hud_edge -- the evidence 0130
+-# needs, because 0130 had zero effect on device (log-38 identical to
+-# log-37); and (0133) for every pane hud_edge matched, a chain record
+-# (type 4): the local translations (+0x30/+0x34) of the pane and each
+-# ancestor up to the root (five levels as floats, plus the depth walked),
+-# and a fields record (type 5): the pane's and its parent's local scales
+-# (+0x48/+0x4c), sizes (+0x50/+0x54) and origins (+0x5b), and the pane's
+-# live global translation (+0x70) as the probe sees it -- the fields that
+-# could hold the (263,71) layout, which log-41 proved is in no +0x30 in
+-# the chain (H3); and (0134) for every pane named TxtCounterSh,
+-# TxtCounter, Capture02, Capture03 or RootPane -- the coin number's own
+-# chain, matched or not -- five hex-dump records (type 6): the pane
+-# struct's raw bytes 0x00-0xFF in 60-byte chunks, so the (263,71) layout
+-# (confirmed by the V1.3.17 screenshot re-measurement) can be found by
+-# grepping for 263.0 = 0x43838000, 123.0 = 0x42F60000 or
+-# 71.0 = 0x428E0000 if it lives in a field the probe has not read yet.
+-# A matched target pane now takes ten records, an unmatched target pane
+-# six; the 13-record cap is unchanged, so a flush carries the aspect
+-# record plus one matched target pane and the rest defer.
+-# Gated by the environment
+-# variable DM_HUD_PROBE=1 (the host sets the buffer's enabled flag from
+-# it). Delete after use; never ship.
+-HUD_PROBE_WORDS = (
+-    "f100001ffa40182454000500f100005ffa401864540004a0b9400065528848a472aa0a446b0400bf54000160b9000064528001a5b900047f52802004"
+-    "b900087fb9000c7fb900107fb9001465b9001864b9001c7fb9400464340002847940b00436380244b940106435000084b9400866710030df54003549"
+-    "b9400c699100806a340001a9aa0a03e18b294d4514000003eb05003f540000c0f940002491002021eb00009f54ffff61d65f03c07103fd3f54ffffc8"
+-    "aa0203e891400c46aa0203e11400000491020021eb06003f54003fa0b9407c24aa0103e734ffff64f9400024eb04001f54ffff01cb020022b94078ef"
+-    "52955561d347fc4272a555414b0f00429b217c41d360fc214b827c22b940b801528f0a8472a86e846b04003f54003940528c286472ae8e046b04003f"
+-    "54003b60528dea4472ae8de46b04003f540000c1b940bc04528c2a0172acadc16b01009f54003e80f10000ff528000a11a9f142152800012b9400870"
+-    "0b0102017100343f54fff9c8a9ba7bfd52800011910003fdf9400c0ea90153f3f90013f5b400006ef24009df1a9f17f10b10060dd360fc1e2a1e03ec"
+-    "2a0003eb531b69a49102e00591208084531b69ad8b040073d280000191003274b824687fb9000660b9000a7e1400000538216a8491000421f1004c3f"
+-    "54000060386168a435ffff649100302138216a7f340034f19102e1c491008275d28000011400000538216ab491000421f1004c3f5400006038616894"
+-    "35ffff749100802138216a7fbd405000d360fdc17940b004bd003660bd405400bd003a60bd407c00bd003e60bd408c00bd004260bd407000bd004660"
+-    "bd408400bd004a60b9004e7f39416c14b9005274b9005664b9005a6eb9005e61b40034e72d4d0ce2bd4070e4b94074f335002bd10f00040052800014"
+-    "1e204001110181a45280002891208084d28000018b040066b8246868910030c8b90004c0b90008de140000053821690491000421f1004c3f54000060"
+-    "386168a435ffff6491003021382168df340031719102e1c4910080d5d28000011400000538216aa891000421f1004c3f540000603861688835ffff68"
+-    "91008021382168dfbd0034c2bd0038c3bd003cc4bd0040c1bd0044c0bd407c00bd0048c0bd408c00bd004cc0b90050cfb90054c2b90058d3b9005cd4"
+-    "2d46080334002db12d4601c1110301a491208084528000738b040066d2800001910030c8b8246873b90004c0b90008de140000053821690491000421"
+-    "f1004c3f54000060386168a435ffff6491003021382168df34002af19102e1c4910080d3d28000011400000538216a6891000421f1004c3f54000060"
+-    "3861688835ffff6891008021382168dfbd0034c3bd0038c2bd003cc1bd0040c0bd4014e0bd0044c0bd4024e0bd0048c0b9004cdfb90050cfb90054c2"
+-    "b90058dfb9005cdff240081f54002981aa0003e6d28000211400000491000421f24008df54000241d37ef4249100c3e88b08009351000427910123e8"
+-    "8b0800842a0103e8710010ff540000882d4600c1bc1fc080bc1fc261f9400cc62a0103e7f10000df7a47182054fffdad110481a45280008691208084"
+-    "d28000018b040074b824686691003286b9000680b9000a9e14000005382168c491000421f1004c3f54000060386168a435ffff649100302138216a9f"
+-    "340022119102e1c491008293d28000011400000538216a6691000421f1004c3f540000603861688635ffff669100802138216a9f9100d286d2800021"
+-    "d503201f0f000400d37ef4249100c3f38b130095910123f38b130084510004331e2040016b07027f5400006abc5fc081bc5fc2a0bd0000c091000421"
+-    "bd0004c1910020c6f100183f54fffde153103c412a0f20212d4918072a080021b9005e8134001c7139416dc82d4911c52d4a01c153185d08110601a1"
+-    "39416c1391208021528000a48b0100662d4a0803b8216864b90004c0910030c7d2800001b90008de14000005382168e491000421f1004c3f54000060"
+-    "386168a435ffff6491003021382168df340019119102e1c4d2800001910080ce14000005382169c791000421f1004c3f540000603861688735ffff67"
+-    "91008021382168dfbd0034c753081c41bd0038c62a080264bd003cc52a0f4021bd0040c411001610bd0044c3110781adbd0048c22a040021bd407c02"
+-    "bd004cc2bd408c02bd0050c2bd0054c1bd0058c0b9005cc13400065253101defaa0003e72a0261f15280000ed280000f5280201452800793528000d2"
+-    "d503201f2a0d03e24b0f0284912080427100f09f8b0200681a93d08491003106d2800001b8226872b900050bb900090c14000005382168c291000421"
+-    "f1004c3f54000060386168a235ffff629100302291008106d28000013822691f528000026b01009f5400004db86168e2b82168c291001021f100f03f"
+-    "54ffff212a1101c1110005ce2a042024b9005d04110181ad9100f1ef9100f0e7710015df54fffb41110016102a0903e1b9000870a94153f311000529"
+-    "f94013f5f8217940b9000c69a8c67bfdd65f03c0bd400021528cccc172a7f4c11e2700201e2020305400042a0f0004000b0604c152800044531b6821"
+-    "112080218b214065b8214864910030a1910080a4b90004bfb90008bf3900003f9100042139004c3feb04003f54ffff81bd0034a1110004c6bd0038a0"
+-    "52800021b9003cbfb90040bfb90044bfb90048bfb9004cbfb90050bfb90054bfb90058bfb9005cbfb9000866b900106117fffe32529999a172a80181"
+-    "1e2700201e2020305400004917ffffdb5291c7211e2e100372a7fc611e27002052a884011e2700221e2018201e2338001e22080017ffffd291020108"
+-    "eb06011f54ffd480b9407d0134ffff81f9400101eb0e003f54ffff212d4d0101529e5941b940750472ae29211e2700257100009f1a9f07e11e252020"
+-    "1a9f17f42a140834321f029417fffe96b940bc04528eade172ae8dc16b01009f54ffc801b940c001528e4ca472ad0a646b04003f54000620528e4ca4"
+-    "6b04003f54ffc701f10000ff528000c152800144528000321a84002117fffe363900827f17fffe65b940bc04528e4ea172a60ca16b01009f54ffc561"
+-    "b940c0015100c8217100043f54ffc4e817ffffef12800002d28000072a0203ef17fffe10390080df17ffff440f000400528000081e2040011e204004"
+-    "1e20400517ffff1d3900829f17fffefc390080df17fffeb50f0004001e20400117fffe93390080df17fffe8111000610110181ad17ffff4539430001"
+-    "35ffc18117ffffd4b940c40135ffc12117ffffd1528000085280000717fffeca"
+-)
+-
+-# The HUD edge-anchor hook (0118): Pane::Calculate (main+0x909494, the vtable's
+-# slot 19) recomputes every pane's global matrix and then its children's. TWO cuts
+-# call the same hud_edge, because one cut misses static panes: the +0x13c cut
+-# (main+0x9095d0), where all paths converge after the pane's own global matrix is
+-# final and before both child loops; and the entry cut (main+0x9094b4), replacing
+-# the first instruction after the prologue, so a pane whose Calculate takes the
+-# skip path (neither the parent changed nor this pane is dirty: 0x9fd528
+-# `tbz w10, #0, 0x9096c8` jumps over the +0x13c site) is still hooked on every
+-# Calculate call. Moving a container carries its children because hud_edge marks
+-# a moved pane's descendants dirty: a static parent passes w22 = 0 to its
+-# children, so without the dirty flag they would never recompute from the moved
+-# parent. The five HUD widgets (compass 'PicStrap', lives 'Life'/'TxtLife', coins
+-# 'TxtCounterSh'/'TxtCounter' plus the moon icon/number 'PicIconSh'/'PicIcon'/
+-# 'TxtTotalShine' under a 'Counter', moons 'Counter'/'TxtTotalShine', hints
+-# 'TxtGuide01') are the only panes matched; everything else is untouched, and
+-# the photo button (a DmGamepad virtual pad button, not a pane) is never moved
+-# by this hook.
+-# The instruction at the +0x13c site is `orr w22, wzr, #0x1` (w22 = 1, the flag the
+-# children's Calculate calls take); x19 is the pane, x20 the DrawInfo, x21 the first
+-# argument. w8 / w9 (the flags, read at the entry and used just after the site) are
+-# live past it, so the +0x13c stub saves and restores x8 / x9; x0-x7 and x10-x18 are
+-# dead there, the vector registers are reloaded after it, and x30 is restored from
+-# the stack by the function's own epilogue, so the stub's bl is safe. At the entry
+-# site the instruction is `ldrh w8, [x19, #0x58]` (the flags load); x19 is the pane
+-# (set just before it), x1 / x2 are still live (they are copied to x21 / x20 after
+-# the site), x3 is live (the force flag, used later), and x8 is dead (the load
+-# itself writes it) -- so the entry stub saves x1, x2, x3 and x8 (x8 only so the
+-# save is a pair), sets x1/x2/x3 for hud_edge (aspect, table, manual params), calls
+-# hud_edge, restores x1/x2/x3 (the force flag) and x8, re-executes the load, and
+-# returns to site+4. The +0x13c stub does NOT save x3 (x0-x7 are dead there); it
+-# only sets it. No runtime __TEXT write anywhere: the cuts are the rewriter's
+-# load-time replacements, the duo_anchor pattern.
+-def _hud_edge_frame_step(ctx):
+-    here, emit, fs_site, fs_put, FS_STATE_OFF = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state
+-    hud_code = here()
+-    hx = ''.join(HUD_EDGE_WORDS)
+-    for i in range(0, len(hx), 8):
+-        emit(int(hx[i:i + 8], 16))
+-    probe_code = here()
+-    px = ''.join(HUD_PROBE_WORDS)
+-    for i in range(0, len(px), 8):
+-        emit(int(px[i:i + 8], 16))
+-    # The +0x13c cut: `orr w22, wzr, #0x1` at Pane::Calculate+0x13c (main+ offsets:
+-    # fs_site/fs_put/B take IMG offsets, not DmIOS file offsets, which are +0xf4000).
+-    fs_site(0x9095d0, 'f6030032')
+-    start = here()
+-    emit(STP_PRE(8, 9, 31, -16))              # stp x8, x9, [sp, #-0x10]! (the live flags)
+-    emit(0xaa1303e0)                          # mov x0, x19 (the pane)
+-    emit(ADRP(1, here(), FS_STATE_OFF)); emit(ADDI(1, 1, 0x58))    # x1 = state + 0x58 (the aspect, loader.c)
+-    emit(ADRP(2, here(), FS_STATE_OFF)); emit(ADDI(2, 2, 0x300))   # x2 = state + 0x300 (table)
+-    emit(ADRP(3, here(), FS_STATE_OFF)); emit(ADDI(3, 3, 0x200))   # x3 = state + 0x200 (the manual params, hud_manual.c)
+-    emit(B(here(), hud_code) | 0x80000000)    # bl hud_edge
+-    # Probe (0129): call hud_probe with the same pane/aspect/table, plus the
+-    # probe buffer. x0-x3 are caller-saved, so re-set them all (hud_edge may
+-    # have clobbered them); x8/x9 stay saved on the stack until after this
+-    # call, and x19 (the pane) is callee-saved, so it is still live.
+-    emit(0xaa1303e0)                          # mov x0, x19 (the pane)
+-    emit(ADRP(1, here(), FS_STATE_OFF)); emit(ADDI(1, 1, 0x58))    # x1 = state + 0x58 (the aspect)
+-    emit(ADRP(2, here(), FS_STATE_OFF)); emit(ADDI(2, 2, 0x300))   # x2 = state + 0x300 (table)
+-    emit(ADRP(3, here(), FS_STATE_OFF + 0x3000)); emit(ADDI(3, 3, 0x300))  # x3 = state + 0x3300 (probe buffer; 0x3300 does not fit one ADDI, so take the +0x3000 page and add 0x300)
+-    emit(B(here(), probe_code) | 0x80000000)  # bl hud_probe
+-    emit(LDP_POST(8, 9, 31, 16))              # ldp x8, x9, [sp], #0x10 (restore the flags)
+-    emit(0x320003f6)                          # orr w22, wzr, #0x1 (the replaced instruction)
+-    emit(B(here(), 0x9095d4))                 # back to the hook site + 4
+-    fs_put(0x9095d0, [B(0x9095d0, start)], 'Pane::Calculate: the five HUD widgets (coins/moons left, compass/lives/hints right) translated by a fixed edge offset from the screen aspect (hud_edge.c)')
+-    # The entry cut: `ldrh w8, [x19, #0x58]` at Pane::Calculate+0x20, the first
+-    # instruction after the prologue (x19 is the pane already; x1 / x2 are copied to
+-    # x21 / x20 just after the site, x3 is the force flag, x8 is dead -- the load
+-    # itself writes it). It runs hud_edge before any of the flag paths, so a static
+-    # pane (the skip path over the +0x13c site) is hooked on every Calculate call.
+-    fs_site(0x9094b4, '68b24079')
+-    estart = here()
+-    emit(STP_PRE(1, 2, 31, -16))              # stp x1, x2, [sp, #-0x10]! (live: copied after the site)
+-    emit(STP_PRE(3, 8, 31, -16))              # stp x3, x8, [sp, #-0x10]! (x3 live: the force flag; x8 dead, saved as a pair)
+-    emit(0xaa1303e0)                          # mov x0, x19 (the pane)
+-    emit(ADRP(1, here(), FS_STATE_OFF)); emit(ADDI(1, 1, 0x58))    # x1 = state + 0x58 (the aspect, loader.c)
+-    emit(ADRP(2, here(), FS_STATE_OFF)); emit(ADDI(2, 2, 0x300))   # x2 = state + 0x300 (table)
+-    emit(ADRP(3, here(), FS_STATE_OFF)); emit(ADDI(3, 3, 0x200))   # x3 = state + 0x200 (the manual params, hud_manual.c)
+-    emit(B(here(), hud_code) | 0x80000000)    # bl hud_edge
+-    # Probe (0129): call hud_probe with the same pane/aspect/table, plus the
+-    # probe buffer. x0-x3 are caller-saved, so re-set them all (hud_edge may
+-    # have clobbered them); x1/x2/x3 stay saved on the stack until after
+-    # this call, and x19 (the pane) is callee-saved, so it is still live.
+-    emit(0xaa1303e0)                          # mov x0, x19 (the pane)
+-    emit(ADRP(1, here(), FS_STATE_OFF)); emit(ADDI(1, 1, 0x58))    # x1 = state + 0x58 (the aspect)
+-    emit(ADRP(2, here(), FS_STATE_OFF)); emit(ADDI(2, 2, 0x300))   # x2 = state + 0x300 (table)
+-    emit(ADRP(3, here(), FS_STATE_OFF + 0x3000)); emit(ADDI(3, 3, 0x300))  # x3 = state + 0x3300 (probe buffer; 0x3300 does not fit one ADDI, so take the +0x3000 page and add 0x300)
+-    emit(B(here(), probe_code) | 0x80000000)  # bl hud_probe
+-    emit(LDP_POST(3, 8, 31, 16))              # ldp x3, x8, [sp], #0x10
+-    emit(LDP_POST(1, 2, 31, 16))              # ldp x1, x2, [sp], #0x10
+-    emit(0x7940b268)                          # ldrh w8, [x19, #0x58] (the replaced instruction)
+-    emit(B(here(), 0x9094b8))                 # back to the hook site + 4
+-    fs_put(0x9094b4, [B(0x9094b4, estart)], 'Pane::Calculate entry: the HUD edge anchor, so static panes (which skip the +0x13c site) are hooked too (hud_edge.c)')
+-
+ # (0137) The in-game editor runtime: same two Pane::Calculate cuts as
+ # 0135 (entry +0x20 at 0x9094b4, +0x13c at 0x9095d0), but the called code is
+ # hud_runtime.c, not hud_edge.c. hud_runtime writes the pane GLOBAL matrix
+@@ -403,7 +117,7 @@ def _hud_runtime_frame_step(ctx):
+ FRAME_STEP = {BUILD_141: _hud_runtime_frame_step}
+ 
+ BINDING = [
+-    {'what': "HUD edge anchor, v14 (hud_edge.c: entry + 0x13c cuts, compass 'PicStrap', lives 'Life'/'TxtLife', coins 'TxtCounterSh'/'TxtCounter', regional coins 'PicIconSh'/'PicIcon'/'TxtTotalShine' under a 'Counter', moons 'Counter'/'TxtTotalShine', hints 'TxtGuide01', matched by pane name only; the auto edge offset from the screen aspect -- iPhone 19.5:9 +140 out, iPhone Duo 1.43:1 -126 in, iPad 4:3 -160 in, 16:9 0 -- plus the launcher's manual settings from the DM_HUD_* environment variables (hud_manual.c, state page +0x200), which are a delta from the auto edge anchor (0128: the editor shows the element at its edge-anchored default and records the drag from there, so the manual offset is ADDED to the edge -- dragging in the editor moves the element by the same amount in the game, and a manual element still follows the aspect), and a hide that pushes the pane off-screen; the compass takes an extra +128 on its edge anchor (0128: its dial is centred in the 340-wide 'PicStrap' strip, so the plain edge puts the strip at the screen edge but the dial ~128 short of it -- the extra brings the dial, and the hints text in the strip, to the edge); a dirty flag so a moved container carries its children, an orig/mod table with the applied transform so a fixed offset never drifts, sixteen slots per HUD element (0126: log-20 shows TEN panes matching coins and eight slots thrashed, so the numbers drifted off-screen in V1.3.16); no settings UI in the game itself; 0123 regroups the moon icon + 020 into the coins element, splits the '+ menu / - map' hints into their own element, and adds parent compensation so a matched child of a matched parent (moon icon under the moons Counter, hints under the compass strip) is moved once, not twice; 0127 splits the two kinds of coins into two separately adjustable elements (coins, regional coins, moons), so the state page grows to 18 floats and the manual/hidden masks move to state +0x248/+0x24C; the white bar under the counts has no matching pane name and stays put, and the launcher editor no longer draws it; 0129 adds a diagnostic-only probe (hud_probe.c, state page +0x3300, gated by DM_HUD_PROBE=1) that logs every pane's name/parent/size/flags/global matrix on first sighting, the aspect and edge exactly as hud_edge reads and computes them, and, for every pane hud_edge matched, the decision it took (element index, slot, tdx/tdy/tk, hidden, the parent's table entry and whether it is a fresh sentinel, and the translation actually in the pane matrix) -- it moves no pane and changes no behaviour, and is deleted after use, never shipped; 0130 fixes the coin/regional numbers vanishing on device (log-36/37): a static leaf pane's +0x70 matrix is never composed by the game, so the stored original was (0,0) and the offset was written as an absolute position (TxtCounter final_m3 = tdx, -124/-140, off-screen) -- the original's translation is now rebuilt from the pane's local transform (+0x30) plus its parent's layout when the live matrix was never composed; the parent subtraction in hud_edge_unparent is kept, because a dynamic child's matrix does carry its parent's move (removing it would put TxtGuide01 at 1063, not 795); and the 'same transform' early return is gated on the child actually having inherited the parent's move, so a static child sharing its parent's transform is still moved; 0131 adds a layout record to the probe (type 3): for every pane hud_edge matched, the pane's own local translation (+0x30/+0x34), the parent's local translation, and the stored original's translation (e_orig[3]/e_orig[7]) after hud_edge -- the evidence 0130 needs, because 0130 had zero effect on device (log-38 identical to log-37): TxtCounter's local +0x30 is (0,0) on device, so the layout (263,71) is most likely in the parent Capture02/03's local transform, which 0130 never reads, and for the regional group the fallback never triggers and the (c) gate is trivially true; 0132 (log-41) confirms H3 -- the layout (263,71) is in neither the pane's local nor the immediate parent's local: the full chain (TxtCounter -> Capture03 -> RootPane) is visible in the log and sums to (0,-100), not (263,71), so the layout is not in the +0x30 chain at all -- and rebuilds the stored original from the FULL parent chain (the sum of the local translations (+0x30) from the pane up to the root, never any +0x70), when the pane has a matched parent (the unparent subtraction is spurious for a static child that never inherited its parent's move) or when its live matrix was never composed; and the 'same transform' early return now only applies when the original came from that chain-walk, so the regional panes (whose layouts (-52,10) and (55,0) ARE in the chain) are rebuilt correctly and move instead of being spuriously left unmoved (log-41: PicIconSh e_orig 88 and TxtTotalShine e_orig 195 were both constructed as g - pm_dx); the coins numbers still land off-screen in x (-140) with this fix alone, because their (263,71) layout is not in the chain -- a further probe must find where it lives; 0133 extends the probe with two records per matched pane (type 4 chain, type 5 fields) to find it: the chain record logs the local translations (+0x30/+0x34) of the pane and each ancestor up to the root (five levels as floats, plus the depth walked -- log-41's chains are at most four levels, so five covers them; a deeper chain reports its depth and truncates), and the fields record logs the pane's and its parent's local scales (+0x48/+0x4c), sizes (+0x50/+0x54) and origins (+0x5b), and the pane's live global translation (+0x70) as the probe sees it -- the fields that could hold the (263,71) layout, which log-41 proved is in no +0x30 in the chain (H3); the live global is read after hud_edge, so on first sighting it is hud_edge's just-written value and the pre-write value is e_orig in the layout record; 0134 adds five hex-dump records (type 6) per pane named TxtCounterSh, TxtCounter, Capture02, Capture03 or RootPane -- the coin number's own chain, matched or not -- dumping the pane struct's raw bytes 0x00-0xFF in 60-byte chunks, so the (263,71) layout (confirmed by the V1.3.17 screenshot re-measurement, REPORT-0133-remeasure.md; log-42 proved it is in no chain, no scale and no size/origin combination) can be found by grepping for 263.0 = 0x43838000, 123.0 = 0x42F60000 or 71.0 = 0x428E0000 if it lives in a field the probe has not read yet; a matched target pane takes ten records and an unmatched target pane six, the 13-record cap is unchanged; 0135 (log-44 criterion (c): the (263,71) layout is not in the pane struct 0x00-0xFF, so no absolute original can be reconstructed; and the compass stayed visually unmoved on device even though the log showed live 1248, because the game recomposes +0x70 after the hook writes it) moves only the DISPLAYED position: hud_edge shifts the pane's LOCAL translation (+0x30/+0x34) and LOCAL scale (+0x48/+0x4c) by the effective delta and never writes +0x70 -- the game composes it from the local, so the shift reaches the display through the game's own composition; the stored original is the pane's original local (e_orig[3]/[7] = local x/y, e_orig[0]/[5] = local scale), the parent compensation is the child's target minus the parent's applied delta (read from the parent's entry) with the scale as a ratio, the old (c) 'same transform' gate is gone (a zero effective delta rides the parent), and after writing a pane's local the hook marks the pane itself dirty (flags bit 4 at +0x58) so the game recomposes +0x70 in the same Calculate call; edge, manual drag and hide are all local deltas (hide is a local +10000, off-screen); a child that rides its parent takes no table entry, so the probe logs no edge/layout/chain/fields records for it -- and the probe's live_global/final_m3 are the game's pre-shift +0x70 and must not be used to judge the displayed position (judge it by the layout record's local minus e_orig, and the screenshot; 0137 (in-game editor runtime, hud_runtime.c) replaces 0135's local-only shift: at the +0x13c cut, where the pane's own global matrix is final, it writes +0x70 directly (m[3]/m[7] shifted by the effective delta, m[0]/m[1]/m[4]/m[5] scaled by the effective k), always re-derived from a stored ORIGINAL global (e_mod, +56..+104, the 12 floats of +0x70 as first seen, refreshed if the game recomposes it), while still writing the local (+0x30/+0x48) as 0135 did as a fallback; hide is a TRUE hide (flags bit 0 at +0x58 cleared, not +10000 off-screen), per the .bflyt finding that flags=0x00 panes are never drawn; it applies ONLY the editor manual deltas from the state page (+0x200) on top of the 0136 overlay base -- no auto-edge term here, so the edge is never applied twice; the +0x13c cut is the mechanism 0135 lacked (its local shift at +0x13c ran after the global was final, and its entry-cut shift was skipped over by static panes), ; 0142 fixes the GLOBAL write's parent compensation: +0x70 is an ABSOLUTE displayed transform, so it is written from the absolute target (tdx/tdy/tk), not the parent-compensated effective delta (edx/edy/ek) the local write uses -- 0137's compensated global write put a child of a moved/scaled parent one parent-shift short and one parent-scale over-divided (dragging the moons misplaced the regional coins, dragging the compass misplaced the hints); the absolute target is stored per entry in unused e_orig slots ([1] g_dx, [2] g_dy, [4] g_k) and the recompute check and early return compare against it. The HUD panes this matters for are static (their +0x70 is never composed by the game, which is why 0137 writes it directly), so the absolute write is exact thereand the probe is not emitted on this path); 0145 (user 2026-11-15 20:40: coins = icon + number together, regional = hexagon + number together, moons move on their own; the white bar and the hints are hidden in the overlay instead): the matcher now also covers the coins icon glyph 'TxtIconSh'/'TxtIcon' (element 2, so the icon and the number move together) and the moon dots 'TxtShine' (element 3, so the dots move with the moons on their own); the regional hexagon 'PicIconSh'/'PicIcon' and its number 'TxtTotalShine' under a 'Counter' were already element 5 and are unchanged; the white bar 'WinLine' and the hints text have no matching name and stay out of the matcher", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
+-     'why': "Pane::Calculate and the pane layout are this build's nn::ui2d code, found by the HUDLOG diagnostic run (log-17) and confirmed by disassembly of DmIOS; the edge offset comes from the screen aspect the loader already writes to state page + 0x58 (log-28). The manual settings come from the launcher's HUD editor (HudEditor.swift) through the same environment-variable channel the launcher already uses for its other settings (DM_SCREEN_ASPECT), so the game reads nothing new: the host copies them to state page +0x200 once per present. This replaces the cancelled draggable HUD (0113): it keeps no user-adjustable state in the game, reuses the 0118 pane-name hook, and its only tree walk is the bounded flag-only mark-dirty, so the 0113 crash class (a name/match walk reading a pane through a bad pointer) is structurally absent. V1.3.14 (build #45) showed the drift on device: with no manual settings at all (log-30: 'HUD manual: no DM_HUD_* set, auto edge anchor only') the coin/moon numbers vanished and the moon dots were wrong, because four panes share the coins element and two slots could not hold them; the table is the only state the stub keeps, so giving each pane its own slot removes the drift at its source.",
++    {'what': "HUD editor runtime, v15 (hud_runtime.c, 0147: two Pane::Calculate cuts, entry +0x20 at 0x9094b4 and +0x13c at 0x9095d0; applies ONLY the editor manual deltas from the DM_HUD_* environment variables via hud_manual.c, state page +0x200: 18 floats dx/dy/k for elements 0 compass, 1 lives, 2 coins, 3 moons, 4 hints (unused), 5 regional coins, manual mask +0x248, hidden mask +0x24C; dx clamped +-640, dy +-360, k clamped [0.6, 1.8]; no auto-edge term -- the edge anchor lives in the 0136/0143 .bflyt overlay, so the edge is never applied twice. 0147 layout-aware matcher: only a layout's 'All' container is ever matched (the display side), identified by its direct children -- compass: 'PicMap' child (MapMini); lives: 'Life' child (CounterLife/Kids/Up); moons: 'Shine' child with a 'TxtShine' child (CounterShine); coins/regional: 'Add' child, told apart by the 'Capture' sibling's tx under the same RootPane (0 = CounterCoin, 130 = CounterCollectCoin; another tx falls back to All tx, nearest of -740/-615; no Capture sibling matches nothing). The old name matcher is gone: 'PicStrap' (BootLoading strip), 'Counter' (moon-tower container), 'TxtGuide01' (hints) and the capture content panes ('TxtCounterSh'/'TxtCounter'/'TxtIconSh'/'TxtIcon' under Capture00-03) are never matched -- moving content panes emptied the 128x128 capture texture (R1, log-51: a manual value moved the glyphs out of the texture and restoring never repainted it), and the name matches hit the wrong layouts (R2). Hints and the white bar have no matcher entry and stay hidden in the overlay. Restore: a mask-0 element takes no table entry and writes nothing; a pane with an existing entry has its local (+0x30/+0x48) written back to e_orig (its first-seen local, the overlay's default edge position) and is marked dirty (flags bit 4) so the game recomposes +0x70 from the restored local; +0x70 itself is never restored to e_mod; once restored and visible the entry is released. Each element takes 1 slot (its All container); HUD_EDGE_SLOTS_PER_ELEM stays 16. Hide is a TRUE hide (flags bit 0 at +0x58 cleared), only on matched All containers. 0137/0142 kept: +0x70 is written directly at the +0x13c cut from the stored original global (e_mod) and the local as fallback; the global write uses the ABSOLUTE target (tdx/tdy/tk, stored in e_orig slots [1]/[2]/[4]) while the local uses the parent-compensated delta; a dirty flag so a moved container carries its children, an orig/mod table so a fixed offset never drifts. The 0118 auto-edge code (hud_edge.c, _hud_edge_frame_step, HUD_EDGE_WORDS) and the diagnostic probe (HUD_PROBE_WORDS, hud_probe.c) are deleted from this profile -- the probe stays a diagnostic tool only, never shipped", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
++     'why': "Pane::Calculate and the pane layout are this build's nn::ui2d code, found by the HUDLOG diagnostic run (log-17) and confirmed by disassembly of DmIOS. The manual settings come from the HUD editor through the same environment-variable channel the launcher already uses for its other settings (DM_SCREEN_ASPECT), so the game reads nothing new: the host copies them to state page +0x200 once per present. The .bflyt ground truth (REPORT-HUD-REDO.md B, all 215 layouts parsed) is why the matcher is layout-aware: the coins and regional-coins content panes share names across two layouts, the capture texture mechanism means only the All container may move, and 'Counter'/'PicStrap' name matches hit the moon tower and the BootLoading strip. The old name matcher moved content panes and emptied the capture texture (log-50/51: coins and regional coins vanished after a manual value, and restoring the default never repainted the texture). The runtime keeps no user-adjustable state in the game beyond the orig/mod table, and its only tree walks are the bounded child-name checks and the bounded flag-only mark-dirty, so the 0113 crash class (a name/match walk reading a pane through a bad pointer) is structurally absent",
+      'blocked': 'the stubs have no function-matched form yet'},
+ ]
+-- 
+2.43.0
+

@@ -1,0 +1,1718 @@
+From 0a4aa9d47cb8a2ca721d6dc915d15099ddb7fef6 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Sun, 15 Nov 2026 14:39:07 +0000
+Subject: [PATCH] 0148: pad-style in-game HUD editor (HudPadEditor), delete the
+ old Swift HUD editors
+
+---
+ dm/ios/Sources/DmGameMenu.h    |    2 +
+ dm/ios/Sources/GameMenu.swift  |    2 +-
+ dm/ios/Sources/HudEditor.swift | 1045 --------------------------------
+ dm/ios/Sources/HudPadEditor.h  |   30 +
+ dm/ios/Sources/HudPadEditor.m  |  533 ++++++++++++++++
+ dm/ios/Sources/Launcher.swift  |   15 +-
+ 6 files changed, 569 insertions(+), 1058 deletions(-)
+ delete mode 100644 dm/ios/Sources/HudEditor.swift
+ create mode 100644 dm/ios/Sources/HudPadEditor.h
+ create mode 100644 dm/ios/Sources/HudPadEditor.m
+
+diff --git a/dm/ios/Sources/DmGameMenu.h b/dm/ios/Sources/DmGameMenu.h
+index 7c2b320..50c57de 100644
+--- a/dm/ios/Sources/DmGameMenu.h
++++ b/dm/ios/Sources/DmGameMenu.h
+@@ -11,6 +11,8 @@ int dm_pad_layout(void);   // DmGamepad.m: 0 = 2D, 1 = 3D, 2 = Tap (DM_GAME_PAD_
+ bool dm_pad_layout_offered(int layout);   // Tap only in handheld mode
+ void dm_pad_layout_set(int layout);   // releases every touch first, and is saved for the next start
+ void dm_gamepad_open_pad_settings(void);   // DmGamepad.m: the in-game menu's "按键设置" (button settings) opens the button editor
++void dm_hud_pad_open_editor(void);   // HudPadEditor.m: the in-game menu's "HUD 设置" opens the pad-style HUD editor
++void dm_hud_pad_apply_saved(void);   // HudPadEditor.m: the saved DmHudPad.* settings go into the DM_HUD_* environment before the game starts
+ void dm_gamepad_touch_feedback(bool on);   // DM_TOUCH_HAPTICS
+ bool dm_setting_live(const char *env, const char *value);
+ void *dm_quit_menu(void);   // front_ios.m: the menu's last item, Quit <game>, which opens the quit prompt (a retained UIMenu, shown inline)   // front_ios.m: value NULL asks whether the running game takes env at once; otherwise applies it
+diff --git a/dm/ios/Sources/GameMenu.swift b/dm/ios/Sources/GameMenu.swift
+index 2495c34..b10c74b 100644
+--- a/dm/ios/Sources/GameMenu.swift
++++ b/dm/ios/Sources/GameMenu.swift
+@@ -20,7 +20,7 @@ private func gameMenuItems() -> [UIMenuElement] {
+     }
+     let layout = UIMenu(title: LauncherText.text("ui.controllerLayout", "Controller layout"), options: .singleSelection, children: layouts)   // a choice's value shows in its submenu: a subtitle would make each row two lines
+     let padSettings = UIAction(title: "按键设置") { _ in dm_gamepad_open_pad_settings() }   // the button editor (DmGamepad.m): the icons' size and where they sit
+-    let hudSettings = UIAction(title: "HUD 设置") { _ in dmHudOpenGameEditor() }   // (0137) the in-game HUD editor: size slider, X/Y steppers, true hide, live in the running game
++    let hudSettings = UIAction(title: "HUD 设置") { _ in dm_hud_pad_open_editor() }   // (0148) the pad-style HUD editor (HudPadEditor.m): drag the elements on the game, live in the running game
+     var items: [UIMenuElement] = []
+     var placed = false
+     if let m = gameMenuModel {
+diff --git a/dm/ios/Sources/HudEditor.swift b/dm/ios/Sources/HudEditor.swift
+deleted file mode 100644
+index 5025d30..0000000
+--- a/dm/ios/Sources/HudEditor.swift
++++ /dev/null
+@@ -1,1045 +0,0 @@
+-// HudEditor.swift -- the launcher HUD editor (0123). The settings screen
+-// shows a game preview (the bundled forest photo, the six HUD elements) at the
+-// device's screen shape, and each element can be dragged, resized (60%-180%) or
+-// hidden. A manual setting wins over the auto edge anchor (0118); an element with
+-// no manual setting keeps the auto edge. Hidden in the editor means hidden in
+-// the game. The settings are kept in UserDefaults and, when the game starts,
+-// written to the DM_HUD_* environment variables (HudSettings). The game reads
+-// them through the host (dm/host/hud_manual.c -> state page +0x200 -> hud_edge.c).
+-// The four preview shapes are iPhone 19.5:9, iPhone Duo 1.43:1, iPad 4:3 and 16:9;
+-// the default is the device's own shape.
+-//
+-// The preview is a port of mockup.html (the design the player approved): the
+-// background is the bundled photo for the aspect (Sources/HudBackgrounds/*.jpg,
+-// the mockup's own art), the stage has the same thick black rounded device frame,
+-// the six elements are drawn with the mockup's shapes and colours, and their
+-// default positions are the mockup's defaultPos formula (edge-anchored fractions
+-// of the preview, measured from the elements' em-sized boxes). Element sizes
+-// scale with the preview width (u = preview.width / 100, the mockup's em), so the
+-// proportions hold on every shape.
+-//
+-// NOTE (0123): the 0119 basePoint + autoEdgeDx mechanism is gone. One base point
+-// per element cannot reproduce defaultPos on all four shapes: the coins centre
+-// would need base.x = 170 for 16:9 but 347 for the iPhone shape (after the -140
+-// edge shift), and the Duo shape would need no shift at all. The default
+-// position is therefore computed from defaultPos directly; the stored manual
+-// setting is still an offset (dx, dy, in layout points) from that default, so
+-// drag / resize / hide and the DM_HUD_* strings are unchanged.
+-import SwiftUI
+-import UIKit
+-import Foundation
+-
+-// One element's manual setting: an offset (dx, dy) in layout points (1280x720
+-// space, y up, from the element's default position), a size multiplier k, and
+-// whether the element is hidden. Encoded as "dx,dy,k,hidden" (dx, dy whole
+-// points, k two decimals, hidden 1 / 0): the same string the host parses from
+-// the DM_HUD_* environment variable, so the launcher and the host agree.
+-struct HudElementSetting: Equatable {
+-    var dx, dy, k: Double
+-    var hidden: Bool
+-    var encoded: String { "\(Int(dx.rounded())),\(Int(dy.rounded())),\(String(format: "%.2f", k)),\(hidden ? 1 : 0)" }
+-    static func decode(_ s: String) -> HudElementSetting? {
+-        let p = s.split(separator: ",")
+-        guard p.count == 4, let dx = Double(p[0]), let dy = Double(p[1]), let k = Double(p[2]), let h = Int(p[3]) else { return nil }
+-        return HudElementSetting(dx: dx, dy: dy, k: k, hidden: h != 0)
+-    }
+-}
+-
+-// The six HUD elements, in the game's fixed order (hud_edge.c, hud_manual.c,
+-// patches.py). The raw values must never change: saved settings and the state
+-// page are keyed by them. Display order in the editor (mockup.html META) is
+-// coins, regional coins, moons, lives, hints, compass -- see displayOrder, not rawValue.
+-//
+-// Grouping (the player's call, 0127: the two kinds of coins are separate
+-// groups now): coins = only the coin icon + 0896; regional coins = only the
+-// hexagon icon + 020; moons = only the two rows of dots below (its own unit).
+-// The white bar under the counts is GONE from the editor (0127): it has no
+-// matching pane in the game (a texture, it cannot move), so it is not drawn
+-// and belongs to no group. The old 0119 moons-falls-back-to-coins rule is
+-// gone: each group has its own setting.
+-enum HudElement: Int, CaseIterable, Identifiable {
+-    case compass = 0, lives, coins, moons, hints, regional
+-    var id: Int { rawValue }
+-    var env: String {
+-        switch self {
+-        case .compass: return "DM_HUD_COMPASS"
+-        case .lives: return "DM_HUD_LIFE"
+-        case .coins: return "DM_HUD_COINS"
+-        case .moons: return "DM_HUD_MOONS"
+-        case .hints: return "DM_HUD_HINTS"
+-        case .regional: return "DM_HUD_REGIONAL"
+-        }
+-    }
+-    var name: String {
+-        switch self {
+-        case .compass: return "指南针"
+-        case .lives: return "生命"
+-        case .coins: return "金币"
+-        case .moons: return "月亮"
+-        case .hints: return "菜单 / 地图提示词"
+-        case .regional: return "地区金币"
+-        }
+-    }
+-    // The name on the selected element's tag (mockup.html: the hints tag reads
+-    // "菜单 / 地图", not the full list name).
+-    var tagName: String { self == .hints ? "菜单 / 地图" : name }
+-    var key: String { "DmHudManual.\(rawValue)" }   // UserDefaults key, one per element
+-    // Display order in the editor list and the preview (mockup.html META).
+-    // 0144: the hints element is gone from the editor (the user 2026-11-15
+-    // 20:40: the "+ menu / - map" hints are hidden in the overlay and not
+-    // shown); the .hints case stays in the enum so the raw values and the
+-    // UserDefaults keys of the other elements do not shift.
+-    static var displayOrder: [HudElement] { [.coins, .regional, .moons, .lives, .compass] }
+-
+-    // The element's rendered size in preview points at scale k, mirroring
+-    // mockup.html's em sizing (u = preview.width / 100; coins/moons use a
+-    // 3.3u font, hints a 2.05u font, life a 6.6u square, compass a 6.9u square).
+-    // The .hud padding (.16em vertical, .30em horizontal) is included; life and
+-    // compass have no font-size in the mockup, so their .1em padding (~2pt) is
+-    // left out. The digit widths are estimates (SF Rounded Heavy, ~0.62em per
+-    // digit plus .045em tracking): the same estimates are used by the drawing
+-    // code below, so the two agree.
+-    static func previewSize(_ el: HudElement, k: Double, unit u: CGFloat) -> CGSize {
+-        switch el {
+-        case .coins:
+-            // Coin icon 1.08em + .34em + "0896" 2.60em = 4.02em; height 1.08em
+-            // (icons only -- the hexagon + 020 are the regional-coins element
+-            // now, and the white bar is gone, 0127); plus .30em / .16em padding.
+-            let em = 3.3 * u * CGFloat(k)
+-            return CGSize(width: 4.62 * em, height: 1.40 * em)
+-        case .regional:
+-            // Hexagon icon 1.08em + .34em + "020" 1.95em = 3.37em; height
+-            // 1.08em (icons only); plus .30em / .16em padding. The hexagon
+-            // drawing is identical to the old coins view (0127 moves it, it
+-            // does not redraw it).
+-            let em = 3.3 * u * CGFloat(k)
+-            return CGSize(width: 3.97 * em, height: 1.40 * em)
+-        case .moons:
+-            // Row 1: 8 filled dots .46em + 2 empty dots .40em, 9 gaps .30em =
+-            // 7.18em; row 2: 6 empty dots = 3.90em; plus .10em left padding.
+-            // Height: two .50em rows + .22em gap = 1.22em; plus padding.
+-            let em = 3.3 * u * CGFloat(k)
+-            return CGSize(width: 7.88 * em, height: 1.54 * em)
+-        case .lives:
+-            let s = 6.6 * u * CGFloat(k)
+-            return CGSize(width: s, height: s)
+-        case .hints:
+-            // Row: key 1.30em + gap .42em + two full-width characters 2.00em =
+-            // 3.72em; height: two 1.30em keys + .30em gap = 2.90em; plus padding.
+-            let em = 2.05 * u * CGFloat(k)
+-            return CGSize(width: 4.32 * em, height: 3.22 * em)
+-        case .compass:
+-            let s = 6.9 * u * CGFloat(k)
+-            return CGSize(width: s, height: s)
+-        }
+-    }
+-
+-    // The element's default top-left corner in preview points: mockup.html's
+-    // defaultPos (mx = 1.8% of W, my = 5% of H, gap = 1.2% of W; the
+-    // coins-to-regional and regional-to-moons gaps are 2.2% of H). Left: coins
+-    // on top, regional coins under it, moons under that. Right: lives on top,
+-    // hints under it, compass under that, centred on the lives column.
+-    // `sizes` holds every element's previewSize at its own k.
+-    static func defaultTopLeft(_ el: HudElement, preview: CGSize, sizes: [HudElement: CGSize]) -> CGPoint {
+-        let W = preview.width, H = preview.height
+-        let mx = W * 0.018, my = H * 0.05, gap = W * 0.012
+-        let coins = sizes[.coins] ?? .zero, regional = sizes[.regional] ?? .zero
+-        let lives = sizes[.lives] ?? .zero
+-        let hints = sizes[.hints] ?? .zero, compass = sizes[.compass] ?? .zero
+-        switch el {
+-        case .coins: return CGPoint(x: mx, y: my)
+-        case .regional: return CGPoint(x: mx, y: my + coins.height + H * 0.022)
+-        case .moons: return CGPoint(x: mx, y: my + coins.height + H * 0.022 + regional.height + H * 0.022)
+-        case .lives: return CGPoint(x: W - mx - lives.width, y: my)
+-        case .hints: return CGPoint(x: W - mx - hints.width, y: my + lives.height + gap * 0.8)
+-        case .compass: return CGPoint(x: W - mx - lives.width / 2 - compass.width / 2,
+-                                      y: my + lives.height + gap * 0.8 + hints.height + gap * 0.9)
+-        }
+-    }
+-}
+-
+-// The four preview shapes. The default is the device's own shape.
+-enum HudAspect: CaseIterable, Identifiable {
+-    case phone, duo, pad, wide
+-    var id: Self { self }
+-    var name: String {
+-        switch self { case .phone: return "iPhone 19.5:9"; case .duo: return "iPhone Duo 1.43:1"; case .pad: return "iPad 4:3"; case .wide: return "16:9" }
+-    }
+-    var ratio: Double {
+-        switch self { case .phone: return 2.167; case .duo: return 1.429; case .pad: return 1.333; case .wide: return 1.778 }
+-    }
+-    // The bundled background photo (dm/ios/Sources/HudBackgrounds/). The
+-    // photos are the mockup's own art, and their ratios match these shapes:
+-    // iphone 1920x886 (2.167), duo 1830x1280 (1.430), ipad 1706x1280 (1.333),
+-    // 16:9 1920x1080 (1.778).
+-    var imageName: String {
+-        switch self { case .phone: return "hud_bg_iphone"; case .duo: return "hud_bg_duo"; case .pad: return "hud_bg_ipad"; case .wide: return "hud_bg_169" }
+-    }
+-    // The layout size for the shape (loader.c dm_fps_state_apply's rule: wider
+-    // than 16:9 keeps the height (720) and widens; taller keeps the width (1280)
+-    // and grows taller). Used only to convert a drag (preview points) into a
+-    // manual offset (layout points) and back.
+-    var layout: CGSize {
+-        if ratio > 1.78 { return CGSize(width: 720 * ratio, height: 720) }
+-        if ratio < 1.77 { return CGSize(width: 1280, height: 1280 / ratio) }
+-        return CGSize(width: 1280, height: 720)
+-    }
+-    static func device() -> HudAspect {
+-        let s = UIScreen.main.bounds.size
+-        let r = max(s.width, s.height) / max(1, min(s.width, s.height))
+-        // The closest of the four shapes (the phone is 2.167, the Duo 1.429, the iPad 1.333, 16:9 is 1.778).
+-        return [phone, duo, pad, wide].min(by: { abs($0.ratio - r) < abs($1.ratio - r) }) ?? .phone
+-    }
+-}
+-
+-final class HudSettings: ObservableObject {
+-    // One setting per element; a missing key means "no manual setting" (auto edge).
+-    @Published private(set) var values: [HudElement: HudElementSetting] = [:]
+-    private let defaults: UserDefaults
+-    init(defaults: UserDefaults = .standard) {
+-        self.defaults = defaults
+-        for e in HudElement.allCases {
+-            if let s = (defaults.string(forKey: e.key)).flatMap(HudElementSetting.decode) { values[e] = s }
+-        }
+-    }
+-    // The setting that applies to an element (nil = auto edge). Each element,
+-    // moons included, stands on its own: there is no cross-element fallback.
+-    func effective(_ e: HudElement) -> HudElementSetting? { values[e] }
+-    func isManual(_ e: HudElement) -> Bool { effective(e) != nil }
+-    // Whether the element was moved or resized (the mockup's "manual" flag for
+-    // the list and the tag): a hidden-only setting still reads as 自动贴边,
+-    // with 已隐藏 on the side.
+-    func isTransformed(_ e: HudElement) -> Bool {
+-        guard let s = effective(e) else { return false }
+-        return s.dx != 0 || s.dy != 0 || s.k != 1
+-    }
+-    func set(_ e: HudElement, _ s: HudElementSetting?) {
+-        if let s { values[e] = s; defaults.set(s.encoded, forKey: e.key) }
+-        else { values.removeValue(forKey: e); defaults.removeObject(forKey: e.key) }
+-    }
+-    func resetAll() { for e in HudElement.allCases { set(e, nil) } }
+-    var anyManual: Bool { HudElement.allCases.contains { effective($0) != nil } }
+-    // Before the game starts: every element with a manual setting goes into the
+-    // environment (the host copies it to the state page); an element with no
+-    // manual setting is unset, so the game keeps its auto edge anchor. A hidden
+-    // element's hidden flag (1) is in the same string.
+-    func applyToEnvironment() {
+-        for e in HudElement.allCases {
+-            if let s = effective(e) {
+-                setenv(e.env, s.encoded, 1)
+-                fputs("launcher: \(e.env)=\(s.encoded) (HUD editor)\n", stderr)
+-            } else {
+-                unsetenv(e.env)
+-            }
+-        }
+-    }
+-    // (0137) In-game editor: push ONE element's current setting into the
+-    // environment right now, so the host (which re-reads the env vars every
+-    // present) applies it on the next frame -- the slider moves the HUD in
+-    // the running game, no restart. An element with no manual setting is
+-    // unset, so the game keeps its overlay base position.
+-    func applyOneToEnvironment(_ e: HudElement) {
+-        if let s = effective(e) {
+-            setenv(e.env, s.encoded, 1)
+-        } else {
+-            unsetenv(e.env)
+-        }
+-    }
+-}
+-
+-// The mockup's text shadow (.num, .hint-row): a dark 1px outline in four
+-// directions plus a soft drop shadow.
+-private extension View {
+-    func hudTextShadow(size: CGFloat) -> some View {
+-        let dark = Color(red: 19 / 255, green: 26 / 255, blue: 21 / 255)
+-        return self
+-            .shadow(color: dark, radius: 0, x: size * 0.05, y: size * 0.05)
+-            .shadow(color: dark, radius: 0, x: -size * 0.05, y: size * 0.05)
+-            .shadow(color: dark, radius: 0, x: size * 0.05, y: -size * 0.05)
+-            .shadow(color: dark, radius: 0, x: -size * 0.05, y: -size * 0.05)
+-            .shadow(color: .black.opacity(0.4), radius: size * 0.16, x: 0, y: size * 0.1)
+-    }
+-}
+-
+-// A white bold number with the mockup's outline (coins "0896", regional coins "020").
+-private struct HudNumber: View {
+-    let text: String
+-    let size: CGFloat
+-    var body: some View {
+-        Text(text)
+-            .font(.system(size: size, weight: .heavy, design: .rounded))
+-            .tracking(size * 0.045)
+-            .foregroundStyle(.white)
+-            .hudTextShadow(size: size)
+-    }
+-}
+-
+-// A white bold label with the mockup's outline (hints "菜单" / "地图").
+-private struct HudLabel: View {
+-    let text: String
+-    let size: CGFloat
+-    var body: some View {
+-        Text(text)
+-            .font(.system(size: size, weight: .bold))
+-            .foregroundStyle(.white)
+-            .hudTextShadow(size: size)
+-    }
+-}
+-
+-// The coin icon (mockup SVG, 100x100 viewBox): a dark disc with a thick white
+-// ring, a thin inner white ring, and a dark vertical bar in the middle.
+-private struct CoinIcon: View {
+-    let size: CGFloat
+-    var body: some View {
+-        ZStack {
+-            Circle().fill(Color(red: 8 / 255, green: 12 / 255, blue: 16 / 255).opacity(0.38))
+-                .frame(width: 0.82 * size, height: 0.82 * size)
+-            Circle().stroke(Color.white, lineWidth: 0.11 * size)
+-                .frame(width: 0.82 * size, height: 0.82 * size)
+-            Circle().stroke(Color.white.opacity(0.92), lineWidth: 0.035 * size)
+-                .frame(width: 0.56 * size, height: 0.56 * size)
+-            RoundedRectangle(cornerRadius: 0.065 * size)
+-                .fill(Color(red: 16 / 255, green: 21 / 255, blue: 28 / 255))
+-                .frame(width: 0.13 * size, height: 0.44 * size)
+-        }
+-        .frame(width: size, height: size)
+-    }
+-}
+-
+-// The regional-coins icon (mockup SVG, 100x100 viewBox): a white hexagon with a dark
+-// ring and a dark centre dot.
+-private struct Hexagon: Shape {
+-    func path(in rect: CGRect) -> Path {
+-        var p = Path()
+-        for i in 0..<6 {
+-            let a = CGFloat(i) * .pi / 3 - .pi / 2
+-            let pt = CGPoint(x: rect.midX + rect.width / 2 * cos(a), y: rect.midY + rect.height / 2 * sin(a))
+-            if i == 0 { p.move(to: pt) } else { p.addLine(to: pt) }
+-        }
+-        p.closeSubpath()
+-        return p
+-    }
+-}
+-
+-// A polygon in the mockup's 0-100 viewBox coordinates, scaled into the frame
+-// (the compass needle's two triangles).
+-private struct UnitPolygon: Shape {
+-    let points: [CGPoint]
+-    func path(in rect: CGRect) -> Path {
+-        let sc = min(rect.width, rect.height) / 100
+-        let ox = rect.midX - 50 * sc, oy = rect.midY - 50 * sc
+-        var p = Path()
+-        for (i, pt) in points.enumerated() {
+-            let q = CGPoint(x: ox + pt.x * sc, y: oy + pt.y * sc)
+-            if i == 0 { p.move(to: q) } else { p.addLine(to: q) }
+-        }
+-        p.closeSubpath()
+-        return p
+-    }
+-}
+-
+-// The heart (mockup SVG path, 100x100 viewBox -- copied verbatim):
+-// M50 79 C36 68 25 57 25 44 C25 34 32 28 39.5 28 C45 28 49 31 50 36
+-// C51 31 55 28 60.5 28 C68 28 75 34 75 44 C75 57 64 68 50 79 Z
+-private struct HeartShape: Shape {
+-    func path(in rect: CGRect) -> Path {
+-        let sc = min(rect.width, rect.height) / 100
+-        let ox = rect.midX - 50 * sc, oy = rect.midY - 50 * sc
+-        func pt(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: ox + x * sc, y: oy + y * sc) }
+-        var p = Path()
+-        p.move(to: pt(50, 79))
+-        p.addCurve(to: pt(25, 44), control1: pt(36, 68), control2: pt(25, 57))
+-        p.addCurve(to: pt(39.5, 28), control1: pt(25, 34), control2: pt(32, 28))
+-        p.addCurve(to: pt(50, 36), control1: pt(45, 28), control2: pt(49, 31))
+-        p.addCurve(to: pt(60.5, 28), control1: pt(51, 31), control2: pt(55, 28))
+-        p.addCurve(to: pt(75, 44), control1: pt(68, 28), control2: pt(75, 34))
+-        p.addCurve(to: pt(50, 79), control1: pt(75, 57), control2: pt(64, 68))
+-        p.closeSubpath()
+-        return p
+-    }
+-}
+-
+-// One moon dot (mockup .pip, em = the moons font size). Filled: a white disc
+-// with a blue inset crescent on the left (#1663ff, the mockup's inset shadow).
+-// Empty: a transparent disc with a dotted white rim.
+-private struct MoonDot: View {
+-    let filled: Bool
+-    let em: CGFloat
+-    var body: some View {
+-        Group {
+-            if filled {
+-                ZStack {
+-                    Circle().fill(Color.white)
+-                    Circle().fill(Color(red: 22 / 255, green: 99 / 255, blue: 255 / 255))
+-                        .offset(x: -0.18 * em, y: 0.03 * em)
+-                }
+-                .clipShape(Circle())
+-                .frame(width: 0.46 * em, height: 0.46 * em)
+-            } else {
+-                Circle()
+-                    .stroke(Color.white.opacity(0.85), style: StrokeStyle(lineWidth: 0.045 * em, lineCap: .round, dash: [0.1, 0.10 * em]))
+-                    .frame(width: 0.40 * em, height: 0.40 * em)
+-            }
+-        }
+-    }
+-}
+-
+-// One hints row: a round key (+ / −, white rim, translucent dark fill) and
+-// the word beside it.
+-private struct HintRow: View {
+-    let symbol: String
+-    let text: String
+-    let em: CGFloat
+-    var body: some View {
+-        HStack(spacing: 0.42 * em) {
+-            ZStack {
+-                Circle().fill(Color(red: 13 / 255, green: 18 / 255, blue: 14 / 255).opacity(0.5))
+-                Circle().stroke(Color.white, lineWidth: 0.09 * em)
+-                Text(symbol).font(.system(size: 0.95 * em, weight: .heavy)).foregroundStyle(.white)
+-            }
+-            .frame(width: 1.3 * em, height: 1.3 * em)
+-            HudLabel(text: text, size: em)
+-        }
+-    }
+-}
+-
+-// The preview of one HUD element, drawn to look like the game (mockup.html).
+-// `unit` is the mockup's u = preview.width / 100; every size is an em multiple
+-// of it, times the element's scale k.
+-private struct HudElementPreview: View {
+-    let el: HudElement
+-    let k: Double
+-    let unit: CGFloat
+-    var body: some View {
+-        Group {
+-            switch el {
+-            case .coins: coinsView
+-            case .regional: regionalCoinsView
+-            case .moons: moonsView
+-            case .lives: livesView
+-            case .hints: hintsView
+-            case .compass: compassView
+-            }
+-        }
+-    }
+-
+-    // Coin icon + 0896 only (0127: the hexagon + 020 are the regional-coins
+-    // element now, and the white bar is gone -- it has no matching pane in the
+-    // game, so it is not drawn and belongs to no group). The coin icon and the
+-    // number drawing are unchanged.
+-    private var coinsView: some View {
+-        let em = 3.3 * unit * CGFloat(k)
+-        let icon = 1.08 * em
+-        return HStack(spacing: 0.34 * em) {
+-            CoinIcon(size: icon)
+-            HudNumber(text: "0896", size: em)
+-        }
+-        .padding(.vertical, 0.16 * em)
+-        .padding(.horizontal, 0.30 * em)
+-    }
+-
+-    // Hexagon icon + 020 only (0127: its own element now). The hexagon drawing
+-    // is moved verbatim from the old coins view -- same Hexagon fill, same
+-    // inner circles, same sizes; only its group changed.
+-    private var regionalCoinsView: some View {
+-        let em = 3.3 * unit * CGFloat(k)
+-        let icon = 1.08 * em
+-        return HStack(spacing: 0.34 * em) {
+-            ZStack {
+-                Hexagon().fill(Color.white)
+-                Circle().stroke(Color(red: 16 / 255, green: 21 / 255, blue: 28 / 255), lineWidth: 0.09 * icon)
+-                    .frame(width: 0.40 * icon, height: 0.40 * icon)
+-                Circle().fill(Color(red: 16 / 255, green: 21 / 255, blue: 28 / 255))
+-                    .frame(width: 0.11 * icon, height: 0.11 * icon)
+-            }
+-            .frame(width: icon, height: icon)
+-            HudNumber(text: "020", size: em)
+-        }
+-        .padding(.vertical, 0.16 * em)
+-        .padding(.horizontal, 0.30 * em)
+-    }
+-
+-    // Only the two rows of dots (the hexagon icon + 020 belong to regional coins now):
+-    // top row 8 filled + 2 empty, bottom row 6 empty.
+-    private var moonsView: some View {
+-        let em = 3.3 * unit * CGFloat(k)
+-        return VStack(alignment: .leading, spacing: 0.22 * em) {
+-            HStack(spacing: 0.30 * em) {
+-                ForEach(0..<8) { _ in MoonDot(filled: true, em: em) }
+-                ForEach(0..<2) { _ in MoonDot(filled: false, em: em) }
+-            }
+-            .frame(height: 0.5 * em)
+-            HStack(spacing: 0.30 * em) {
+-                ForEach(0..<6) { _ in MoonDot(filled: false, em: em) }
+-            }
+-            .frame(height: 0.5 * em)
+-        }
+-        .padding(.leading, 0.10 * em)
+-        .padding(.vertical, 0.16 * em)
+-        .padding(.horizontal, 0.30 * em)
+-    }
+-
+-    // Green ring, white heart (the mockup's SVG path), dark "3" in the middle.
+-    private var livesView: some View {
+-        let s = 6.6 * unit * CGFloat(k)
+-        let dark = Color(red: 34 / 255, green: 39 / 255, blue: 45 / 255)
+-        return ZStack {
+-            Circle().fill(Color(red: 16 / 255, green: 22 / 255, blue: 17 / 255).opacity(0.38))
+-                .frame(width: 0.88 * s, height: 0.88 * s)
+-            Circle().stroke(Color(red: 61 / 255, green: 220 / 255, blue: 90 / 255), lineWidth: 0.07 * s)
+-                .frame(width: 0.88 * s, height: 0.88 * s)
+-            HeartShape().fill(Color.white).frame(width: s, height: s)
+-            HeartShape().stroke(dark, lineWidth: 0.025 * s).frame(width: s, height: s)
+-            Text("3")
+-                .font(.system(size: 0.27 * s, weight: .heavy))
+-                .foregroundStyle(dark)
+-                .position(x: s / 2, y: 0.48 * s)
+-        }
+-        .frame(width: s, height: s)
+-    }
+-
+-    // Two rows: "+ 菜单" / "− 地图", each with its round key.
+-    private var hintsView: some View {
+-        let em = 2.05 * unit * CGFloat(k)
+-        return VStack(alignment: .leading, spacing: 0.30 * em) {
+-            HintRow(symbol: "+", text: "菜单", em: em)
+-            HintRow(symbol: "−", text: "地图", em: em)
+-        }
+-        .padding(.vertical, 0.16 * em)
+-        .padding(.horizontal, 0.30 * em)
+-    }
+-
+-    // Dial (dark translucent disc, white rim), N/E/S/W ticks, the red-grey
+-    // needle rotated 38°, a white centre dot, "N" at the top.
+-    private var compassView: some View {
+-        let s = 6.9 * unit * CGFloat(k)
+-        let tick = Color(red: 207 / 255, green: 214 / 255, blue: 207 / 255)
+-        let rim = Color(red: 242 / 255, green: 244 / 255, blue: 241 / 255)
+-        return ZStack {
+-            Circle().fill(Color(red: 14 / 255, green: 18 / 255, blue: 15 / 255).opacity(0.55))
+-                .frame(width: 0.90 * s, height: 0.90 * s)
+-            Circle().stroke(rim, lineWidth: 0.04 * s)
+-                .frame(width: 0.90 * s, height: 0.90 * s)
+-            Rectangle().fill(tick).frame(width: 0.025 * s, height: 0.07 * s).position(x: 0.5 * s, y: 0.135 * s)
+-            Rectangle().fill(tick).frame(width: 0.025 * s, height: 0.07 * s).position(x: 0.5 * s, y: 0.865 * s)
+-            Rectangle().fill(tick).frame(width: 0.07 * s, height: 0.025 * s).position(x: 0.135 * s, y: 0.5 * s)
+-            Rectangle().fill(tick).frame(width: 0.07 * s, height: 0.025 * s).position(x: 0.865 * s, y: 0.5 * s)
+-            ZStack {
+-                UnitPolygon(points: [CGPoint(x: 50, y: 20), CGPoint(x: 56.5, y: 50), CGPoint(x: 50, y: 43), CGPoint(x: 43.5, y: 50)])
+-                    .fill(Color(red: 232 / 255, green: 68 / 255, blue: 58 / 255))
+-                    .frame(width: s, height: s)
+-                UnitPolygon(points: [CGPoint(x: 50, y: 80), CGPoint(x: 55, y: 50), CGPoint(x: 50, y: 56), CGPoint(x: 45, y: 50)])
+-                    .fill(Color(red: 154 / 255, green: 167 / 255, blue: 156 / 255))
+-                    .frame(width: s, height: s)
+-            }
+-            .rotationEffect(.degrees(38))
+-            Circle().fill(rim).frame(width: 0.09 * s, height: 0.09 * s)
+-            Text("N")
+-                .font(.system(size: 0.14 * s, weight: .heavy))
+-                .foregroundStyle(.white)
+-                .position(x: 0.5 * s, y: 0.28 * s)
+-        }
+-        .frame(width: s, height: s)
+-    }
+-}
+-
+-struct HudEditorView: View {
+-    @ObservedObject var settings: HudSettings
+-    @State private var aspect: HudAspect = .device()
+-    @State private var selected: HudElement = .coins
+-    @State private var dragOffset = CGSize.zero   // the in-progress drag, in preview points
+-    @Environment(\.dismiss) private var dismiss
+-
+-    // The bundled background photo for the aspect (Sources/HudBackgrounds/*.jpg,
+-    // copied into the app bundle by xcodegen's Sources entry -- the PadIcons
+-    // precedent: Sources/PadIcons/*.png load the same way with UIImage(named:)).
+-    // Nil when the image is missing, so the preview falls back to the drawn
+-    // gradient instead of going blank.
+-    private static func backgroundImage(for aspect: HudAspect) -> UIImage? {
+-        let name = aspect.imageName
+-        if let url = Bundle.main.url(forResource: name, withExtension: "jpg"),
+-           let image = UIImage(contentsOfFile: url.path) { return image }
+-        return UIImage(named: name)
+-    }
+-
+-    private func effectiveSetting(_ el: HudElement) -> HudElementSetting? { settings.effective(el) }
+-    // 0144: the manual offset is in the 1280x720 DESIGN space (hud_manual.c
+-    // reads dx/dy in that space), not the layout space. The preview is a view
+-    // of the LAYOUT (phone 1560x720, iPad 1280x960), so converting a preview
+-    // drag with the layout width made the phone's dx 1560/1280 = 22% too large
+-    // (log-49: drags of a few hundred preview points became dx 300-600 and
+-    // pushed the number panes off-screen) and the iPad's dy 1280/960 = 33%
+-    // too large. The design-space scales are 1280/preview.width (x) and
+-    // 720/preview.height (y); the y scale equals the old layout scale on the
+-    // phone (same aspect), so only the phone's dx and the iPad's dy change.
+-    private func dragScale(preview: CGSize) -> CGSize {
+-        CGSize(width: 1280 / max(1, preview.width), height: 720 / max(1, preview.height))
+-    }
+-
+-    // The element's frame in preview points: the mockup's default position,
+-    // the manual offset (design points -> preview points, y flipped), clamped
+-    // inside the preview like the mockup does. (0144: the offset is design
+-    // space, so it scales by preview.width/1280 and preview.height/720, not
+-    // by the layout size.)
+-    private func elementFrame(_ el: HudElement, preview: CGSize, layout: CGSize, sizes: [HudElement: CGSize]) -> CGRect {
+-        let size = sizes[el] ?? .zero
+-        var origin = HudElement.defaultTopLeft(el, preview: preview, sizes: sizes)
+-        if let s = effectiveSetting(el) {
+-            origin.x += CGFloat(s.dx) * preview.width / 1280
+-            origin.y -= CGFloat(s.dy) * preview.height / 720
+-        }
+-        let x = min(max(origin.x, 0), max(0, preview.width - size.width))
+-        let y = min(max(origin.y, 0), max(0, preview.height - size.height))
+-        return CGRect(origin: CGPoint(x: x, y: y), size: size)
+-    }
+-
+-    // The list row's status line (mockup statusText): manual state, size, hidden.
+-    private func statusLine(_ el: HudElement) -> String {
+-        let s = effectiveSetting(el)
+-        var parts = [settings.isTransformed(el) ? "已手动调整" : "自动贴边", "\(Int((s?.k ?? 1) * 100))%"]
+-        if s?.hidden == true { parts.append("已隐藏") }
+-        return parts.joined(separator: " · ")
+-    }
+-
+-    // The selected element's tag: "{name} · {status}". The status is pink
+-    // (#ffb3c0) when manual or hidden, green (#9fe8bb) when auto (mockup .tag).
+-    private func tagStatus(_ el: HudElement) -> (text: String, color: Color) {
+-        let pink = Color(red: 255 / 255, green: 179 / 255, blue: 192 / 255)
+-        let green = Color(red: 159 / 255, green: 232 / 255, blue: 187 / 255)
+-        if effectiveSetting(el)?.hidden == true { return ("已隐藏 · 游戏内不显示", pink) }
+-        if settings.isTransformed(el) { return ("已手动调整", pink) }
+-        return ("自动贴边", green)
+-    }
+-
+-    private func tagView(for el: HudElement) -> some View {
+-        let st = tagStatus(el)
+-        return HStack(spacing: 0) {
+-            Text(el.tagName + " · ").font(.system(size: 12, weight: .bold)).foregroundStyle(.white)
+-            Text(st.text).font(.system(size: 12, weight: .semibold)).foregroundStyle(st.color)
+-        }
+-        .padding(.horizontal, 9).padding(.vertical, 6)
+-        .background(Color(red: 20 / 255, green: 24 / 255, blue: 28 / 255))
+-        .cornerRadius(7)
+-    }
+-
+-    private func toggleHidden(_ el: HudElement) {
+-        selected = el
+-        var cur = settings.effective(el) ?? HudElementSetting(dx: 0, dy: 0, k: 1, hidden: false)
+-        cur.hidden.toggle()
+-        settings.set(el, cur)
+-    }
+-
+-    // The preview's size, fitted inside the screen (0125): it must be fully
+-    // visible -- never cut off -- on every shape, in portrait and in
+-    // landscape. Before this the preview took the full width
+-    // (.frame(maxWidth: .infinity) + .aspectRatio(..., .fit)), so its height
+-    // was width / ratio: in landscape on an iPhone the iPad 4:3 preview was
+-    // ~675pt tall in a ~386pt viewport, and the top (coins) and the bottom
+-    // were cut off; only the widest (iPhone 19.5:9) shape fitted. Now the size
+-    // is the aspect rect fitted inside the available box: the width is the
+-    // container width minus the VStack's horizontal padding, the height is the
+-    // container height minus a reserve for the aspect picker and a peek of the
+-    // element list below the preview (the rest of the list and the controls
+-    // scroll), and the preview takes the smaller of the width-constrained and
+-    // height-constrained sizes, so neither dimension overflows. The device
+-    // frame scales with the preview (it is drawn on the same box), and the HUD
+-    // elements scale with the preview width (unit = preview.width / 100), so
+-    // the layout, drag, resize and hide behaviour are unchanged -- only the
+-    // overall scale changes. The container is read with a GeometryReader
+-    // outside the ScrollView (inside one it would see an unbounded height),
+-    // so a rotation re-fits the preview.
+-    private static func fittedPreviewSize(aspect: HudAspect, container: CGSize) -> CGSize {
+-        let availW = max(0, container.width - 32)
+-        let availH = max(0, container.height - 120)
+-        let w = min(availW, availH * CGFloat(aspect.ratio))
+-        return CGSize(width: w, height: w / CGFloat(aspect.ratio))
+-    }
+-
+-    var body: some View {
+-        NavigationStack {
+-            // The container (the viewport below the navigation bar) is read
+-            // here, outside the ScrollView: a GeometryReader inside the
+-            // ScrollView would see an unbounded height and could not bound
+-            // the preview. previewSize is the aspect rect fitted inside it
+-            // (fittedPreviewSize), so the preview is fully visible on every
+-            // shape; a rotation re-fits it.
+-            GeometryReader { outer in
+-                let previewSize = Self.fittedPreviewSize(aspect: aspect, container: outer.size)
+-                ScrollView {
+-                VStack(alignment: .leading, spacing: 16) {
+-                    // The preview, at the chosen shape, in the mockup's device
+-                    // frame: a thick black rounded border (1.1% of the preview
+-                    // width, 6-11pt) and a soft shadow. The frame is only the
+-                    // presentation; it never moves with an element.
+-                    GeometryReader { geo in
+-                        let preview = geo.size
+-                        let layout = aspect.layout
+-                        let unit = preview.width / 100
+-                        // Sizes first (em-driven), then positions -- the
+-                        // mockup's render() order.
+-                        let sizes = HudElement.allCases.reduce(into: [HudElement: CGSize]()) { m, el in
+-                            m[el] = HudElement.previewSize(el, k: effectiveSetting(el)?.k ?? 1, unit: unit)
+-                        }
+-                        let border = min(11, max(6, preview.width * 0.011))
+-                        ZStack {
+-                            if let bg = Self.backgroundImage(for: aspect) {
+-                                Image(uiImage: bg).resizable().scaledToFill()
+-                                    .frame(width: preview.width, height: preview.height)
+-                                    .clipped()
+-                            } else {
+-                                // Fallback when the photo is missing: the old
+-                                // drawn gradient, never a blank preview.
+-                                LinearGradient(colors: [Color(red: 0.16, green: 0.42, blue: 0.24), Color(red: 0.35, green: 0.62, blue: 0.30), Color(red: 0.55, green: 0.75, blue: 0.38)],
+-                                               startPoint: .topLeading, endPoint: .bottomTrailing)
+-                                RadialGradient(colors: [Color.white.opacity(0.28), Color.clear], center: .topTrailing, startRadius: 10, endRadius: preview.width * 0.7)
+-                                Text("M").font(.system(size: 90, weight: .black)).foregroundStyle(.white.opacity(0.25))
+-                            }
+-                            ForEach(HudElement.displayOrder) { el in
+-                                let s = effectiveSetting(el)
+-                                let hidden = s?.hidden == true
+-                                let frame = elementFrame(el, preview: preview, layout: layout, sizes: sizes)
+-                                let tagBelow = frame.minY < preview.height * 0.12
+-                                HudElementPreview(el: el, k: s?.k ?? 1, unit: unit)
+-                                    .opacity(hidden ? 0.38 : 1)
+-                                    .saturation(hidden ? 0.35 : 1)
+-                                    .background {
+-                                        if selected == el {
+-                                            RoundedRectangle(cornerRadius: 8)
+-                                                .fill(Color(red: 10 / 255, green: 14 / 255, blue: 10 / 255).opacity(0.18))
+-                                        }
+-                                    }
+-                                    .overlay {
+-                                        if selected == el {
+-                                            RoundedRectangle(cornerRadius: 8)
+-                                                .stroke(Color(red: 217 / 255, green: 4 / 255, blue: 41 / 255), lineWidth: 2)
+-                                                .padding(-1.5)
+-                                        }
+-                                    }
+-                                    .overlay {
+-                                        if selected == el {
+-                                            RoundedRectangle(cornerRadius: 10)
+-                                                .stroke(Color.white.opacity(0.85), lineWidth: 2)
+-                                                .padding(-3.5)
+-                                        }
+-                                    }
+-                                    .overlay(alignment: tagBelow ? .bottomLeading : .topLeading) {
+-                                        if selected == el { tagView(for: el).offset(y: tagBelow ? 30 : -30) }
+-                                    }
+-                                    .position(x: frame.midX, y: frame.midY)
+-                                    .offset(el == selected ? dragOffset : .zero)
+-                                    .onTapGesture { selected = el }
+-                                    .gesture(
+-                                        DragGesture().onChanged { v in
+-                                            selected = el; dragOffset = v.translation
+-                                        }.onEnded { v in
+-                                            // The drag (preview points, y down) into design points (y up): dx as-is, dy negated.
+-                                            // Start from the EFFECTIVE setting (an element following no fallback starts at 0).
+-                                            // (0144: design-space scales, 1280/preview.width and 720/preview.height --
+-                                            // the old single layout-width scale made the phone's dx 22% too large.)
+-                                            let sc = dragScale(preview: preview)
+-                                            var cur = settings.effective(el) ?? HudElementSetting(dx: 0, dy: 0, k: 1, hidden: false)
+-                                            cur.dx += Double(v.translation.width) * sc.width
+-                                            cur.dy -= Double(v.translation.height) * sc.height
+-                                            settings.set(el, cur)
+-                                            dragOffset = .zero
+-                                        }
+-                                    )
+-                            }
+-                        }
+-                        .clipShape(RoundedRectangle(cornerRadius: 26))
+-                        .overlay(RoundedRectangle(cornerRadius: 26).strokeBorder(Color(red: 20 / 255, green: 24 / 255, blue: 28 / 255), lineWidth: border))
+-                        .shadow(color: Color(red: 24 / 255, green: 42 / 255, blue: 22 / 255).opacity(0.16), radius: 38, x: 0, y: 16)
+-                    }
+-                    // Fixed to the fitted size (0125): the preview is the
+-                    // aspect rect inside the viewport, never wider or taller
+-                    // than it. The outer .frame(maxWidth: .infinity) centres
+-                    // it in the VStack when it is narrower than the screen.
+-                    .frame(width: previewSize.width, height: previewSize.height)
+-                    .frame(maxWidth: .infinity)
+-
+-                    // The four shapes: switching shape moves the auto-anchored
+-                    // elements to the new edges; a manually set one stays put.
+-                    Picker("预览比例", selection: $aspect) {
+-                        ForEach(HudAspect.allCases) { Text($0.name).tag($0) }
+-                    }
+-                    .pickerStyle(.segmented)
+-
+-                    // The element list, in display order: tap to select; the
+-                    // eye hides / shows that element. A manual element is
+-                    // marked 手动, a hidden one 已隐藏; auto has no badge.
+-                    VStack(spacing: 0) {
+-                        ForEach(HudElement.displayOrder) { el in
+-                            let hidden = effectiveSetting(el)?.hidden == true
+-                            HStack(spacing: 10) {
+-                                VStack(alignment: .leading, spacing: 2) {
+-                                    Text(el.name).font(.headline)
+-                                    Text(statusLine(el)).font(.caption).foregroundStyle(.secondary)
+-                                }
+-                                Spacer()
+-                                if hidden {
+-                                    Text("已隐藏").font(.caption.weight(.bold)).foregroundStyle(.white)
+-                                        .padding(.horizontal, 8).padding(.vertical, 4)
+-                                        .background(Color(red: 58 / 255, green: 63 / 255, blue: 58 / 255))
+-                                        .cornerRadius(999)
+-                                } else if settings.isTransformed(el) {
+-                                    Text("手动").font(.caption.weight(.bold)).foregroundStyle(.white)
+-                                        .padding(.horizontal, 8).padding(.vertical, 4)
+-                                        .background(Color(red: 217 / 255, green: 4 / 255, blue: 41 / 255))
+-                                        .cornerRadius(999)
+-                                }
+-                                Button { toggleHidden(el) } label: {
+-                                    Image(systemName: hidden ? "eye.slash" : "eye").font(.system(size: 18))
+-                                }
+-                                .buttonStyle(.plain)
+-                                .frame(width: 40, height: 40)
+-                                .accessibilityLabel(hidden ? "显示\(el.name)" : "隐藏\(el.name)")
+-                            }
+-                            .padding(.vertical, 8)
+-                            .padding(.horizontal, 6)
+-                            .background(selected == el ? Color.primary.opacity(0.08) : Color.clear)
+-                            .overlay(alignment: .leading) {
+-                                if selected == el {
+-                                    Color(red: 217 / 255, green: 4 / 255, blue: 41 / 255).frame(width: 3)
+-                                }
+-                            }
+-                            .contentShape(Rectangle())
+-                            .onTapGesture { selected = el }
+-                            Divider()
+-                        }
+-                    }
+-                    .padding(.horizontal, 4)
+-
+-                    // The selected element's controls.
+-                    Group {
+-                        VStack(alignment: .leading, spacing: 8) {
+-                            Text(selected.name).font(.headline)
+-                            let hidden = effectiveSetting(selected)?.hidden == true
+-                            Text(statusLine(selected) + (hidden ? "（游戏里不显示）" : ""))
+-                                .font(.subheadline).foregroundStyle(.secondary)
+-                            Text("大小").font(.headline)
+-                            let k = Binding(get: { effectiveSetting(selected)?.k ?? 1 }, set: { v in
+-                                var cur = settings.effective(selected) ?? HudElementSetting(dx: 0, dy: 0, k: 1, hidden: false)
+-                                cur.k = v; settings.set(selected, cur)
+-                            })
+-                            Slider(value: k, in: 0.6...1.8, step: 0.05)
+-                            HStack { Text("60%"); Spacer(); Text("\(Int((effectiveSetting(selected)?.k ?? 1) * 100))%").monospacedDigit(); Spacer(); Text("180%") }
+-                                .font(.caption).foregroundStyle(.secondary)
+-                        }
+-                        Button(effectiveSetting(selected)?.hidden == true ? "显示这个元素" : "隐藏这个元素") { toggleHidden(selected) }
+-                        if settings.isManual(selected) {
+-                            Button("恢复自动贴边") { settings.set(selected, nil) }
+-                        }
+-                        Button("全部恢复自动贴边", role: .destructive) { settings.resetAll() }
+-                            .disabled(!settings.anyManual)
+-                        Text("隐藏后游戏里不显示这个元素；在预览里它会变淡，方便你随时改回来。拖动或改大小后，该元素就不再跟随自动贴边。").font(.caption).foregroundStyle(.secondary)
+-                    }
+-                }
+-                .padding()
+-                }
+-                .navigationTitle("HUD 设置")
+-                .navigationBarTitleDisplayMode(.inline)
+-                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("完成") { dismiss() } } }
+-            }
+-        }
+-    }
+-}
+-
+-// MARK: - In-game HUD editor (0137)
+-//
+-// A compact panel presented OVER the running game (GameMenu -> "HUD 设置"),
+-// not the launcher's full editor: no preview photo, no drag -- the live game
+-// is the preview. Every change saves to UserDefaults AND pushes the env var
+-// at once (applyOneToEnvironment), so the host applies it on the next
+-// present and the HUD in the game moves/resizes/hides in real time.
+-// Position is adjusted with X/Y steppers (layout points, +/-10 per tap);
+-// size with a 60%-180% slider, like the launcher editor and the button
+-// settings. Hide is a TRUE hide (flags bit 0, hud_runtime.c), not off-screen.
+-// 0144: the in-game HUD editor, rebuilt as a drag editor like the pad
+-// ("按键设置") settings: the five elements are drawn on a preview of the
+-// device's own shape, tap one to select it, drag it to move it, a slider for
+-// the selected element's own size, and an eye toggle per element to show or
+-// hide it. Every change is applied live to the running game (update() calls
+-// settings.set + applyOneToEnvironment), so the HUD moves behind the sheet
+-// as you drag. The old list + X/Y steppers are gone (the user 2026-11-15
+-// 20:26: "做成和按键一样的设置"). The hints element is not shown (0144:
+-// hidden in the overlay); the preview reuses HudElementPreview and the
+-// launcher's elementFrame math, with the 0144 design-space drag scale
+-// (1280/preview.width, 720/preview.height).
+-struct HudGameEditorView: View {
+-    @ObservedObject var settings: HudSettings
+-    @State private var selected: HudElement = .coins
+-    @State private var dragOffset = CGSize.zero   // the in-progress drag, in preview points
+-    @Environment(\.dismiss) private var dismiss
+-
+-    private func cur(_ el: HudElement) -> HudElementSetting {
+-        settings.effective(el) ?? HudElementSetting(dx: 0, dy: 0, k: 1, hidden: false)
+-    }
+-    private func update(_ el: HudElement, _ s: HudElementSetting) {
+-        settings.set(el, s)
+-        settings.applyOneToEnvironment(el)
+-    }
+-    // The preview is the device's own shape (the game is running on this
+-    // device, so only its shape matters), fitted to the sheet's width.
+-    private func previewSize(container: CGSize) -> CGSize {
+-        let ratio = HudAspect.device().ratio
+-        let w = max(0, container.width - 32)
+-        return CGSize(width: w, height: w / CGFloat(ratio))
+-    }
+-    // The element's frame in preview points (the launcher's elementFrame,
+-    // design-space offset: preview.width/1280, preview.height/720).
+-    private func elementFrame(_ el: HudElement, preview: CGSize, sizes: [HudElement: CGSize]) -> CGRect {
+-        let size = sizes[el] ?? .zero
+-        var origin = HudElement.defaultTopLeft(el, preview: preview, sizes: sizes)
+-        if let s = settings.effective(el) {
+-            origin.x += CGFloat(s.dx) * preview.width / 1280
+-            origin.y -= CGFloat(s.dy) * preview.height / 720
+-        }
+-        let x = min(max(origin.x, 0), max(0, preview.width - size.width))
+-        let y = min(max(origin.y, 0), max(0, preview.height - size.height))
+-        return CGRect(origin: CGPoint(x: x, y: y), size: size)
+-    }
+-    private func statusLine(_ el: HudElement) -> String {
+-        let s = cur(el)
+-        var parts = ["\(Int(s.k * 100))%"]
+-        if s.dx != 0 || s.dy != 0 { parts.append("已移动") }
+-        if s.hidden { parts.append("已隐藏") }
+-        return parts.joined(separator: " · ")
+-    }
+-
+-    var body: some View {
+-        NavigationView {
+-            GeometryReader { outer in
+-                let preview = previewSize(container: outer.size)
+-                ScrollView {
+-                    VStack(alignment: .leading, spacing: 16) {
+-                        // The preview: a dark backdrop (the game is behind the
+-                        // sheet) with the five elements on it, draggable.
+-                        GeometryReader { geo in
+-                            let pv = geo.size
+-                            let unit = pv.width / 100
+-                            let sizes = HudElement.allCases.reduce(into: [HudElement: CGSize]()) { m, el in
+-                                m[el] = HudElement.previewSize(el, k: settings.effective(el)?.k ?? 1, unit: unit)
+-                            }
+-                            ZStack {
+-                                Color(red: 0.08, green: 0.10, blue: 0.09)
+-                                ForEach(HudElement.displayOrder) { el in
+-                                    let s = settings.effective(el)
+-                                    let hidden = s?.hidden == true
+-                                    let frame = elementFrame(el, preview: pv, sizes: sizes)
+-                                    HudElementPreview(el: el, k: s?.k ?? 1, unit: unit)
+-                                        .opacity(hidden ? 0.38 : 1)
+-                                        .saturation(hidden ? 0.35 : 1)
+-                                        .overlay {
+-                                            if selected == el {
+-                                                RoundedRectangle(cornerRadius: 8)
+-                                                    .stroke(Color.white.opacity(0.85), lineWidth: 2)
+-                                                    .padding(-1.5)
+-                                            }
+-                                        }
+-                                        .position(x: frame.midX, y: frame.midY)
+-                                        .offset(el == selected ? dragOffset : .zero)
+-                                        .onTapGesture { selected = el }
+-                                        .gesture(
+-                                            DragGesture().onChanged { v in
+-                                                selected = el; dragOffset = v.translation
+-                                            }.onEnded { v in
+-                                                let scX = 1280 / max(1, pv.width)
+-                                                let scY = 720 / max(1, pv.height)
+-                                                var n = cur(el)
+-                                                n.dx += Double(v.translation.width) * scX
+-                                                n.dy -= Double(v.translation.height) * scY
+-                                                update(el, n)
+-                                                dragOffset = .zero
+-                                            }
+-                                        )
+-                                }
+-                            }
+-                            .clipShape(RoundedRectangle(cornerRadius: 18))
+-                        }
+-                        .frame(width: preview.width, height: preview.height)
+-                        .frame(maxWidth: .infinity)
+-                        // The selected element: tap a chip to pick it, then the
+-                        // size slider, the eye toggle and the per-element reset.
+-                        HStack(spacing: 8) {
+-                            ForEach(HudElement.displayOrder) { el in
+-                                Button(action: { selected = el }) {
+-                                    HStack(spacing: 4) {
+-                                        Text(el.name).font(.system(size: 13, weight: .semibold))
+-                                        Image(systemName: cur(el).hidden ? "eye.slash" : "eye")
+-                                            .font(.system(size: 11))
+-                                            .foregroundStyle(cur(el).hidden ? .red : .blue)
+-                                    }
+-                                    .padding(.horizontal, 10).padding(.vertical, 6)
+-                                    .background(selected == el ? Color.blue.opacity(0.18) : Color.secondary.opacity(0.12))
+-                                    .cornerRadius(8)
+-                                }
+-                                .buttonStyle(.plain)
+-                            }
+-                        }
+-                        .frame(maxWidth: .infinity)
+-                        VStack(alignment: .leading, spacing: 12) {
+-                            let s = cur(selected)
+-                            HStack {
+-                                Text("大小")
+-                                Slider(value: Binding(
+-                                    get: { s.k },
+-                                    set: { v in var n = s; n.k = v; update(selected, n) }
+-                                ), in: 0.6...1.8, step: 0.05)
+-                                Text("\(Int(s.k * 100))%").frame(width: 52, alignment: .trailing)
+-                            }
+-                            HStack {
+-                                Text(statusLine(selected))
+-                                    .font(.subheadline).foregroundStyle(.secondary)
+-                                Spacer()
+-                                Button(action: {
+-                                    var n = cur(selected); n.hidden.toggle(); update(selected, n)
+-                                }) {
+-                                    Label(cur(selected).hidden ? "显示" : "隐藏", systemImage: cur(selected).hidden ? "eye" : "eye.slash")
+-                                }
+-                                .buttonStyle(.plain)
+-                                Button("恢复 \(selected.name) 默认") {
+-                                    settings.set(selected, nil)
+-                                    settings.applyOneToEnvironment(selected)
+-                                }
+-                                .foregroundStyle(.red)
+-                            }
+-                            Button("全部恢复默认") {
+-                                settings.resetAll()
+-                                settings.applyToEnvironment()
+-                            }
+-                            .foregroundStyle(.red)
+-                        }
+-                    }
+-                    .padding(.horizontal, 16)
+-                    .padding(.vertical, 12)
+-                }
+-            }
+-            .navigationTitle("HUD 设置")
+-            .navigationBarTitleDisplayMode(.inline)
+-            .toolbar {
+-                ToolbarItem(placement: .confirmationAction) {
+-                    Button("完成") { dismiss() }
+-                }
+-            }
+-        }
+-    }
+-}
+-
+-// The in-game menu's "HUD 设置": present the game editor over the running
+-// game. Mirrors the quit prompt's presentation (front_ios.m): walk to the
+-// topmost presented view controller and present a DmHostingController.
+-@_cdecl("dm_hud_open_game_editor")
+-public func dmHudOpenGameEditor() {
+-    DispatchQueue.main.async {
+-        guard let window = UIApplication.shared.connectedScenes
+-            .compactMap({ $0 as? UIWindowScene })
+-            .flatMap({ $0.windows })
+-            .first(where: { $0.isKeyWindow }),
+-            var vc = window.rootViewController else { return }
+-        while let p = vc.presentedViewController { vc = p }
+-        let editor = HudGameEditorView(settings: HudSettings())
+-        let host = DmHostingController(rootView: editor)
+-        host.modalPresentationStyle = .pageSheet
+-        vc.present(host, animated: true, completion: nil)
+-    }
+-}
+diff --git a/dm/ios/Sources/HudPadEditor.h b/dm/ios/Sources/HudPadEditor.h
+new file mode 100644
+index 0000000..004991a
+--- /dev/null
++++ b/dm/ios/Sources/HudPadEditor.h
+@@ -0,0 +1,30 @@
++// HudPadEditor.h -- the in-game HUD editor (0148).
++//
++// The pad-style HUD editor: the in-game menu's "HUD 设置" opens it over the
++// running game (the game keeps running behind it). Five elements, each its
++// own: compass (0), lives (1), coins icon + number (2), moons (3), regional
++// coins hexagon + number (5). Hints (4) and the white bar are not in the
++// editor: they are permanently hidden in the overlay, not editable.
++//
++// See HudPadEditor.m for the layout, the drag conversion and the migration.
++#pragma once
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++void dm_hud_pad_open_editor(void);   // GameMenu.swift: the in-game menu's "HUD 设置" opens the pad-style HUD editor
++void dm_hud_pad_apply_saved(void);   // Launcher.swift: before the game starts, the saved DmHudPad.* settings go into the DM_HUD_* environment
++#ifdef __cplusplus
++}
++#endif
++
++#import <UIKit/UIKit.h>
++
++// The editor itself: a full-screen transparent overlay on the key window.
++// The game shows through it; the five element handles and the settings bar
++// sit on top of the picture. Created by dm_hud_pad_open_editor, removed by
++// Done (closeEditor).
++@interface HudPadEditor : UIView <UIGestureRecognizerDelegate>
++- (void)openEditor;   // read the saved settings, apply them live, show the bar and the handles
++- (void)closeEditor;   // Done: save the settings and remove the editor
++@end
+diff --git a/dm/ios/Sources/HudPadEditor.m b/dm/ios/Sources/HudPadEditor.m
+new file mode 100644
+index 0000000..cb17f40
+--- /dev/null
++++ b/dm/ios/Sources/HudPadEditor.m
+@@ -0,0 +1,533 @@
++// HudPadEditor.m -- the in-game HUD editor (0148).
++//
++// The pad-style HUD editor (REPORT-HUD-REDO.md D.5): no SwiftUI, no popup.
++// It copies the button editor's structure (DmGamepad.m): a settings bar at
++// the top (title, size slider, eye toggle, Done, hint line) that drags by
++// its title or blank area, and the elements themselves as handles on the
++// game picture -- tap one to select it, drag it to move it. The game keeps
++// running behind the editor; every change goes live at once through the
++// DM_HUD_* environment (hud_manual.c re-reads getenv every present, so the
++// next frame shows it).
++//
++// Elements (the DM_HUD_* index is the raw value; hints (4) is not here):
++//   0 compass 指南针, 1 lives 生命, 2 coins 金币 (icon + number together),
++//   3 moons 月亮 (the dots row on its own), 5 regional 地区金币 (hexagon
++//   icon + number together). A hidden element shows dimmed (0.35) while the
++//   editor is open, so it can still be tapped to unhide it (0146's rule);
++//   once the editor closes it is fully hidden.
++//
++// Anchor rectangles (REPORT-HUD-REDO.md B.5), in chain space: X right, Y
++// up, origin at the layout centre. The layout is the device's own shape
++// (phone 1560x720, iPad 1280x960, 16:9 1280x720 -- the same rule as
++// (the old launcher preview's layout rule): the anchor's layout point is (layoutW/2 + chainX,
++// layoutH/2 - chainY), and the manual offset (dx, dy) adds to it in design
++// points. The moons row is thin (25 layout points tall), so its handle is
++// widened to 44 tall to stay grabbable; every handle is at least 44x44
++// view points.
++//
++// Drag conversion: the drag is measured in view points and converted to
++// the layout space the DM_HUD_* strings use (the layout is the device's
++// own shape: 1560x720 on the phone, 1280x960 on the iPad), because the
++// runtime adds dx 1:1 to the layout points:
++//   dragScale = layoutW / view.width, layoutH / view.height
++// (Verified values: a 100pt drag on a 350pt-wide phone-layout view is dx
++// 446; on the full-screen game view of an iPhone 15 Pro Max in landscape,
++// 932pt wide, 100pt -> dx 167 -- and 167 layout points render as exactly
++// 100 view points, so the element follows the finger 1:1. 0144 used the
++// 1280x720 design space instead, which on the phone made the element move
++// only 82% as far as the finger.) The handle position uses the exact
++// inverse (dx * view.width / layoutW), so the handle stays under the
++// finger while it is dragged.
++//
++// Persistence: one UserDefaults key per element, DmHudPad.<rawValue>, value
++// "dx,dy,k,hidden" (the same string the host parses). "完成" saves; opening
++// reads. An element at its default (0, 0, 1, shown) has no key and its
++// DM_HUD_* variable is unset, so the runtime leaves it on the overlay base
++// position and writes nothing for it (D.1: no manual value, no write).
++//
++// Migration (R1): the old keys DmHudManual.<rawValue> (6 of them) hold the
++// log-49 drag values, which emptied the coins/regional capture textures at
++// launch. They are deleted when the editor first opens AND when the saved
++// settings are applied at launch, so the old values can never reach the
++// runtime again.
++//
++// The text is Chinese: the user asked for the settings panel in Chinese
++// (the rest of the repository is English).
++#import "HudPadEditor.h"
++#import <Foundation/Foundation.h>
++#import <QuartzCore/QuartzCore.h>
++#import <math.h>
++#import <stdio.h>
++#import <stdlib.h>
++#import <string.h>
++
++enum { kHudPadCount = 5 };   // the editor's elements (DM_HUD_* indices 0, 1, 2, 3, 5; 4 = hints is not edited)
++static const int kHudPadElem[kHudPadCount] = {0, 1, 2, 3, 5};
++static const char *const kHudPadEnv[kHudPadCount] = {"DM_HUD_COMPASS", "DM_HUD_LIFE", "DM_HUD_COINS", "DM_HUD_MOONS", "DM_HUD_REGIONAL"};
++static NSString *const kHudPadNames[kHudPadCount] = {@"指南针", @"生命", @"金币", @"月亮", @"地区金币"};
++// Anchor rectangles, chain space (centre x, centre y, width, height):
++//   compass: PicMap 88x88 centred on All (696,157); lives: PicIcon 128x128
++//   centred on All (696,284); coins: icon+number bbox x 22..182 y 16..122
++//   in 1560x720 layout; regional: x 147..307 y 9..116; moons: dots row
++//   x 46..158 y 98..123, handle widened to 44 tall so it can be grabbed.
++static const double kHudPadAnchor[kHudPadCount][4] = {
++    {696, 157, 88, 88},
++    {696, 284, 128, 128},
++    {-678, 291, 160, 106},
++    {-678, 249.5, 112, 44},
++    {-553, 297.5, 160, 107},
++};
++static const double kHudPadKMin = 0.6, kHudPadKMax = 1.8;   // the size slider's range (hud_manual.c clamps k to the same)
++
++// One element's manual setting, encoded as "dx,dy,k,hidden" (dx, dy whole
++// points, k two decimals, hidden 1 / 0): the same string the host parses
++// from the DM_HUD_* environment variable, so the editor and the host agree.
++static NSString *hudPadEncode(double dx, double dy, double k, BOOL hidden) {
++    return [NSString stringWithFormat:@"%d,%d,%.2f,%d", (int)lround(dx), (int)lround(dy), k, hidden ? 1 : 0];
++}
++static BOOL hudPadDecode(NSString *s, double *dx, double *dy, double *k, BOOL *hidden) {
++    if (!s) return NO;
++    double x, y, kk; int h;
++    if (sscanf(s.UTF8String, "%lf,%lf,%lf,%d", &x, &y, &kk, &h) != 4) return NO;
++    *dx = fmin(fmax(x, -640), 640); *dy = fmin(fmax(y, -360), 360);   // hud_manual.c clamps dx/dy to the same
++    *k = (kk > 0) ? fmin(fmax(kk, kHudPadKMin), kHudPadKMax) : 1;
++    *hidden = h != 0;
++    return YES;
++}
++static BOOL hudPadIsDefault(double dx, double dy, double k, BOOL hidden) {
++    return dx == 0 && dy == 0 && k == 1 && !hidden;
++}
++static NSString *hudPadKey(int i) { return [NSString stringWithFormat:@"DmHudPad.%d", kHudPadElem[i]]; }
++
++// 0148: drop the old DmHudManual.* keys (6 of them, log-49's drag values):
++// they emptied the coins/regional capture textures at launch (R1), so they
++// must never reach the runtime again. Called on first open and on launch apply.
++static void hudPadMigrate(void) {
++    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
++    for (int r = 0; r < 6; r++) [d removeObjectForKey:[NSString stringWithFormat:@"DmHudManual.%d", r]];
++}
++
++// The layout size for the view's shape (the old launcher preview's rule): wider
++// than 16:9 keeps the height (720) and widens; taller keeps the width
++// (1280) and grows taller; 16:9 is 1280x720.
++static CGSize hudPadLayoutSize(CGSize view) {
++    CGFloat w = fmax(view.width, 1), h = fmax(view.height, 1);
++    CGFloat ratio = fmax(w, h) / fmax(1, fmin(w, h));
++    if (ratio > 1.78) return CGSizeMake(720 * ratio, 720);
++    if (ratio < 1.77) return CGSizeMake(1280, 1280 / ratio);
++    return CGSizeMake(1280, 720);
++}
++
++static HudPadEditor *g_editor;   // the open editor, if any (one at a time)
++
++@implementation HudPadEditor {
++    UIView *_editBar;              // the settings bar (hidden until the editor opens)
++    UISlider *_editSlider;         // the selected element's size, 0.6-1.8, live
++    UIButton *_editEye;            // 0146: the eye toggle for the selected element (tag 306)
++    UIView *_handles[kHudPadCount];   // one overlay handle per element (non-interactive: the view hit-tests them itself)
++    CALayer *_highlight;           // the ring around the selected handle (layoutEditHighlight's shape)
++    int _selected;                 // the element the slider and the eye tune (editor order 0..4)
++    double _dx[kHudPadCount], _dy[kHudPadCount], _k[kHudPadCount];   // the manual offsets (design points) and sizes
++    BOOL _hidden[kHudPadCount];    // the elements the player hid
++    CGPoint _panelPos;             // the bar's centre fraction (DmHudPadPanelPos), so it stays where it was dragged to
++    BOOL _panelDragging;           // a bar drag is in progress: the layout leaves its frame alone (0116)
++    UITouch *_dragTouch;           // the touch dragging a handle now, if any
++    int _dragElem;                 // the handle that touch is dragging
++    CGPoint _dragGrab;             // the finger's offset from the dragged handle's centre
++}
++
++- (instancetype)initWithFrame:(CGRect)frame {
++    self = [super initWithFrame:frame];
++    if (!self) return nil;
++    self.backgroundColor = [UIColor clearColor];   // the game shows through; only the bar and the handles cover it
++    _selected = 0;
++    for (int i = 0; i < kHudPadCount; i++) { _dx[i] = 0; _dy[i] = 0; _k[i] = 1; _hidden[i] = NO; }
++    [self loadPanelPos];
++    [self buildEditBar];
++    [self buildHandles];
++    return self;
++}
++
++- (void)layoutSubviews {
++    [super layoutSubviews];
++    [self layoutEditBar];
++    [self layoutHandles];
++    [self bringSubviewToFront:_editBar];   // the bar stays above the handles
++}
++
++// ---- Saved settings ----
++// Read the saved settings in (no key = the default: overlay base position,
++// shown). Called when the editor opens.
++- (void)loadSaved {
++    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
++    for (int i = 0; i < kHudPadCount; i++) {
++        _dx[i] = 0; _dy[i] = 0; _k[i] = 1; _hidden[i] = NO;
++        double x, y, k; BOOL h;
++        if (hudPadDecode([d stringForKey:hudPadKey(i)], &x, &y, &k, &h)) { _dx[i] = x; _dy[i] = y; _k[i] = k; _hidden[i] = h; }
++    }
++}
++// Done: save. A default element has no key (and no DM_HUD_* variable), so
++// the runtime leaves it on the overlay base position.
++- (void)save {
++    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
++    for (int i = 0; i < kHudPadCount; i++) {
++        if (hudPadIsDefault(_dx[i], _dy[i], _k[i], _hidden[i])) [d removeObjectForKey:hudPadKey(i)];
++        else [d setObject:hudPadEncode(_dx[i], _dy[i], _k[i], _hidden[i]) forKey:hudPadKey(i)];
++    }
++    fputs("hud editor: saved DmHudPad.* (HUD 设置已保存)\n", stderr);
++}
++
++// ---- Live channel ----
++// Push one element into the environment right now, so the host (which
++// re-reads the env vars every present) applies it on the next frame. A
++// default element is unset, so the game keeps its overlay base position.
++- (void)applyElement:(int)i {
++    if (hudPadIsDefault(_dx[i], _dy[i], _k[i], _hidden[i])) unsetenv(kHudPadEnv[i]);
++    else setenv(kHudPadEnv[i], hudPadEncode(_dx[i], _dy[i], _k[i], _hidden[i]).UTF8String, 1);
++}
++- (void)applyAll {
++    for (int i = 0; i < kHudPadCount; i++) [self applyElement:i];
++}
++
++// ---- Geometry ----
++// A drag in view points becomes a layout-space offset: the runtime adds
++// dx 1:1 to the layout points, so the scale is the layout size over the
++// view bounds. The preview here is the game view itself.
++- (CGPoint)dragScale {
++    CGSize L = hudPadLayoutSize(self.bounds.size);
++    return CGPointMake(L.width / fmax(1, self.bounds.size.width), L.height / fmax(1, self.bounds.size.height));
++}
++// The anchor's view point, before the manual offset: the layout point
++// (layoutW/2 + chainX, layoutH/2 - chainY) scaled to the view.
++- (CGPoint)anchorViewCentre:(int)i {
++    CGSize v = self.bounds.size, L = hudPadLayoutSize(v);
++    return CGPointMake((L.width / 2 + kHudPadAnchor[i][0]) * v.width / L.width,
++                       (L.height / 2 - kHudPadAnchor[i][1]) * v.height / L.height);
++}
++// The handle's centre now: the anchor plus the manual offset, converted
++// back to view points with the exact inverse of dragScale, so the handle
++// stays under the finger while it is dragged.
++- (CGPoint)handleCentre:(int)i {
++    CGPoint a = [self anchorViewCentre:i];
++    CGSize L = hudPadLayoutSize(self.bounds.size);
++    return CGPointMake(a.x + _dx[i] * self.bounds.size.width / L.width,
++                       a.y - _dy[i] * self.bounds.size.height / L.height);
++}
++// The handle's size in view points: the anchor rect, scaled by k and by
++// the layout-to-view scale, at least 44x44 so it stays grabbable.
++- (CGSize)handleSize:(int)i {
++    CGSize v = self.bounds.size, L = hudPadLayoutSize(v);
++    return CGSizeMake(fmax(kHudPadAnchor[i][2] * _k[i] * v.width / L.width, 44),
++                      fmax(kHudPadAnchor[i][3] * _k[i] * v.height / L.height, 44));
++}
++- (CGPoint)clampHandleCentre:(CGPoint)c size:(CGSize)s {   // the handle stays fully on screen, so an off-screen anchor (iPad) stays reachable
++    CGFloat W = self.bounds.size.width, H = self.bounds.size.height, m = 4;
++    CGFloat loX = s.width / 2 + m, hiX = W - s.width / 2 - m, loY = s.height / 2 + m, hiY = H - s.height / 2 - m;
++    if (hiX < loX) c.x = W / 2; else c.x = fmin(fmax(c.x, loX), hiX);
++    if (hiY < loY) c.y = H / 2; else c.y = fmin(fmax(c.y, loY), hiY);
++    return c;
++}
++
++// ---- The settings bar (buildEditBar's shape, without the glass slider) ----
++// The bar's stored position (DmHudPadPanelPos): the centre fraction, so it
++// stays where it was dragged to. It opens at the bottom centre, clear of
++// the HUD row at the top.
++static NSString *const kHudPadPanelPosKey = @"DmHudPadPanelPos";
++static const CGFloat kHudPadPanelDefault[2] = {0.50, 0.82};
++- (void)loadPanelPos {
++    _panelPos = CGPointMake(kHudPadPanelDefault[0], kHudPadPanelDefault[1]);
++    NSDictionary *d = [NSUserDefaults.standardUserDefaults dictionaryForKey:kHudPadPanelPosKey];
++    NSArray *v = [d isKindOfClass:[NSDictionary class]] ? d[@"hud"] : nil;
++    if ([v isKindOfClass:[NSArray class]] && v.count == 2 && [v[0] isKindOfClass:[NSNumber class]] && [v[1] isKindOfClass:[NSNumber class]])
++        _panelPos = CGPointMake(fmin(fmax([v[0] doubleValue], 0), 1), fmin(fmax([v[1] doubleValue], 0), 1));
++}
++- (void)savePanelPos {
++    [NSUserDefaults.standardUserDefaults setObject:@{@"hud": @[@(_panelPos.x), @(_panelPos.y)]} forKey:kHudPadPanelPosKey];
++}
++- (CGPoint)clampPanelCentre:(CGPoint)c size:(CGSize)s {   // a bar's centre, clamped so the whole bar stays inside the view (its Done button stays reachable)
++    CGFloat W = self.bounds.size.width, H = self.bounds.size.height, m = 4;
++    CGFloat loX = s.width / 2 + m, hiX = W - s.width / 2 - m, loY = s.height / 2 + m, hiY = H - s.height / 2 - m;
++    if (hiX < loX) c.x = W / 2; else c.x = fmin(fmax(c.x, loX), hiX);
++    if (hiY < loY) c.y = H / 2; else c.y = fmin(fmax(c.y, loY), hiY);
++    return c;
++}
++- (CGPoint)panelCentre:(CGSize)s {   // the bar's centre from its stored fraction, clamped inside the view
++    return [self clampPanelCentre:CGPointMake(_panelPos.x * self.bounds.size.width, _panelPos.y * self.bounds.size.height) size:s];
++}
++- (void)panelPan:(UIPanGestureRecognizer *)pan {   // drag the settings bar: it follows the finger, and stays where it is left
++    UIView *bar = pan.view;
++    if (pan.state == UIGestureRecognizerStateBegan || pan.state == UIGestureRecognizerStateChanged) {
++        _panelDragging = YES;
++        CGPoint d = [pan translationInView:self];
++        [pan setTranslation:CGPointZero inView:self];
++        bar.center = [self clampPanelCentre:CGPointMake(bar.center.x + d.x, bar.center.y + d.y) size:bar.bounds.size];
++    } else {
++        _panelDragging = NO;
++        if (pan.state == UIGestureRecognizerStateEnded || pan.state == UIGestureRecognizerStateCancelled) {
++            _panelPos = CGPointMake(fmin(fmax(bar.center.x / fmax(self.bounds.size.width, 1), 0), 1), fmin(fmax(bar.center.y / fmax(self.bounds.size.height, 1), 0), 1));
++            [self savePanelPos];
++        }
++    }
++}
++- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g shouldReceiveTouch:(UITouch *)t {   // a slider or a button keeps its own touch; the bar's background, title and hint start a drag
++    (void)g;
++    return ![t.view isKindOfClass:[UIControl class]];
++}
++
++// The settings bar: title, size slider, eye toggle, Done, and a hint line
++// below. No glass slider: that belongs to the button settings, not the HUD.
++- (void)buildEditBar {
++    _editBar = [[UIView alloc] init];
++    _editBar.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
++    _editBar.layer.cornerRadius = 10;
++    _editBar.hidden = YES;
++    UILabel *title = [[UILabel alloc] init]; title.tag = 301;
++    title.text = @"HUD 设置"; title.textColor = UIColor.whiteColor; title.font = [UIFont boldSystemFontOfSize:15]; title.textAlignment = NSTextAlignmentCenter;
++    [_editBar addSubview:title];
++    UILabel *size = [[UILabel alloc] init]; size.tag = 302;
++    size.text = @"大小"; size.textColor = UIColor.whiteColor; size.font = [UIFont systemFontOfSize:13]; size.textAlignment = NSTextAlignmentRight;
++    [_editBar addSubview:size];
++    _editSlider = [[UISlider alloc] init];
++    _editSlider.minimumValue = kHudPadKMin; _editSlider.maximumValue = kHudPadKMax; _editSlider.value = 1;   // the compass is selected by default (openEditor)
++    [_editSlider addTarget:self action:@selector(editSliderChanged:) forControlEvents:UIControlEventValueChanged];
++    [_editBar addSubview:_editSlider];
++    _editEye = [UIButton buttonWithType:UIButtonTypeSystem]; _editEye.tag = 306;   // 0146: the eye toggle: hides / shows the selected element
++    [_editEye addTarget:self action:@selector(editEyeTapped:) forControlEvents:UIControlEventTouchUpInside];
++    [_editBar addSubview:_editEye];
++    [self updateEditEye];
++    UIButton *done = [UIButton buttonWithType:UIButtonTypeSystem]; done.tag = 303;
++    [done setTitle:@"完成" forState:UIControlStateNormal]; done.titleLabel.font = [UIFont boldSystemFontOfSize:15];
++    [done addTarget:self action:@selector(closeEditor) forControlEvents:UIControlEventTouchUpInside];
++    [_editBar addSubview:done];
++    UILabel *hint = [[UILabel alloc] init]; hint.tag = 304; hint.numberOfLines = 2;
++    hint.text = @"当前：指南针\n拖动元素可以移动位置 · 拖动面板可以移动面板"; hint.textColor = UIColor.whiteColor; hint.font = [UIFont systemFontOfSize:12]; hint.textAlignment = NSTextAlignmentCenter;
++    [_editBar addSubview:hint];
++    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(panelPan:)];   // the bar drags by its title or blank area (0116); a slider or the Done button keeps its own touch
++    pan.delegate = self;
++    [_editBar addGestureRecognizer:pan];
++    [self addSubview:_editBar];
++    _highlight = [CAShapeLayer layer];   // the ring around the selected handle (the slider's target): on top of the handles, hidden until the editor opens
++    _highlight.fillColor = [UIColor colorWithWhite:1 alpha:0.08].CGColor;
++    _highlight.strokeColor = [UIColor colorWithWhite:1 alpha:0.85].CGColor; _highlight.lineWidth = 2;
++    _highlight.shadowColor = UIColor.blackColor.CGColor; _highlight.shadowOpacity = 0.2; _highlight.shadowRadius = 3; _highlight.shadowOffset = CGSizeMake(0, 1);
++    _highlight.hidden = YES;
++    [self.layer addSublayer:_highlight];
++}
++- (void)layoutEditBar {   // the bar's rows (title, size label, slider, eye, Done), the hint below, where it was dragged to (or its default at the bottom centre)
++    if (!_editBar) return;
++    CGFloat w = fmin(self.bounds.size.width * 0.8, 480), h = 108;
++    if (!_panelDragging) {   // a drag in progress keeps the bar under the finger; the rows below still follow the width
++        CGPoint c = [self panelCentre:CGSizeMake(w, h)];
++        _editBar.frame = CGRectMake(c.x - w / 2, c.y - h / 2, w, h);
++    }
++    CGFloat x = 12, doneW = 48, eyeW = 36;
++    UIView *title = [_editBar viewWithTag:301]; title.frame = CGRectMake(x, 8, 80, 24); x += 88;
++    UIView *size = [_editBar viewWithTag:302]; size.frame = CGRectMake(x, 8, 32, 24); x += 36;
++    _editSlider.frame = CGRectMake(x, 10, w - x - eyeW - doneW - 12 - 8 - 12, 20);
++    _editEye.frame = CGRectMake(w - doneW - 12 - eyeW - 8, 8, eyeW, 24);   // 0146: the eye toggle, between the size slider and Done
++    UIView *done = [_editBar viewWithTag:303]; done.frame = CGRectMake(w - doneW - 12, 8, doneW, 24);
++    UIView *hint = [_editBar viewWithTag:304]; hint.frame = CGRectMake(0, 66, w, 34);
++}
++
++// ---- The element handles ----
++// One handle per element: a translucent rounded box with the element's
++// name. The handles are not interactive themselves: the editor view
++// hit-tests them in its touch methods (DmGamepad.m's way), so a drag that
++// starts on a handle is one gesture from tap to move.
++- (void)buildHandles {
++    for (int i = 0; i < kHudPadCount; i++) {
++        UIView *h = [[UIView alloc] init];
++        h.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.12];
++        h.layer.cornerRadius = 10;
++        h.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.35].CGColor; h.layer.borderWidth = 1;
++        h.userInteractionEnabled = NO;
++        h.hidden = YES;
++        UILabel *name = [[UILabel alloc] init];
++        name.text = kHudPadNames[i]; name.textColor = UIColor.whiteColor; name.font = [UIFont boldSystemFontOfSize:13]; name.textAlignment = NSTextAlignmentCenter;
++        name.backgroundColor = [UIColor clearColor];
++        [h addSubview:name];
++        _handles[i] = h;
++        [self addSubview:h];
++    }
++    if (_highlight) [self.layer addSublayer:_highlight];   // the ring sits above the handle layers (a re-add moves it to the top)
++}
++- (void)layoutHandles {   // each handle sits on its element now (anchor + manual offset, scaled by k), a hidden one dimmed so it stays tappable
++    for (int i = 0; i < kHudPadCount; i++) {
++        UIView *h = _handles[i];
++        if (!h) continue;
++        CGSize s = [self handleSize:i];
++        CGPoint c = [self clampHandleCentre:[self handleCentre:i] size:s];
++        h.frame = CGRectMake(c.x - s.width / 2, c.y - s.height / 2, s.width, s.height);
++        h.alpha = _hidden[i] ? 0.35 : 1;   // 0146: a hidden element shows dimmed while the editor is open, so it can be tapped to unhide it
++        UILabel *name = (UILabel *)[h.subviews firstObject];
++        name.frame = h.bounds;
++    }
++    [self layoutHighlight];
++}
++- (void)layoutHighlight {   // the ring around the selected handle while the editor is open
++    if (!_highlight) return;
++    BOOL show = !_editBar.hidden;
++    _highlight.hidden = !show;
++    if (!show) return;
++    UIView *h = _handles[_selected];
++    if (!h) { _highlight.hidden = YES; return; }
++    CGRect r = CGRectInset(h.frame, -4, -4);
++    [CATransaction begin]; [CATransaction setDisableActions:YES];
++    _highlight.frame = r;
++    CGMutablePathRef path = CGPathCreateWithRoundedRect(CGRectMake(0, 0, r.size.width, r.size.height), 12, 12, NULL);
++    _highlight.path = path;
++    CGPathRelease(path);
++    [CATransaction commit];
++}
++
++// ---- Selection, slider, eye ----
++- (void)selectElement:(int)i {   // tap a handle in the editor: it becomes the one the slider tunes
++    if (i < 0 || i >= kHudPadCount) return;
++    _selected = i;
++    _editSlider.value = _k[i];
++    [self updateEditEye];   // 0146: the eye for this element
++    [self updateHint];
++    [self layoutHandles];   // refreshes the highlight ring
++}
++- (void)updateHint {
++    UILabel *hint = (UILabel *)[_editBar viewWithTag:304];
++    hint.text = [NSString stringWithFormat:@"当前：%@ · %d%%%@\n拖动元素可以移动位置 · 拖动面板可以移动面板",
++                 kHudPadNames[_selected], (int)lround(_k[_selected] * 100), _hidden[_selected] ? @" · 已隐藏" : @""];
++}
++- (void)editSliderChanged:(UISlider *)s {   // the size slider: resize the selected element only, live
++    _k[_selected] = fmin(fmax(s.value, kHudPadKMin), kHudPadKMax);
++    [self applyElement:_selected];
++    [self layoutHandles];
++    [self updateHint];
++}
++// 0146: the eye toggle for the selected element: eye (shown) or eye.slash (hidden, red).
++- (void)updateEditEye {
++    if (!_editEye) return;
++    BOOL hidden = _hidden[_selected];
++    [_editEye setImage:[UIImage systemImageNamed:hidden ? @"eye.slash" : @"eye"] forState:UIControlStateNormal];
++    _editEye.tintColor = hidden ? UIColor.systemRedColor : UIColor.whiteColor;
++}
++- (void)editEyeTapped:(UIButton *)b {   // 0146: hide / show the selected element
++    (void)b;
++    _hidden[_selected] = !_hidden[_selected];
++    [self applyElement:_selected];
++    [self layoutHandles];   // the element hides at once, or shows dimmed so it stays tappable
++    [self updateEditEye];
++    [self selectElement:_selected];   // refreshes the hint (now shows 已隐藏) and the highlight
++}
++
++// ---- Handle touches ----
++// The handle under a point, or -1. Handles can overlap (coins and regional
++// share a strip on the left), so among the handles covering the point the
++// one whose centre is nearest wins.
++- (int)handleAt:(CGPoint)p {
++    int best = -1; CGFloat bestD = 0;
++    for (int i = 0; i < kHudPadCount; i++) {
++        UIView *h = _handles[i];
++        if (!h || h.hidden) continue;
++        if (!CGRectContainsPoint(h.frame, p)) continue;
++        CGFloat d = hypot(p.x - CGRectGetMidX(h.frame), p.y - CGRectGetMidY(h.frame));
++        if (best < 0 || d < bestD) { best = i; bestD = d; }
++    }
++    return best;
++}
++- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
++    (void)event;
++    if (_dragTouch) return;   // one drag at a time
++    UITouch *t = [touches anyObject];
++    if (!t) return;
++    CGPoint p = [t locationInView:self];
++    int e = [self handleAt:p];
++    if (e < 0) return;   // a tap on empty picture does nothing (and stays inside the editor: the pad underneath gets no press while editing)
++    [self selectElement:e];   // a tap selects the handle (the drag below still starts, as before)
++    _dragTouch = t; _dragElem = e;
++    CGPoint cur = [self handleCentre:e];
++    _dragGrab = CGPointMake(p.x - cur.x, p.y - cur.y);   // the finger's offset from the handle's centre
++}
++- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
++    (void)event;
++    UITouch *t = [touches anyObject];
++    if (!t || t != _dragTouch) return;
++    CGPoint p = [t locationInView:self];
++    CGSize hs = [self handleSize:_dragElem];
++    CGPoint c = CGPointMake(p.x - _dragGrab.x, p.y - _dragGrab.y);   // the handle's new centre, the finger's offset kept
++    c = [self clampHandleCentre:c size:hs];   // stay fully on screen
++    CGPoint sc = [self dragScale];   // view points -> layout points
++    CGPoint a = [self anchorViewCentre:_dragElem];
++    _dx[_dragElem] = fmin(fmax((c.x - a.x) * sc.x, -640), 640);
++    _dy[_dragElem] = fmin(fmax(-(c.y - a.y) * sc.y, -360), 360);
++    [self applyElement:_dragElem];   // live: the next frame shows the move
++    [self layoutHandles];
++}
++- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
++    (void)event;
++    UITouch *t = [touches anyObject];
++    if (t && t == _dragTouch) _dragTouch = nil;
++}
++- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
++    (void)event;
++    UITouch *t = [touches anyObject];
++    if (t && t == _dragTouch) _dragTouch = nil;
++}
++
++// ---- Open / close ----
++- (void)openEditor {   // the in-game menu's "HUD 设置": show the editor over the running game
++    hudPadMigrate();   // first open: the old DmHudManual.* keys go, so they can never empty the capture textures again
++    [self loadSaved];
++    [self applyAll];   // the saved values go live at once, so the editor shows what the game shows
++    _editBar.hidden = NO;
++    for (int i = 0; i < kHudPadCount; i++) _handles[i].hidden = NO;
++    [self selectElement:0];   // the compass is selected by default, so the slider always has a target
++    [self setNeedsLayout];
++    fputs("hud editor: opened (HUD 设置已打开，拖动元素改位置，大小滑块 0.6-1.8，眼睛隐藏/显示)\n", stderr);
++}
++- (void)closeEditor {   // Done: save the settings and go back to playing (the env vars stay set, so a hidden element stays hidden)
++    [self save];
++    g_editor = nil;
++    [self removeFromSuperview];
++}
++@end
++
++// The in-game menu's "HUD 设置": put the editor over the running game.
++// Mirrors the quit prompt's presentation (front_ios.m) and the old
++// in-game editor: walk to the key window and add the editor to it, so
++// it sits above the game and the gamepad.
++void dm_hud_pad_open_editor(void) {
++    dispatch_async(dispatch_get_main_queue(), ^{
++        if (g_editor) return;   // already open
++        UIWindow *w = nil;
++        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
++            if (![s isKindOfClass:[UIWindowScene class]]) continue;
++            for (UIWindow *win in ((UIWindowScene *)s).windows) if (win.isKeyWindow) { w = win; break; }
++            if (w) break;
++        }
++        if (!w) w = [UIApplication sharedApplication].keyWindow;
++        if (!w) return;
++        HudPadEditor *e = [[HudPadEditor alloc] initWithFrame:w.bounds];
++        e.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
++        g_editor = e;
++        [w addSubview:e];
++        [e openEditor];
++    });
++}
++
++// Launcher.swift: before the game starts, the saved DmHudPad.* settings
++// go into the DM_HUD_* environment (the old launcher's applyToEnvironment
++// did this for DmHudManual.*). The old keys are deleted here too, so a
++// launch never re-applies the log-49 values that emptied the capture
++// textures. A default element is unset, so the game keeps its overlay base.
++void dm_hud_pad_apply_saved(void) {
++    hudPadMigrate();
++    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
++    for (int i = 0; i < kHudPadCount; i++) {
++        double x, y, k; BOOL h;
++        NSString *s = [d stringForKey:hudPadKey(i)];
++        if (hudPadDecode(s, &x, &y, &k, &h) && !hudPadIsDefault(x, y, k, h)) {
++            setenv(kHudPadEnv[i], hudPadEncode(x, y, k, h).UTF8String, 1);
++            fputs("launcher: ", stderr); fputs(kHudPadEnv[i], stderr);
++            fprintf(stderr, "=%s (HUD editor)\n", hudPadEncode(x, y, k, h).UTF8String);
++        } else {
++            unsetenv(kHudPadEnv[i]);
++        }
++    }
++}
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index 4ebf576..db24a34 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -153,8 +153,6 @@ private struct DocumentPicker: UIViewControllerRepresentable {
+ 
+ private struct LauncherView: View {
+     @ObservedObject var m: LauncherModel
+-    @ObservedObject var hud: HudSettings   // the HUD editor's settings (HudEditor.swift)
+-    @State private var showingHud = false
+     let play: () -> Void
+     @State private var memory = os_proc_available_memory()
+ 
+@@ -192,12 +190,6 @@ private struct LauncherView: View {
+                     } footer: {
+                         Text(LauncherText.text("ui.resetDefaultsNote", "Brings back all settings this game was tested with."))
+                     }
+-                    Section(header: Text("HUD"),
+-                            footer: Text(hud.anyManual ? "已有手动 HUD 设置，优先于自动贴边。" : "预览游戏画面里的金币、月亮、生命和指南针：拖动改位置，调大小，隐藏后游戏里也不显示。默认自动贴边。")) {
+-                        Button("HUD 设置") { showingHud = true }
+-                            // The sheet sits on the button, not on the Section: SwiftUI hands a Section's modifiers to every row, so one tap presented a picker per row and they invalidated each other (LNPANDY/NX2Apple#315).
+-                            .sheet(isPresented: $showingHud) { HudEditorView(settings: hud) }
+-                    }
+                     GameDataSection()
+                     CloudSavesSection()
+                     Section {
+@@ -246,15 +238,14 @@ public func dmShowLauncher(_ viewController: UnsafeMutableRawPointer, _ done: @c
+     // env key, falling back to the English in launcher.json.
+     let model = LauncherModel(LauncherText.localizedSettings(file.settings))
+     gameMenuModel = model   // the in-game menu shows and saves the same choices (GameMenu.swift)
+-    let hud = HudSettings()   // the HUD editor's settings (HudEditor.swift); its applyToEnvironment() goes in both start paths below
+-    if ProcessInfo.processInfo.environment["DM_LAUNCHER"] == "0" { fputs("launcher: off (DM_LAUNCHER=0)\n", stderr); model.applySaved(); hud.applyToEnvironment(); return false }
++    if ProcessInfo.processInfo.environment["DM_LAUNCHER"] == "0" { fputs("launcher: off (DM_LAUNCHER=0)\n", stderr); model.applySaved(); dm_hud_pad_apply_saved(); return false }
+     let parent = Unmanaged<UIViewController>.fromOpaque(viewController).takeUnretainedValue()
+     var host: UIViewController?
+-    let view = LauncherView(m: model, hud: hud) {
++    let view = LauncherView(m: model) {
+         guard let h = host else { return }
+         host = nil
+         model.apply()
+-        hud.applyToEnvironment()
++        dm_hud_pad_apply_saved()
+         h.dismiss(animated: false) { done() }
+     }
+     let h = DmHostingController(rootView: view)
+-- 
+2.43.0
+
