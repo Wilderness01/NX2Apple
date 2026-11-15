@@ -105,3 +105,6 @@
 0144-hud-editor-design-space-drag.patch
 0145-hud-matcher-coins-icon-moon-dots.patch
 0146-pad-settings-show-hide-eye.patch
+0147-hud-runtime-layout-aware-matcher.patch
+0148-hud-pad-editor.patch
+0149-hud-overlay-menu-map-hints.patch
