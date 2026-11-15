@@ -101,3 +101,7 @@
 0140-hud-game-editor-swift-name.patch
 0141-hud-overlay-szs-in-place.patch
 0142-hud-global-absolute-target.patch
+0143-hud-overlay-compass-whitebar-hints.patch
+0144-hud-editor-design-space-drag.patch
+0145-hud-matcher-coins-icon-moon-dots.patch
+0146-pad-settings-show-hide-eye.patch
