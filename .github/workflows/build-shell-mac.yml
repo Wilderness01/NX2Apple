@@ -39,20 +39,21 @@
 # 4. 谷歌云盘上传已去掉（2026-11-08）：最后一步不再往谷歌云盘传 IPA，
 #    跑完出一个 GitHub Artifact（SuperMarioOdyssey-V1.3.19），老大直接从那下载。
 #    原因：服务账号自己没有云盘存储空间，rclone 会报 403 storageQuotaExceeded，
-#    且 GDRIVE_SA_KEY 已删。NSP 输入仍从谷歌云盘下载（gdown），那步不动。
+#    且 GDRIVE_SA_KEY 已删。NSP 输入改走 rclone + 自有 Client ID（RCLONE_CONFIG Secret），
+#    不再用 gdown 公开链接（公开下载有单文件配额锁，#50 死在这）。
 name: Build NX2Apple single-game IPA (iPhone, manual)
 
 on:
   workflow_dispatch:
     inputs:
-      drive_base_id:
-        description: "Google Drive 文件 ID：本体 NSP（链接里 /d/ 后面那串）"
+      drive_base_path:
+        description: "Google Drive 路径：本体 NSP（rclone gdrive: 后面的路径）"
         required: true
-        default: "18WXMdiLFF6FXuvcn5eSnkl5BJltpzCwZ"
-      drive_update_id:
-        description: "Google Drive 文件 ID：更新 NSP v393216（链接里 /d/ 后面那串）"
+        default: "马里奥奥德赛/本体.nsp"
+      drive_update_path:
+        description: "Google Drive 路径：更新 NSP（rclone gdrive: 后面的路径）"
         required: true
-        default: "1M-8AIkLR-5gAvFfxEqJ0TMDNRsIggK-G"
+        default: "马里奥奥德赛/升级包.nsp"
 
 permissions:
   contents: read
@@ -82,17 +83,25 @@ jobs:
           set -euo pipefail
           python3 -m venv .venv
           .venv/bin/python -m pip install -U pip
-          .venv/bin/python -m pip install lz4 capstone fonttools zbic nsz "backports.zstd; python_version < '3.14'" gdown
+          .venv/bin/python -m pip install lz4 capstone fonttools zbic nsz "backports.zstd; python_version < '3.14'"
 
-      - name: Download NSPs from Google Drive
+      - name: Download NSPs from Google Drive (rclone)
         env:
-          BASE_ID: ${{ inputs.drive_base_id }}
-          UPDATE_ID: ${{ inputs.drive_update_id }}
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+          BASE_PATH: ${{ inputs.drive_base_path }}
+          UPDATE_PATH: ${{ inputs.drive_update_path }}
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/game"
-          .venv/bin/python -m gdown "$BASE_ID" -O "$RUNNER_TEMP/game/base.nsp"
-          .venv/bin/python -m gdown "$UPDATE_ID" -O "$RUNNER_TEMP/game/update.nsp"
+          # rclone + 自有 Client ID 走 Drive API，不走 gdown 公开链接：
+          # 公开下载有单文件配额锁（#50 死在这），API 路线是 GCP 项目每天 1TB 出站，
+          # 两个 NSP 约 6GB，远碰不到上限。--transfers 2 --checkers 4 防单秒查询率限制。
+          test -n "$RCLONE_CONFIG"
+          brew install rclone
+          mkdir -p ~/.config/rclone "$RUNNER_TEMP/game"
+          printf '%s' "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+          rclone copy "gdrive:$BASE_PATH" "$RUNNER_TEMP/game/base.nsp" --transfers 2 --checkers 4 --progress
+          rclone copy "gdrive:$UPDATE_PATH" "$RUNNER_TEMP/game/update.nsp" --transfers 2 --checkers 4 --progress
           ls -lh "$RUNNER_TEMP/game/"
           # 本体约 5.2GB、更新约 379MB；下到确认页/小文件就直接失败，别往下编
           test "$(stat -f%z "$RUNNER_TEMP/game/base.nsp")" -gt 1000000000
