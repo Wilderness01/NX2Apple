@@ -1,0 +1,243 @@
+From 27538bb04a6077a95f88e11bf4a29b45c4a7019b Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Sun, 15 Nov 2026 20:57:20 +0800
+Subject: [PATCH] 0146: button settings get a show/hide eye toggle per icon
+
+---
+ dm/ios/Sources/DmGamepad.m | 99 +++++++++++++++++++++++++++++++++-----
+ 1 file changed, 88 insertions(+), 11 deletions(-)
+
+diff --git a/dm/ios/Sources/DmGamepad.m b/dm/ios/Sources/DmGamepad.m
+index ce16625..1ac3ebb 100644
+--- a/dm/ios/Sources/DmGamepad.m
++++ b/dm/ios/Sources/DmGamepad.m
+@@ -12,7 +12,7 @@
+ //   Touch-down ownership (dm_pad_menu_takes and dm_pad_hit in DmPadGeometry.h): the menu button where it is nearer than a locked key (a view of its own, DmMenuButton), locked keys next (shoulders, − / +, L3 / R3), the jump and photo buttons next, then whichever of the diamond and the left stick has the smallest distance / grab radius (the left half holds the floating stick),
+ //     then in 3D the right stick for a touch in the right third. X, ZR, R, L3, R3 and the D-pad are hidden and disabled: a touch on one of them falls through to the floating stick (left half) or the right stick (right third) instead.
+ //   The player can move single controls in the shell's settings (DM_TOUCH_LAYOUT, one arrangement per layout): the geometry places each only where it fits and keeps the rest where they were.
+-//   The in-game menu's "按键设置" (button settings) opens a panel above the game: tapping an icon selects it, a slider for the selected icon's own size and dragging the icons to move them, saved per icon in NSUserDefaults (DmPadLineLayout) so it survives a restart; and a slider for the glass effect's strength (0-100%, the game's own setting, NSUserDefaults DmPadGlassOpacity): 70% is the look as shipped, 100% is the deepest the glass gets.
++//   The in-game menu's "按键设置" (button settings) opens a panel above the game: tapping an icon selects it, a slider for the selected icon's own size and dragging the icons to move them, saved per icon in NSUserDefaults (DmPadLineLayout) so it survives a restart; and a slider for the glass effect's strength (0-100%, the game's own setting, NSUserDefaults DmPadGlassOpacity): 70% is the look as shipped, 100% is the deepest the glass gets. 0146: an eye toggle in the panel hides / shows the selected icon (hidden icons are not drawn and cannot be pressed; the menu gear is never hideable, so the eye is disabled for it); while the panel is open a hidden icon is shown dimmed, so it can be tapped to unhide it.
+ //   Everything hugs the edges and corners to leave the picture room; each control is one
+ //   image layer (dm/ios/Sources/PadIcons/pad_line_*.png, the line set, bundled as resources):
+ //   the artwork never changes on press (no pressed state), only the left stick's knob moves,
+@@ -173,11 +173,13 @@ static void pads_start(void);   // Physical controllers, below
+     CGPoint _lCentre;                              // the floating left stick's centre: where its touch landed
+     CGFloat _lineScale;                            // the legacy global size (migration default): 0.7 to 3.0, 1 is built-in; the slider no longer changes it
+     CGFloat _lineSizes[E_N];                       // each movable icon's own size, 0.7 to 3.0 (NSUserDefaults DmPadLineLayout "sizes")
++    BOOL _lineHidden[E_N];                         // 0146: a movable icon the player hid in the button settings (NSUserDefaults DmPadLineLayout "hidden"); hidden icons are not drawn and cannot be pressed; the menu (gear) is never hidden
+     int _editSelected;                             // the movable control the size slider tunes (E_*, A by default)
+     CAShapeLayer *_editHighlight;                  // the ring around the selected icon while the editor is open
+     NSMutableDictionary<NSString *, NSValue *> *_lineOffsets;   // the drag offsets, points from each control's built-in centre (NSUserDefaults DmPadLineLayout)
+     BOOL _editing;                                 // the button editor is open: touches drag controls instead of pressing them
+     UIView *_editBar; UISlider *_editSlider, *_glassSlider;   // the editor's bar: the size slider, the glass slider, hint and Done
++    UIButton *_editEye;                            // 0146: the editor bar's eye toggle: hides / shows the selected icon (the menu is never hideable, so it is disabled for it)
+     UITouch *_editTouch; int _editControl; CGPoint _editGrab, _editBase;   // the control being dragged and where its drag started
+     CGPoint _panelPos[1];                          // the bar's centre as a fraction of the view, NSUserDefaults DmPadPanelPos (0116)
+     BOOL _panelDragging[1];                        // a bar is being dragged now: the layout leaves its frame alone (0116)
+@@ -413,6 +415,20 @@ static void glassDiscSetOpacity(CAGradientLayer *disc, CGFloat p) {   // the fal
+     for (int b = 0; b < B_N; b++) _key[b].hidden = _tap || (fullOnly(b) && !_full) || b == B_X || b == B_ZR || b == B_R || b == B_LS || b == B_RS || b >= B_LEFT;
+     _ring.hidden = _knob.hidden = YES;   // the floating stick is drawn only while a finger holds it (refresh)
+     _jump.hidden = _photo.hidden = _tap;   // the extra buttons: jump (B) and photo (D-pad down)
++    // 0146: a control the player hid in the button settings stays hidden (and cannot be
++    // pressed, see extraButtonAt / faceAt / the KEY lineOff). While the editor is open it
++    // is shown dimmed instead, so it can be tapped to unhide it; a control the layout
++    // already hid (Tap, X/ZR/R...) stays hidden. The menu is never hidden. A control
++    // that is not hidden gets its full opacity back (undo a previous dim).
++    for (int e = 0; e < E_N; e++) {
++        if (e == E_MENU) continue;
++        CALayer *ly = [self editLayer:e];
++        if (!ly || ly.hidden) continue;   // layout-hidden: leave it hidden
++        if (_lineHidden[e]) {
++            if (_editing) { ly.hidden = NO; ly.opacity = 0.35; }
++            else ly.hidden = YES;
++        } else ly.opacity = 1;
++    }
+     [CATransaction commit];
+     [self syncGlassVisibility];   // the glass follows its control: hidden with it in the Tap layout
+ }
+@@ -490,9 +506,9 @@ static int lockedKey(int c) {   // DmPadGeometry.h's control → the key it pres
+     if (_tap || _padOff || (_layout.separated && !CGRectContainsPoint(_layout.controls, p))) return YES;
+     return dm_pad_menu_takes(self.geo, _full, _layout.separated, p);
+ }
+-- (uint64_t)faceAt:(CGPoint)p {   // keys under the finger in the diamond (between two keys both count)
++- (uint64_t)faceAt:(CGPoint)p {   // keys under the finger in the diamond (between two keys both count); a hidden key cannot be pressed (0146)
+     uint64_t m = 0;
+-    for (int b = B_A; b <= B_Y; b++) if (dist(p, [self facePos:b]) <= [self lineFaceHitR:b]) m |= 1ull << b;
++    for (int b = B_A; b <= B_Y; b++) if (![self keyUserHidden:b] && dist(p, [self facePos:b]) <= [self lineFaceHitR:b]) m |= 1ull << b;
+     return m;
+ }
+ - (uint64_t)dpadAt:(CGPoint)p {   // 8 directions: 45° each, diagonals press two keys; a small centre circle counts as none
+@@ -522,6 +538,9 @@ static int lockedKey(int c) {   // DmPadGeometry.h's control → the key it pres
+     // X, ZR, R, L3, R3 and the D-pad are hidden and disabled: no touch may press them. The photo
+     // button sends B_DOWN and the jump button B_B as locked keys (C_BTN, touchesBegan), so they survive.
+     face &= ~(1ull << B_X);
++    if (_lineHidden[E_A]) face &= ~(1ull << B_A);   // 0146: a key the player hid cannot stay pressed
++    if (_lineHidden[E_B]) face &= ~(1ull << B_B);
++    if (_lineHidden[E_Y]) face &= ~(1ull << B_Y);
+     dpad = 0;
+     btn &= ~((1ull << B_ZR) | (1ull << B_R) | (1ull << B_LS) | (1ull << B_RS));
+     int32_t ax[4] = {0};
+@@ -591,7 +610,7 @@ int front_web_touch(void);
+             if (extra == 2) { [_owner setObject:@(C_BTN | (uint64_t)B_DOWN << 8) forKey:t]; continue; }
+         }
+         DmPadHit hit = dm_pad_hit(self.geo, _full, _layout.separated, _tap, !_stick[0], p);   // the same geometry the controls are drawn with (the menu button took its own touches, menuTakes)
+-        BOOL lineOff = hit.kind == DM_PAD_HIT_KEY && (lockedKey(hit.key) == B_ZR || lockedKey(hit.key) == B_R || lockedKey(hit.key) == B_LS || lockedKey(hit.key) == B_RS);   // ZR, R, L3 and R3 are hidden and disabled
++        BOOL lineOff = hit.kind == DM_PAD_HIT_KEY && (lockedKey(hit.key) == B_ZR || lockedKey(hit.key) == B_R || lockedKey(hit.key) == B_LS || lockedKey(hit.key) == B_RS || [self keyUserHidden:lockedKey(hit.key)]);   // ZR, R, L3 and R3 are hidden and disabled; a key the player hid in the button settings is too (0146)
+         if (hit.kind == DM_PAD_HIT_KEY && !lineOff) { [_owner setObject:@(C_BTN | (uint64_t)lockedKey(hit.key) << 8) forKey:t]; continue; }
+         if (_tap) { game |= [self gameBegin:t]; continue; }
+         int kind = hit.kind == DM_PAD_HIT_FACE ? C_FACE : hit.kind == DM_PAD_HIT_DPAD ? C_DPAD : hit.kind == DM_PAD_HIT_STICK ? C_STICK : C_NONE, idx = 0;
+@@ -821,9 +840,9 @@ static BOOL g_hintShown;   // once per launch
+ // their radii are their own sizes.
+ - (CGPoint)jumpCenter { CGPoint f = self.faceCenter; CGFloat g = self.faceGap, r = self.faceR * _lineSizes[E_Y]; CGPoint o = [self lineOffset:@"jump"]; return CGPointMake(f.x - g - 2 * r - 12 * self.u + o.x, f.y + o.y); }
+ - (CGPoint)photoCenter { CGPoint f = self.faceCenter; CGFloat g = self.faceGap, r = self.faceR * _lineSizes[E_Y]; CGPoint o = [self lineOffset:@"photo"]; return CGPointMake(f.x - 2 * g - 4 * r - 24 * self.u + o.x, f.y + o.y); }
+-- (int)extraButtonAt:(CGPoint)p {   // 1 jump, 2 photo
+-    if (dist(p, [self jumpCenter]) <= [self lineExtraRFor:E_JUMP]) return 1;
+-    if (dist(p, [self photoCenter]) <= [self lineExtraRFor:E_PHOTO]) return 2;
++- (int)extraButtonAt:(CGPoint)p {   // 1 jump, 2 photo; a hidden extra button cannot be pressed (0146)
++    if (!_lineHidden[E_JUMP] && dist(p, [self jumpCenter]) <= [self lineExtraRFor:E_JUMP]) return 1;
++    if (!_lineHidden[E_PHOTO] && dist(p, [self photoCenter]) <= [self lineExtraRFor:E_PHOTO]) return 2;
+     return 0;
+ }
+ 
+@@ -834,6 +853,7 @@ static NSString *const k_line_layout_key = @"DmPadLineLayout";
+ - (void)loadLineLayout {
+     _lineScale = 1;
+     for (int e = 0; e < E_N; e++) _lineSizes[e] = 1;   // fresh: every icon at its built-in size
++    for (int e = 0; e < E_N; e++) _lineHidden[e] = NO;   // 0146: fresh: every icon shown
+     _lineOffsets = [NSMutableDictionary dictionary];
+     NSDictionary *d = [NSUserDefaults.standardUserDefaults dictionaryForKey:k_line_layout_key];
+     if (![d isKindOfClass:[NSDictionary class]]) return;
+@@ -844,6 +864,12 @@ static NSString *const k_line_layout_key = @"DmPadLineLayout";
+         NSNumber *v = [z isKindOfClass:[NSDictionary class]] ? z[k_lineEditKeys[e]] : nil;
+         _lineSizes[e] = [v isKindOfClass:[NSNumber class]] ? fmin(fmax(v.doubleValue, 0.7), 3.0) : _lineScale;
+     }
++    NSDictionary *h = d[@"hidden"];   // 0146: an icon the player hid (its key maps to @(YES)); the menu is never hidden, so a stored YES for it is ignored
++    if ([h isKindOfClass:[NSDictionary class]]) for (int e = 0; e < E_N; e++) {
++        if (e == E_MENU) continue;
++        NSNumber *v = h[k_lineEditKeys[e]];
++        _lineHidden[e] = [v isKindOfClass:[NSNumber class]] && v.boolValue;
++    }
+     NSDictionary *o = d[@"offsets"];
+     if ([o isKindOfClass:[NSDictionary class]]) for (NSString *name in o) {
+         NSArray *v = o[name];
+@@ -856,7 +882,9 @@ static NSString *const k_line_layout_key = @"DmPadLineLayout";
+     for (NSString *name in _lineOffsets) { CGPoint p = [_lineOffsets[name] CGPointValue]; o[name] = @[@(p.x), @(p.y)]; }
+     NSMutableDictionary *z = [NSMutableDictionary dictionary];
+     for (int e = 0; e < E_N; e++) z[k_lineEditKeys[e]] = @(_lineSizes[e]);
+-    NSDictionary *d = @{@"scale": @(_lineScale), @"sizes": z, @"offsets": o};
++    NSMutableDictionary *h = [NSMutableDictionary dictionary];   // 0146: the icons the player hid (only the YES ones are stored)
++    for (int e = 0; e < E_N; e++) if (_lineHidden[e]) h[k_lineEditKeys[e]] = @(YES);
++    NSDictionary *d = @{@"scale": @(_lineScale), @"sizes": z, @"offsets": o, @"hidden": h};
+     [NSUserDefaults.standardUserDefaults setObject:d forKey:k_line_layout_key];
+ }
+ 
+@@ -1000,6 +1028,10 @@ static const CGFloat k_panel_default[1][2] = {{0.30, 0.58}};   // pad: the bar's
+     [_editSlider addTarget:self action:@selector(editSliderChanged:) forControlEvents:UIControlEventValueChanged];
+     [_editSlider addTarget:self action:@selector(editSliderDone:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside];
+     [_editBar addSubview:_editSlider];
++    _editEye = [UIButton buttonWithType:UIButtonTypeSystem]; _editEye.tag = 306;   // 0146: the eye toggle: hides / shows the selected icon
++    [_editEye addTarget:self action:@selector(editEyeTapped:) forControlEvents:UIControlEventTouchUpInside];
++    [_editBar addSubview:_editEye];
++    [self updateEditEye];
+     UIButton *done = [UIButton buttonWithType:UIButtonTypeSystem]; done.tag = 303;
+     [done setTitle:@"完成" forState:UIControlStateNormal]; done.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+     [done addTarget:self action:@selector(closePadSettings) forControlEvents:UIControlEventTouchUpInside];
+@@ -1033,10 +1065,11 @@ static const CGFloat k_panel_default[1][2] = {{0.30, 0.58}};   // pad: the bar's
+         CGPoint c = [self panelCentre:0 size:CGSizeMake(w, h)];
+         _editBar.frame = CGRectMake(c.x - w / 2, c.y - h / 2, w, h);
+     }
+-    CGFloat x = 12, doneW = 48;
++    CGFloat x = 12, doneW = 48, eyeW = 36;
+     UIView *title = [_editBar viewWithTag:301]; title.frame = CGRectMake(x, 8, 80, 24); x += 88;
+     UIView *size = [_editBar viewWithTag:302]; size.frame = CGRectMake(x, 8, 32, 24); x += 36;
+-    _editSlider.frame = CGRectMake(x, 10, w - x - doneW - 24, 20);
++    _editSlider.frame = CGRectMake(x, 10, w - x - eyeW - doneW - 12 - 8 - 12, 20);
++    _editEye.frame = CGRectMake(w - doneW - 12 - eyeW - 8, 8, eyeW, 24);   // 0146: the eye toggle, between the size slider and Done
+     UIView *done = [_editBar viewWithTag:303]; done.frame = CGRectMake(w - doneW - 12, 8, doneW, 24);
+     UIView *glass = [_editBar viewWithTag:305]; glass.frame = CGRectMake(12, 38, 32, 20);
+     _glassSlider.frame = CGRectMake(48, 40, w - 48 - 12, 20);
+@@ -1046,6 +1079,7 @@ static const CGFloat k_panel_default[1][2] = {{0.30, 0.58}};   // pad: the bar's
+     if (_padOff || _editing) return;
+     [self reset];   // release every key and touch first, as the menu does
+     _editing = YES;
++    [self applyLayout];   // 0146: a hidden icon shows dimmed while the editor is open, so it can be tapped to unhide it
+     [self updateControlVisibility];
+     _editBar.hidden = NO;
+     [self selectEditControl:E_A];   // A is selected by default, so the slider always has a target
+@@ -1057,6 +1091,7 @@ static const CGFloat k_panel_default[1][2] = {{0.30, 0.58}};   // pad: the bar's
+     _editTouch = nil;
+     [self saveLineLayout];
+     [self saveGlassOpacity];
++    [self applyLayout];   // 0146: a hidden icon hides fully once the editor is closed
+     [self updateControlVisibility];
+     _editBar.hidden = YES;
+     [self setNeedsLayout];
+@@ -1070,6 +1105,26 @@ static const CGFloat k_panel_default[1][2] = {{0.30, 0.58}};   // pad: the bar's
+     (void)s;
+     [self saveLineLayout];
+ }
++// 0146: the eye toggle for the selected icon: eye (shown) or eye.slash (hidden, red);
++// the menu (gear) is never hideable, so the eye is disabled and dimmed for it.
++- (void)updateEditEye {
++    if (!_editEye) return;
++    BOOL menu = _editSelected == E_MENU;
++    BOOL hidden = !menu && _lineHidden[_editSelected];
++    [_editEye setImage:[UIImage systemImageNamed:hidden ? @"eye.slash" : @"eye"] forState:UIControlStateNormal];
++    _editEye.tintColor = hidden ? UIColor.systemRedColor : UIColor.whiteColor;
++    _editEye.enabled = !menu;
++    _editEye.alpha = menu ? 0.35 : 1;
++}
++- (void)editEyeTapped:(UIButton *)b {   // 0146: hide / show the selected icon
++    (void)b;
++    if (_editSelected == E_MENU) return;   // the menu is never hideable
++    _lineHidden[_editSelected] = !_lineHidden[_editSelected];
++    [self saveLineLayout];
++    [self applyLayout];   // the icon hides at once, or shows dimmed so it stays tappable
++    [self updateEditEye];
++    [self selectEditControl:_editSelected];   // refreshes the hint (now shows 已隐藏) and the highlight
++}
+ - (void)glassSliderChanged:(UISlider *)s {   // the glass slider: the effect's strength, live
+     _glassOpacity = s.value / 100;
+     [self applyGlassOpacity];
+@@ -1082,8 +1137,9 @@ static const CGFloat k_panel_default[1][2] = {{0.30, 0.58}};   // pad: the bar's
+     if (e < 0 || e >= E_N) return;
+     _editSelected = e;
+     _editSlider.value = _lineSizes[e];
++    [self updateEditEye];   // 0146: the eye for this icon
+     UILabel *hint = (UILabel *)[_editBar viewWithTag:304];
+-    hint.text = [NSString stringWithFormat:@"当前：%@ · 拖动图标可以移动位置 · 拖动面板可以移动面板\n玻璃 %.0f%% 是现在的效果，100%% 最深", k_lineEditNames[e], k_glassAnchor * 100];
++    hint.text = [NSString stringWithFormat:@"当前：%@%@ · 拖动图标可以移动位置 · 拖动面板可以移动面板\n玻璃 %.0f%% 是现在的效果，100%% 最深", k_lineEditNames[e], _lineHidden[e] ? @" · 已隐藏" : @"", k_glassAnchor * 100];   // 0146: a hidden icon says so
+     [self layoutEditHighlight];
+ }
+ - (void)layoutEditHighlight {   // the ring around the selected icon while the editor is open
+@@ -1098,6 +1154,27 @@ static const CGFloat k_panel_default[1][2] = {{0.30, 0.58}};   // pad: the bar's
+     setPath(_editHighlight, circlePath(CGPointMake(r, r), r - 1));
+     [CATransaction commit];
+ }
++// 0146: the layer for a movable control (the same mapping as editIconHidden), so the
++// user-hidden state can hide it; nil for nothing (every E_* has a layer).
++- (CALayer *)editLayer:(int)e {
++    switch (e) {
++        case E_A: return _key[B_A]; case E_B: return _key[B_B]; case E_Y: return _key[B_Y];
++        case E_ZL: return _key[B_ZL]; case E_L: return _key[B_L];
++        case E_MINUS: return _key[B_MINUS]; case E_PLUS: return _key[B_PLUS];
++        case E_JUMP: return _jump; case E_MENU: return _menu; default: return _photo;
++    }
++}
++// 0146: whether a game key (B_*) is hidden by the player in the button settings
++// (the editable controls only; the hardcoded-hidden keys X/ZR/R/L3/R3 and the D-pad
++// are handled by the layout, not here).
++- (BOOL)keyUserHidden:(int)b {
++    switch (b) {
++        case B_A: return _lineHidden[E_A]; case B_B: return _lineHidden[E_B]; case B_Y: return _lineHidden[E_Y];
++        case B_ZL: return _lineHidden[E_ZL]; case B_L: return _lineHidden[E_L];
++        case B_MINUS: return _lineHidden[E_MINUS]; case B_PLUS: return _lineHidden[E_PLUS];
++        default: return NO;
++    }
++}
+ - (BOOL)editIconHidden:(int)e {   // the icon's layer is hidden (the Tap layout hides jump and photo, and every key)
+     switch (e) {
+         case E_A: return _key[B_A].hidden; case E_B: return _key[B_B].hidden; case E_Y: return _key[B_Y].hidden;
+-- 
+2.43.0
+
