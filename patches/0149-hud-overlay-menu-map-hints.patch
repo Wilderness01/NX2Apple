@@ -1,4 +1,4 @@
-From b4aaeeec4e2618a9ff451eeba81e61ae6f1a603b Mon Sep 17 00:00:00 2001
+From 97fbb93825efd2a621ee08893e7be96625755b94 Mon Sep 17 00:00:00 2001
 From: seedds <seedds@gmail.com>
 Date: Sun, 15 Nov 2026 14:38:21 +0000
 Subject: [PATCH] 0149: HUD overlay: menu/map fullscreen, hint hide,

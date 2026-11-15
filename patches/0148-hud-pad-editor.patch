@@ -1,4 +1,4 @@
-From 0a4aa9d47cb8a2ca721d6dc915d15099ddb7fef6 Mon Sep 17 00:00:00 2001
+From 66c18dd8efb42dc66c8c67f864ad4bb2dd48f4b7 Mon Sep 17 00:00:00 2001
 From: seedds <seedds@gmail.com>
 Date: Sun, 15 Nov 2026 14:39:07 +0000
 Subject: [PATCH] 0148: pad-style in-game HUD editor (HudPadEditor), delete the
@@ -1131,7 +1131,7 @@ index 0000000..004991a
 +@end
 diff --git a/dm/ios/Sources/HudPadEditor.m b/dm/ios/Sources/HudPadEditor.m
 new file mode 100644
-index 0000000..cb17f40
+index 0000000..336e1da
 --- /dev/null
 +++ b/dm/ios/Sources/HudPadEditor.m
 @@ -0,0 +1,533 @@
@@ -1262,7 +1262,7 @@ index 0000000..cb17f40
 +    UISlider *_editSlider;         // the selected element's size, 0.6-1.8, live
 +    UIButton *_editEye;            // 0146: the eye toggle for the selected element (tag 306)
 +    UIView *_handles[kHudPadCount];   // one overlay handle per element (non-interactive: the view hit-tests them itself)
-+    CALayer *_highlight;           // the ring around the selected handle (layoutEditHighlight's shape)
++    CAShapeLayer *_highlight;      // the ring around the selected handle (layoutEditHighlight's shape)
 +    int _selected;                 // the element the slider and the eye tune (editor order 0..4)
 +    double _dx[kHudPadCount], _dy[kHudPadCount], _k[kHudPadCount];   // the manual offsets (design points) and sizes
 +    BOOL _hidden[kHudPadCount];    // the elements the player hid
