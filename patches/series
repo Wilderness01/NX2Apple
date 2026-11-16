@@ -111,3 +111,6 @@
 0150-hud-local-matrix-write.patch
 0151-hud-show-and-refresh.patch
 0152-hud-self-guard-log.patch
+0153-hud-editor-reset.patch
+0154-hud-needle-follower-emod-follow.patch
+0155-hud-life-upright-overlay.patch

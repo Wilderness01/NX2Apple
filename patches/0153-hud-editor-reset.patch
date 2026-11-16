@@ -1,0 +1,80 @@
+From fcca140fd9efc80c0c68395fe9262e8b0b9f1631 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Mon, 16 Nov 2026 13:41:13 +0800
+Subject: [PATCH] =?UTF-8?q?0153:=20HUD=20editor=20Reset=20button=20?=
+ =?UTF-8?q?=E2=80=94=20every=20element=20back=20to=20its=20edge-aligned=20?=
+ =?UTF-8?q?base=20position?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ dm/ios/Sources/HudPadEditor.m | 29 +++++++++++++++++++++++++----
+ 1 file changed, 25 insertions(+), 4 deletions(-)
+
+diff --git a/dm/ios/Sources/HudPadEditor.m b/dm/ios/Sources/HudPadEditor.m
+index 336e1da..f04c9de 100644
+--- a/dm/ios/Sources/HudPadEditor.m
++++ b/dm/ios/Sources/HudPadEditor.m
+@@ -2,7 +2,7 @@
+ //
+ // The pad-style HUD editor (REPORT-HUD-REDO.md D.5): no SwiftUI, no popup.
+ // It copies the button editor's structure (DmGamepad.m): a settings bar at
+-// the top (title, size slider, eye toggle, Done, hint line) that drags by
++// the top (title, size slider, eye toggle, Reset, Done, hint line) that drags by
+ // its title or blank area, and the elements themselves as handles on the
+ // game picture -- tap one to select it, drag it to move it. The game keeps
+ // running behind the editor; every change goes live at once through the
+@@ -295,6 +295,10 @@ static const CGFloat kHudPadPanelDefault[2] = {0.50, 0.82};
+     [_editEye addTarget:self action:@selector(editEyeTapped:) forControlEvents:UIControlEventTouchUpInside];
+     [_editBar addSubview:_editEye];
+     [self updateEditEye];
++    UIButton *reset = [UIButton buttonWithType:UIButtonTypeSystem]; reset.tag = 307;   // 0153: Reset: every element back to its edge-aligned base position
++    [reset setTitle:@"复位" forState:UIControlStateNormal]; reset.titleLabel.font = [UIFont boldSystemFontOfSize:15];
++    [reset addTarget:self action:@selector(resetAll:) forControlEvents:UIControlEventTouchUpInside];
++    [_editBar addSubview:reset];
+     UIButton *done = [UIButton buttonWithType:UIButtonTypeSystem]; done.tag = 303;
+     [done setTitle:@"完成" forState:UIControlStateNormal]; done.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+     [done addTarget:self action:@selector(closeEditor) forControlEvents:UIControlEventTouchUpInside];
+@@ -320,11 +324,12 @@ static const CGFloat kHudPadPanelDefault[2] = {0.50, 0.82};
+         CGPoint c = [self panelCentre:CGSizeMake(w, h)];
+         _editBar.frame = CGRectMake(c.x - w / 2, c.y - h / 2, w, h);
+     }
+-    CGFloat x = 12, doneW = 48, eyeW = 36;
++    CGFloat x = 12, doneW = 48, resetW = 48, eyeW = 36;
+     UIView *title = [_editBar viewWithTag:301]; title.frame = CGRectMake(x, 8, 80, 24); x += 88;
+     UIView *size = [_editBar viewWithTag:302]; size.frame = CGRectMake(x, 8, 32, 24); x += 36;
+-    _editSlider.frame = CGRectMake(x, 10, w - x - eyeW - doneW - 12 - 8 - 12, 20);
+-    _editEye.frame = CGRectMake(w - doneW - 12 - eyeW - 8, 8, eyeW, 24);   // 0146: the eye toggle, between the size slider and Done
++    _editSlider.frame = CGRectMake(x, 10, w - x - eyeW - 8 - resetW - 8 - doneW - 12 - 12, 20);
++    _editEye.frame = CGRectMake(w - doneW - 12 - resetW - 8 - eyeW - 8, 8, eyeW, 24);   // 0146: the eye toggle, between the size slider and Reset
++    UIView *reset = [_editBar viewWithTag:307]; reset.frame = CGRectMake(w - doneW - 12 - 8 - resetW, 8, resetW, 24);   // 0153: Reset, between the eye and Done
+     UIView *done = [_editBar viewWithTag:303]; done.frame = CGRectMake(w - doneW - 12, 8, doneW, 24);
+     UIView *hint = [_editBar viewWithTag:304]; hint.frame = CGRectMake(0, 66, w, 34);
+ }
+@@ -415,6 +420,22 @@ static const CGFloat kHudPadPanelDefault[2] = {0.50, 0.82};
+     [self updateEditEye];
+     [self selectElement:_selected];   // refreshes the hint (now shows 已隐藏) and the highlight
+ }
++// 0153: Reset: every element back to its overlay base position (the
++// edge-aligned anchor), shown, 100%. A default element has no key and no
++// DM_HUD_* variable, so the runtime leaves it on the overlay base at once
++// (applyAll unsets every var) and the reset survives a relaunch (save
++// removes every DmHudPad.* key). The handles snap back to their anchors.
++- (void)resetAll:(UIButton *)b {
++    (void)b;
++    for (int i = 0; i < kHudPadCount; i++) { _dx[i] = 0; _dy[i] = 0; _k[i] = 1; _hidden[i] = NO; }
++    [self applyAll];
++    [self save];
++    _editSlider.value = 1;
++    [self updateEditEye];
++    [self updateHint];
++    [self layoutHandles];
++    fputs("hud editor: reset to edge-aligned base (HUD 已复位到贴边位置)\n", stderr);
++}
+ 
+ // ---- Handle touches ----
+ // The handle under a point, or -1. Handles can overlap (coins and regional
+-- 
+2.43.0
+

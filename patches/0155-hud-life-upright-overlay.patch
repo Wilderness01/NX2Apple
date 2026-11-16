@@ -1,0 +1,25 @@
+From e1e4a8101e380312c1a9c81518ed44b502c444d8 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Mon, 16 Nov 2026 14:09:05 +0800
+Subject: [PATCH] =?UTF-8?q?0155:=20upright=20the=20life=20icon=20=E2=80=94?=
+ =?UTF-8?q?=20CounterLife=20overlay=20PicIcon/TxtLife=20rz=203=20->=200?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ dm/romfs-overlay/LayoutData/CounterLife.szs | Bin 104218 -> 104218 bytes
+ 1 file changed, 0 insertions(+), 0 deletions(-)
+
+diff --git a/dm/romfs-overlay/LayoutData/CounterLife.szs b/dm/romfs-overlay/LayoutData/CounterLife.szs
+index 61bf3970eae86815365d29acd5b1eaa93b85abe1..49320cd22fb95a153a8540dc58b7045096bb8eb1 100644
+GIT binary patch
+delta 29
+ncmV+&0OJ3et_GT}2Cxh40ssJ$4eXbbU;zY^4d@B8vFvH8t|$yu
+
+delta 24
+fcmbQWj&0UDwhi2Gm>e7?^S+r5q&6>mQ?d#Gf65BZ
+
+-- 
+2.43.0
+
