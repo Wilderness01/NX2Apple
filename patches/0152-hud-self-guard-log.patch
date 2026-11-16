@@ -1,0 +1,600 @@
+From 82db268379af937ad01851e41aeb8f8a9e07b7b1 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Mon, 16 Nov 2026 03:00:23 +0000
+Subject: [PATCH] 0152: shrink the self-guard window 0x100 -> 0x20 so the four
+ counters match; log every match and skip to the probe buffer
+
+---
+ dm/games/0100000000010000/hud_runtime.c | 339 +++++++++++++++++++++++-
+ dm/games/0100000000010000/patches.py    | 168 +++++++-----
+ 2 files changed, 432 insertions(+), 75 deletions(-)
+
+diff --git a/dm/games/0100000000010000/hud_runtime.c b/dm/games/0100000000010000/hud_runtime.c
+index 8dcc218..c057e48 100644
+--- a/dm/games/0100000000010000/hud_runtime.c
++++ b/dm/games/0100000000010000/hud_runtime.c
+@@ -1,4 +1,12 @@
+-// hud_runtime.c -- Super Mario Odyssey in-game HUD editor runtime (0137 + 0142 + 0147).
++// hud_runtime.c -- Super Mario Odyssey in-game HUD editor runtime (0137 + 0142 + 0147 + 0152).
++// (0152) The 0x100 self-guard window is 0x20 (see hud_edge_child_self):
++// the loader allocates a layout's panes consecutively in .bflyt file
++// order, ~0xe0 apart, so a child one pane after its parent was skipped
++// as "self" and the matcher never matched the four counters (#67
++// no-change, REPORT-HUD-67-NOCHANGE.md R1). This file also logs every
++// match and skip into the probe buffer (state +0x3300) when the host
++// enables it (DM_HUD_PROBE=1), so one device test shows exactly what the
++// matcher did -- see the (0152) block before hud_edge.
+ // (History: this file started as a copy of hud_edge.c, the 0118 HUD edge anchor;
+ // the 0118 auto-edge code is deleted -- the edge anchor now lives in the
+ // 0136/0143 .bflyt overlay, and this file applies ONLY manual deltas.)
+@@ -417,16 +425,28 @@ static inline __attribute__((always_inline)) char *hud_edge_find_entry(void *tab
+ //  (b) a list node is checked (non-NULL, 8-byte aligned, >= 0x10000) before
+ //      child = node - 8 is computed from it;
+ //  (c) a child that is the pane itself, or lies inside the pane's own
+-//      first 0x100 bytes, is never treated as a pane.
++//      first 0x20 bytes, is never treated as a pane.
+ static inline __attribute__((always_inline)) int hud_edge_node_ok(void *node) {
+     uintptr_t v = (uintptr_t)node;
+     return v != 0 && (v & 7u) == 0 && v >= 0x10000;
+ }
+ 
++// (0152) The window is 0x20, not 0x100: a real child pane can never live
++// within 0x20 bytes after its parent -- the Pane struct alone is >=0xd0
++// bytes (its name ends at +0xd0) -- so the only "self" a child can be is
++// the pane itself (offset 0, caught by the child == p check above). The
++// 0x100 window was the #67 no-change bug (REPORT-HUD-67-NOCHANGE.md R1):
++// the loader allocates a layout's panes consecutively in .bflyt file
++// order, ~0xe0 bytes apart, so a child one pane after its parent (Life /
++// Add / Shine, one pane after All in CounterLife / CounterCoin /
++// CounterCollectCoin / CounterShine) sat at parent+~0xe0 < parent+0x100
++// and was skipped as "self" -- the matcher never matched the four
++// counters, so all three cuts no-op'd for them, while the compass's
++// PicMap (two panes after All, ~0x1c0) escaped the window and worked.
+ static inline __attribute__((always_inline)) int hud_edge_child_self(void *p, void *child) {
+     if (child == p) return 1;
+     if ((uintptr_t)child <= (uintptr_t)p) return 0;
+-    return (uintptr_t)child - (uintptr_t)p < 0x100;
++    return (uintptr_t)child - (uintptr_t)p < 0x20;
+ }
+ 
+ // The DFS stack: ONE array of {pane, depth} entries (the v8 fix for the
+@@ -560,6 +580,203 @@ static inline __attribute__((always_inline)) int hud_edge_capture_tx(void *pane,
+     return 0;
+ }
+ 
++// (0152) Per-element diagnostic logging, through the existing probe
++// buffer (hud_probe.c / hud_manual.c dm_hud_probe_tick): the runtime
++// writes 96-byte records into the frame-step state page at +0x3300 and
++// the host drains them once per present into "[hudprobe] ..." log lines.
++// The runtime never calls LOG/fprintf -- it is compiled freestanding
++// into a relocation-free word table -- so the probe buffer is the ONLY
++// path for runtime data to reach the device log. Gated by the host's
++// enabled flag (DM_HUD_PROBE=1, set by dm_hud_probe_tick every present;
++// the flag is 0 until the first present, so a first-frame match is logged
++// one frame late, not lost -- see the retry flag below).
++// Buffer layout (hud_probe.c): 32-byte header (magic "PRBE" 0x50524245
++// at +0, enabled at +4, rec_count at +8, seen_count at +12,
++// aspect_logged at +16, rec_cap at +20, seen_cap at +24), seen-table
++// 256 x u64 at +32, record buffer 13 x 96 bytes at +2080. A record:
++// type +0 (u32), addr lo/hi +4/+8, name +12 (char[20]), pname +32
++// (char[20]), v0..v6 +52..+76 (7 floats), w0..w3 +80..+92 (4 u32s).
++// Match records reuse type 1 (edge-decision), skip records type 0
++// (pane), so the existing drain prints them with no host change -- but
++// the drain's labels for v3/v4 and w3 are repurposed here (documented
++// below); read the values, not the labels.
++//   type 1 (match): name = the pane name ("All"); v0=tdx, v1=tdy,
++//     v2=tk; v3=final local x (+0x30 after the write), v4=final local y
++//     (+0x34 after the write); v5=final global m[3], v6=final global
++//     m[7]; w0=idx, w1=slot, w2=hidden; w3 bits: bit0 = the pane's +0xa0
++//     was NULL, bit1 = e_lm0 was captured, bit2 = this is a restore
++//     (the pane was written back to its original) rather than an apply.
++//     (The drain prints v3/v4 as pm_dx/pm_dy and w3 as
++//     parent_hidden/has_parent/pm_sentinel; those labels are wrong for
++//     this record -- the parent compensation is always 0 for a HUD All,
++//     its parent being an unmatched RootPane, so nothing is lost.)
++//   type 0 (skip): name = the pane name ("All"); pname = the first two
++//     child names joined by '/' for a matcher miss (the drain prints it
++//     as parent='...'), or the parent name for a bit-7 skip; v0/v1 = 0,
++//     v2=local tx, v3=local ty, v4=global m[3], v5=global m[7];
++//     w0 = the skip reason (1 = bit-7 guard, 2 = no match), w1 = the
++//     pane flags (+0x58), w2/w3 = the parent address lo/hi.
++// Logging is ON CHANGE only (first match, value change, hide/show
++// transition, first sighting of a skip), never every frame: a match is
++// logged once, when the write block runs, and the entry's e_orig[8]
++// (a slot the local never uses, zeroed on first sighting) records
++// whether it was logged (1.0 = logged, 0.0 = still owed); the early
++// return below does not fire while a log is owed and logging is on, so
++// a pending log forces a re-run of the write block (an idempotent
++// re-write) while logging is on, and the fast path is unchanged when
++// logging is off. A skip is logged once per pane (the seen-table, keyed
++// by pane address, dedups it). Hot-path cost when logging is off: one
++// branch per call (the enabled-flag load in hud_log_begin). No
++// allocation: the records go to the pre-allocated state-page buffer.
++// All probe-buffer accesses are volatile (shared with the host; also
++// prevents literal-pool loads, as in hud_probe.c).
++#define HUD_LOG_MAGIC 0x50524245u   // "PRBE"
++#define HUD_LOG_REC_CAP 13
++#define HUD_LOG_REC_SIZE 96
++#define HUD_LOG_SEEN_CAP 256
++#define HUD_LOG_SEEN_OFF 32
++#define HUD_LOG_REC_OFF 2080
++#define HUD_LOG_REC_MATCH 1   // match record (edge-decision)
++#define HUD_LOG_REC_SKIP 0    // skip record (pane)
++#define HUD_LOG_SKIP_BIT7 1
++#define HUD_LOG_SKIP_NOMATCH 2
++// e_orig[8]: 1.0 once this entry's current match has been logged,
++// 0.0 while a log is still owed (a free slot: the local never reads
++// [8..11], they are zeroed on first sighting).
++#define HUD_LOG_DONE_SLOT 8
++
++// The probe buffer for this table (table + 0x3000 = state + 0x3300).
++// Returns 0 when the probe is not enabled, so the caller logs nothing.
++// Initialises the header when the magic is absent (the state page starts
++// zeroed); the enabled word is never written here -- the host owns it.
++static inline __attribute__((always_inline)) volatile char *hud_log_begin(void *table) {
++    volatile char *pb = (volatile char *)table + 0x3000;
++    volatile u32 *hdr = (volatile u32 *)pb;
++    if (hdr[0] != HUD_LOG_MAGIC) {
++        hdr[0] = HUD_LOG_MAGIC;
++        hdr[2] = 0;
++        hdr[3] = 0;
++        hdr[4] = 0;
++        hdr[5] = HUD_LOG_REC_CAP;
++        hdr[6] = HUD_LOG_SEEN_CAP;
++        hdr[7] = 0;
++    }
++    if (hdr[1] != 1) return 0;
++    return pb;
++}
++// Mark a pane as seen (the skip dedup). Returns 1 when the pane is newly
++// added (the caller should log it), 0 when it was already seen or the
++// seen-table is full.
++static inline __attribute__((always_inline)) int hud_log_mark_seen(volatile char *pb, void *pane) {
++    volatile u32 *hdr = (volatile u32 *)pb;
++    volatile uintptr_t *seen = (volatile uintptr_t *)(pb + HUD_LOG_SEEN_OFF);
++    u32 sc = hdr[3];
++    for (u32 i = 0; i < sc; i++) {
++        if (seen[i] == (uintptr_t)pane) return 0;
++    }
++    if (sc >= HUD_LOG_SEEN_CAP) return 0;
++    seen[sc] = (uintptr_t)pane;
++    hdr[3] = sc + 1;
++    return 1;
++}
++// Copy a pane name (a C string) into dst, at most max-1 chars, always
++// NUL-terminated. Same as hud_probe.c's hud_probe_copy_name.
++static inline __attribute__((always_inline)) void hud_log_copy_name(volatile char *dst, const char *src, int max) {
++    int i = 0;
++    if (src) {
++        for (; i < max - 1; i++) {
++            char c = src[i];
++            if (c == 0) break;
++            dst[i] = c;
++        }
++    }
++    dst[i] = 0;
++}
++// Write a type-1 match record. Returns 1 on success, 0 when the buffer
++// is full (the caller keeps the log owed and retries next frame). The
++// record count is raised only AFTER the record is fully written, as in
++// hud_probe.c, so the host never drains a half-written record.
++static inline __attribute__((always_inline)) int hud_log_match(volatile char *pb, void *pane, int idx, int slot, float tdx, float tdy, float tk, int hidden, float fx, float fy, float gx, float gy, u32 w3) {
++    volatile u32 *hdr = (volatile u32 *)pb;
++    u32 rc = hdr[2];
++    if (rc >= HUD_LOG_REC_CAP) return 0;
++    volatile char *rec = pb + HUD_LOG_REC_OFF + rc * HUD_LOG_REC_SIZE;
++    *(volatile u32 *)(rec + 0) = HUD_LOG_REC_MATCH;
++    *(volatile u32 *)(rec + 4) = (u32)(uintptr_t)pane;
++    *(volatile u32 *)(rec + 8) = (u32)((uintptr_t)pane >> 32);
++    hud_log_copy_name(rec + 12, (const char *)pane + 0xb8, 20);
++    {
++        void *parent = *(void **)((const char *)pane + 0x18);
++        if (parent && !((uintptr_t)parent & 7u)) hud_log_copy_name(rec + 32, (const char *)parent + 0xb8, 20);
++        else rec[32] = 0;
++    }
++    *(volatile float *)(rec + 52) = tdx;
++    *(volatile float *)(rec + 56) = tdy;
++    *(volatile float *)(rec + 60) = tk;
++    *(volatile float *)(rec + 64) = fx;
++    *(volatile float *)(rec + 68) = fy;
++    *(volatile float *)(rec + 72) = gx;
++    *(volatile float *)(rec + 76) = gy;
++    *(volatile u32 *)(rec + 80) = (u32)idx;
++    *(volatile u32 *)(rec + 84) = (u32)slot;
++    *(volatile u32 *)(rec + 88) = (u32)hidden;
++    *(volatile u32 *)(rec + 92) = w3;
++    hdr[2] = rc + 1;
++    return 1;
++}
++// Write a type-0 skip record. pname is the parent name (bit-7 skip) or
++// the child names joined by '/' (matcher miss). Returns 1 on success,
++// 0 when the buffer is full.
++static inline __attribute__((always_inline)) int hud_log_skip(volatile char *pb, void *pane, const char *pname, float lx, float ly, float gx, float gy, u32 reason, u32 flags, void *parent) {
++    volatile u32 *hdr = (volatile u32 *)pb;
++    u32 rc = hdr[2];
++    if (rc >= HUD_LOG_REC_CAP) return 0;
++    volatile char *rec = pb + HUD_LOG_REC_OFF + rc * HUD_LOG_REC_SIZE;
++    *(volatile u32 *)(rec + 0) = HUD_LOG_REC_SKIP;
++    *(volatile u32 *)(rec + 4) = (u32)(uintptr_t)pane;
++    *(volatile u32 *)(rec + 8) = (u32)((uintptr_t)pane >> 32);
++    hud_log_copy_name(rec + 12, (const char *)pane + 0xb8, 20);
++    hud_log_copy_name(rec + 32, pname, 20);
++    *(volatile float *)(rec + 52) = 0.0f;
++    *(volatile float *)(rec + 56) = 0.0f;
++    *(volatile float *)(rec + 60) = lx;
++    *(volatile float *)(rec + 64) = ly;
++    *(volatile float *)(rec + 68) = gx;
++    *(volatile float *)(rec + 72) = gy;
++    *(volatile float *)(rec + 76) = 0.0f;
++    *(volatile u32 *)(rec + 80) = reason;
++    *(volatile u32 *)(rec + 84) = flags;
++    *(volatile u32 *)(rec + 88) = (u32)(uintptr_t)parent;
++    *(volatile u32 *)(rec + 92) = (u32)((uintptr_t)parent >> 32);
++    hdr[2] = rc + 1;
++    return 1;
++}
++// The first two direct child names of a pane, joined by '/', into dst
++// (at most max-1 chars, NUL-terminated). The list is walked RAW -- no
++// hud_edge_child_self -- because this is the matcher-miss diagnostic and
++// the guard is what is being diagnosed. Bounded to 16 children; a bad
++// node or an unaligned child ends the walk.
++static inline __attribute__((always_inline)) void hud_log_child_names(char *dst, void *pane, int max) {
++    int ci = 0;
++    void *head = (char *)pane + 0x20;
++    void *node = *(void **)((const char *)pane + 0x28);
++    int nchild = 0;
++    for (int i = 0; i < 16; i++) {
++        if (!node || node == head) break;
++        if (!hud_edge_node_ok(node)) break;
++        void *child = (char *)node - 8;
++        if (((uintptr_t)child & 7u) != 0) break;
++        if (nchild < 2) {
++            if (nchild == 1 && ci < max - 1) dst[ci++] = '/';
++            const char *cn = (const char *)child + 0xb8;
++            for (int j = 0; j < max - 1 && cn[j] && ci < max - 1; j++) dst[ci++] = cn[j];
++        }
++        nchild++;
++        node = *(void **)((const char *)child + 0x10);
++    }
++    dst[ci] = 0;
++}
++
+ void hud_edge(void *pane, const float *aspect_ptr, void *table, const float *params) {
+     if (!pane || !aspect_ptr || !table) return;
+     // (0147) The aspect is no longer read: the edge anchor lives in the
+@@ -570,6 +787,15 @@ void hud_edge(void *pane, const float *aspect_ptr, void *table, const float *par
+     // the stub passes it, and still NULL-checked above.
+     (void)aspect_ptr;
+ 
++    // (0152) The probe buffer, when the host enabled it (DM_HUD_PROBE=1).
++    // log_on is 0 when the probe is off, so every logging call below is
++    // a single branch when off. hud_log_begin initialises the header
++    // (the magic) when it is absent -- the host never writes the magic,
++    // only the enabled flag -- so the first call here is what lets the
++    // host drain anything at all.
++    volatile char *log_pb = hud_log_begin(table);
++    int log_on = log_pb != 0;
++
+     // The manual settings (state +0x200; a NULL params pointer, or an
+     // unwritten block, reads as no manual setting and nothing hidden).
+     u32 manual_mask = 0, hidden_mask = 0;
+@@ -654,12 +880,46 @@ void hud_edge(void *pane, const float *aspect_ptr, void *table, const float *par
+             }
+         }
+     }
+-    if (idx < 0) return;   // not a HUD element: leave it alone
++    if (idx < 0) {
++        // (0152) An "All" pane that matched nothing: log it once, with
++        // its first two child names, so a matcher miss is identifiable
++        // on device (which child the matcher expected, and which it
++        // actually saw). Non-"All" panes are never logged here -- the
++        // game has hundreds of them, and a miss on a non-"All" is not
++        // a matcher failure.
++        if (log_on && nw[0] == HUD_E_ALL0 && hud_log_mark_seen(log_pb, pane)) {
++            char cnames[20];
++            void *lpar = *(void **)((const char *)pane + 0x18);
++            hud_log_child_names(cnames, pane, 20);
++            hud_log_skip(log_pb, pane, cnames,
++                *(const float *)((const char *)pane + 0x30),
++                *(const float *)((const char *)pane + 0x34),
++                *(const float *)((const char *)pane + 0x70 + 12),
++                *(const float *)((const char *)pane + 0x70 + 28),
++                HUD_LOG_SKIP_NOMATCH, (u32)pflags, lpar);
++        }
++        return;   // not a HUD element: leave it alone
++    }
+ 
+     // (0151) S2, continued: the bit-7 guard, moved here from above the
+     // matcher. Unmatched panes already returned; a matched pane with an
+     // entry is never skipped, so a hidden pane can be re-shown.
+-    if (!(pflags & 0x80u) && !hud_edge_find_entry(table, pane)) return;
++    if (!(pflags & 0x80u) && !hud_edge_find_entry(table, pane)) {
++        // (0152) A matched pane skipped by the bit-7 guard (never
++        // calculated): log it once, so a first-frame skip is visible.
++        if (log_on && hud_log_mark_seen(log_pb, pane)) {
++            void *lpar = *(void **)((const char *)pane + 0x18);
++            const char *lpar_name = 0;
++            if (lpar && !((uintptr_t)lpar & 7u)) lpar_name = (const char *)lpar + 0xb8;
++            hud_log_skip(log_pb, pane, lpar_name,
++                *(const float *)((const char *)pane + 0x30),
++                *(const float *)((const char *)pane + 0x34),
++                *(const float *)((const char *)pane + 0x70 + 12),
++                *(const float *)((const char *)pane + 0x70 + 28),
++                HUD_LOG_SKIP_BIT7, (u32)pflags, lpar);
++        }
++        return;
++    }
+ 
+     // What this element should be, this frame. (0137) The runtime applies
+     // ONLY the editor's manual adjustments on top of whatever base the
+@@ -741,6 +1001,23 @@ void hud_edge(void *pane, const float *aspect_ptr, void *table, const float *par
+                 o_orig[HUD_GDX_SLOT] = 0.0f;
+                 o_orig[HUD_GDY_SLOT] = 0.0f;
+                 o_orig[HUD_GK_SLOT] = 1.0f;
++                // (0152) Log the restore, best-effort: the pane was
++                // written back to its original (a manual setting was
++                // just cleared). The entry is released just below, so a
++                // deferred log is not retried here.
++                if (log_on) {
++                    float *rlm = *(float **)((const char *)pane + 0xa0);
++                    u32 rw3 = 4u;   // bit2: a restore, not an apply
++                    if (!rlm) rw3 |= 1u;
++                    if (o_orig[HUD_LM0_SLOT] == 1.0f) rw3 |= 2u;
++                    int rslot = (int)(((uintptr_t)old - (uintptr_t)table) / HUD_EDGE_ENTRY);
++                    rslot = (rslot - idx) / HUD_EDGE_N;
++                    hud_log_match(log_pb, pane, idx, rslot, 0.0f, 0.0f, 1.0f, hidden,
++                        *(const float *)((const char *)pane + 0x30),
++                        *(const float *)((const char *)pane + 0x34),
++                        *(const float *)((const char *)pane + 0x70 + 12),
++                        *(const float *)((const char *)pane + 0x70 + 28), rw3);
++                }
+             }
+             if (!hidden) {
+                 *(uintptr_t *)(old + 0) = 0;
+@@ -997,8 +1274,22 @@ void hud_edge(void *pane, const float *aspect_ptr, void *table, const float *par
+         // e_mod and e_lm0 are left alone; the write below re-applies the
+         // shift to the local matrix and +0x70.
+     }
++    // (0152) The early return also fires only when the match has been
++    // logged (or logging is off): a pending log forces a re-run of the
++    // write block below, so a first-frame match deferred by a disabled
++    // probe is logged one frame late instead of lost.
+     if (!recomputed && *e_dx == edx && *e_dy == edy && *e_k == ek && *e_hidden == (u32)hidden
+-        && e_orig[HUD_GDX_SLOT] == tdx && e_orig[HUD_GDY_SLOT] == tdy && e_orig[HUD_GK_SLOT] == tk) return;   // already correct: nothing to do (0142: the absolute target must match too -- a parent move can leave the compensated delta unchanged while the absolute target moved)
++        && e_orig[HUD_GDX_SLOT] == tdx && e_orig[HUD_GDY_SLOT] == tdy && e_orig[HUD_GK_SLOT] == tk
++        && (e_orig[HUD_LOG_DONE_SLOT] != 0.0f || !log_on)) return;   // already correct: nothing to do (0142: the absolute target must match too -- a parent move can leave the compensated delta unchanged while the absolute target moved)
++
++    // (0152) Whether this write changes the value: the target differs
++    // from the last written absolute target, or the hidden flag differs.
++    // Captured here, before the stores below update them. The log at the
++    // end of the block uses this, so a re-apply of an unchanged target
++    // (the third cut, after the driver's refresh wipes the shift every
++    // frame) does not spam a record per frame.
++    int target_changed = (e_orig[HUD_GDX_SLOT] != tdx || e_orig[HUD_GDY_SLOT] != tdy ||
++                          e_orig[HUD_GK_SLOT] != tk || *e_hidden != (u32)hidden);
+ 
+     // The local shift is always re-derived from the stored original, so a
+     // fixed offset cannot drift: local = original local + effective delta,
+@@ -1089,4 +1380,40 @@ void hud_edge(void *pane, const float *aspect_ptr, void *table, const float *par
+     // from the moved parent on the same frame.
+     *(unsigned short *)((char *)pane + 0x58) |= 0x10u;
+     hud_edge_mark_dirty(pane);
++
++    // (0152) Log the match, but ONLY when the value changed (the target
++    // differs from the last written absolute target -- target_changed,
++    // captured above before the stores updated it) or a log is owed
++    // (e_orig[8] == 0: the first match, a probe that was off, or a full
++    // buffer). The write block re-runs every frame for a pane the game
++    // wipes and re-applies (the third cut, after the driver's refresh),
++    // so logging on every write would spam one record per frame per
++    // element; a re-apply of an unchanged, already-logged target logs
++    // nothing. When logging is off the flag is left 0.0 (owed), and the
++    // early return's !log_on clause keeps the fast path unchanged.
++    {
++        int log_owed = (e_orig[HUD_LOG_DONE_SLOT] == 0.0f);
++        if (log_on && (target_changed || log_owed)) {
++            float *alm = *(float **)((const char *)pane + 0xa0);
++            u32 w3 = 0;
++            if (!alm) w3 |= 1u;   // +0xa0 was NULL
++            if (e_orig[HUD_LM0_SLOT] == 1.0f) w3 |= 2u;   // e_lm0 captured
++            // bit2 (restore) is 0 here: this is an apply, not a restore.
++            int slot = (int)(((uintptr_t)ent - (uintptr_t)table) / HUD_EDGE_ENTRY);
++            slot = (slot - idx) / HUD_EDGE_N;
++            if (hud_log_match(log_pb, pane, idx, slot, tdx, tdy, tk, hidden,
++                    *(const float *)((const char *)pane + 0x30),
++                    *(const float *)((const char *)pane + 0x34),
++                    *(const float *)((const char *)pane + 0x70 + 12),
++                    *(const float *)((const char *)pane + 0x70 + 28), w3)) {
++                e_orig[HUD_LOG_DONE_SLOT] = 1.0f;
++            } else {
++                e_orig[HUD_LOG_DONE_SLOT] = 0.0f;
++            }
++        } else if (!log_on) {
++            e_orig[HUD_LOG_DONE_SLOT] = 0.0f;
++        }
++        // else: the target is unchanged and already logged -- no record,
++        // and the flag stays 1.0f.
++    }
+ }
+diff --git a/dm/games/0100000000010000/patches.py b/dm/games/0100000000010000/patches.py
+index b719168..13ccc89 100644
+--- a/dm/games/0100000000010000/patches.py
++++ b/dm/games/0100000000010000/patches.py
+@@ -32,75 +32,105 @@ BUILD_141 = 'b424be150a8e7d78701cbe7a439d9ebf'   # main 1.4.1 (game.tsv v393216)
+ # an All with a PicView child as compass (MapMiniPlayer's red needle --
+ # #66 S3).
+ HUD_RUNTIME_WORDS = (
+-    "f100003ffa401844fa40180454000220b400022329491c68b940b8017940b006515b18217131042154000141f940140191008004f100003ffa441024"
+-    "540000a0f240083fd29fffe5fa450020540000a8d65f03c0528000075280000817ffffefaa0103e55280020ad10020a9eb09001f540001c054000082"
+-    "cb000129f103fd3f54000149b940b0ab528d2a0972a9ac696b09017f540000a1b940b4ab528e0c296b09017f54001660f94004a57100054a54000100"
+-    "f10000bffa451084540000a0f24008bfd29fffe9fa4900a054fffce8aa0103e552800209d10020aa528d2a0bcb00014c72aacc6beb0a001f540001a0"
+-    "eb00015f54000069f103fd9f54000129b940b0aa6b0b015f540000c1b940b4aa515dd94a7115a54a540012c0d503201ff94004a57100052954000100"
+-    "f10000bfd29fffeafa45108454000080f24008bffa4a00a054fffca8aa0103e55280020ad10020a9528d298bcb00012c72acaccbeb09001f540056a0"
+-    "eb00013f54000069f103fd9f54005629b940b0a96b0b013f540055c15280002936380f86d285ac058b0500441ac92508d11003ff1ac924e71200010a"
+-    "120000e7370015c8aa0203e1140000049102c021eb01009f540014e0b9407c2534ffff85f9400025eb05001f54ffff21f94050032a2603e2710000ff"
+-    "12000042120000c4bd4014202d4608011a8410422d491805b4005043bd4020241e2e1003528000041e23208054000361bd400c6452800024bd408c23"
+-    "1e232080540002c1bd401c64bd409c231e23208054000241bd400064bd4080231e232080540001c1bd400464bd4084231e23208054000141bd401064"
+-    "bd4090231e232080540000c1bd401464bd4094231e2320801a9f07e4d503201f1e20202054004881bd4024211e21204054004821bd4008211e252020"
+-    "540000e1bd401c211e26202054000081520000422a040042340041c2bd003000bd402420bd003400bd400820bd004800bd401c20bd004c00b4000223"
+-    "bd4020211e2e10001e202020540001a1bd408c20bd000c60bd409c20bd001c60bd408020bd000060bd408420bd000460bd409020bd001060bd409420"
+-    "bd001460121f38c2320000c3710000ff910003e51a82006352800066321c00635280000452800002d29fffe8f90003e0390023e67900b003d503201f"
+-    "b4000060f240081f540002e07100fc9f7a40d84454003b6d51000442937c7c40f86068a017fffff752800009373ff0c6d285ac04aa0203e18b040044"
+-    "d503201fb9407c2534000085f9400025eb05001f54ffefe09102c021eb01009f54ffff21d65f03c0f940140391008006f100007ffa4310c454fffcc0"
+-    "f240087ffa48006054fffc69937c7c4a910023e95280040bd29fffee386a692dd100206aeb00014c54000240eb0a001f54000062f103fd9f540001c9"
+-    "7940a06c7100fc5f937c7c4f910003f1321c018c7900a06c510005b0110004847a40d9a45400008011000442f82f6a2a382f6930f94004637100056b"
+-    "54fff8e0f100007ffa4310c454fff880f240087ffa4e006054fff82917ffffe3340034c7d503201ff100007f1a9f07e16a0a003f540034600b090521"
+-    "93407c21bc6178641e24208054003bc152a884051e2700a01e2020905400392c52b884051e2700a01e202090540038a491000421d37ef425bc617863"
+-    "1e232060540039a152a876811e2700201e202070540037cc52b876811e2700201e202070540037448b050061bd4004211e2020281e21142054003841"
+-    "5293334172a7e3211e2700201e20203054003644528cccc172a7fcc11e2700201e202030540035acd503201ff9400c05b40002e5f24008bf540002a1"
+-    "aa0203e1140000049102c021eb04003f54000200b9407c2334ffff83f9400023eb0300bf54ffff21bd407025529e5943bd40682672ae29231e270060"
+-    "1e2020a81e2014c41e2514a054004400d503201f1e2040671e2040861e204025528016011b017d2193407c25f861c8418b0500428b050085aa0203e4"
+-    "eb00003f54000160aa0203e1b9407c23340025a391108084eb05009f54003ce0f9400083aa0403e1eb03001f54ffff01aa0403e1aa0103e49100e025"
+-    "f9405003f8480482eb00005f54002c204f000400529e594272ae29221e2700429101c0085280002abd006822d28000023c8080203c8180203c828020"
+-    "3c8380203c8480203c858020ad0400203d802820bd403000f9000020b9007829bd001420bd403400b9007c2abd002420bd404800bd000820bd404c00"
+-    "bd001c20bc626900bc2268a091001042f100c05f54ffff81b4002b03d2800002d503201fbc626860bc22688091001042f100c05f54ffff811e2e1000"
+-    "bd0020202d4658172d495015bd407c19bd408c18bd400c2052800009bd408c22bd400c701e2028401e202200540003a1bd401032bd409c20bd401c71"
+-    "1e3228001e202220540002e1bd401831bd408020bd4000721e200a201e20224054000221bd408420bd4004721e200a201e20224054000181bd409020"
+-    "bd4010721e200a201e202240540000e1bd409432bd4014601e320a311e2022201a9f17e9d503201f1e22220052800008540002c1bd401c62bd409c20"
+-    "1e20204054000241bd400062bd4080201e202040540001c1bd400462bd4084201e20204054000141bd401062bd4090201e202040540000c1bd401462"
+-    "bd4094201e2020401a9f17e8d503201fbd406830529e594272ae29221e270042bd4014201e222200540005401e202a13f100007f1a9f07e2bd400831"
+-    "bd401c225200012abd4024321e3722602d4dcc3a1e322b521e310a711e220a62540019611e3222c0540019811e3122a054001e011e22228054001921"
+-    "7100005f7a401944540018c1bd400c22bd4044311e3128511e39222054003001bd401032bd4054311e312a511e38222054002f611e26220054000101"
+-    "1e3a20e0540000c11e3320a054000081b94074226b07005f540039c01e262800bd003000bd4024201e272800bd003400bd4008201e250800bd004800"
+-    "bd401c201e250800bd004c00bd4038201e210800bd007000bd403c201e210800bd007400bd4044201e242800bd007c00bd4048201e210800bd008000"
+-    "bd404c201e210800bd008400bd4054201e232800bd008c00b4000403bd4020221e2e10001e20204054000140d2800002d503201fbc626860bc226880"
+-    "91001042f100c05f54ffff811e2e1000bd002020bd408c201e242800bd000c60bd409c201e232800bd001c60bd4080201e210800bd000060bd408420"
+-    "1e210800bd000460bd4090201e210800bd001060bd4094201e210800bd001460121f38c2320000c5710000ff2d018c241a8200a5bd001821321c00a5"
+-    "2d0d1c2652800068910003e4bd00702552800003b900742752800002d29fffe6f90003e0390023e87900b005140000077100fc7f7a40d82454000acd"
+-    "51000422937c7c40f86068802a0203e1b4ffff20f240081f54fffee1f940140291008005f100005ffa4210a454fffe40f240085ffa46004054fffde9"
+-    "937c7c27910023e952800408d29fffec3867692bd1002047eb0000ea54000240eb07001f54000062f103fd5f540001c97940a04a7100fc3f937c7c2d"
+-    "910003ef321c014a7900a04a5100056e110004637a40d9645400008011000421f82d69e7382d692ef94004427100050854fffa60f100005ffa4210a4"
+-    "54fffa00f240085ffa4c004054fff9a917ffffe391108083eb05007f540001a0f9421088aa0303e4eb00011f540000c117fffed4f9400068aa0303e4"
+-    "eb00011f54ffda0091108063eb05007f54ffff41350000e71e2020c80f0004021e2e10001e2204e01e2004a0540001c0f100003f9a82102117fffec4"
+-    "0f0004001e2e1001b9007427bd001821bd007021fc00c020fd00342035000067f900003fb9007c3f911003ffd65f03c00f0004031e2e10011e204064"
+-    "17fffe851e3222c0bd00143754000040bd0024361e3122a0540004811e22228054000040bd001c34520001080a0800426a02015f54000061bd401420"
+-    "17ffff44d2800002bc626860bc22688091001042f100c05f54ffff811e2e1002bd401420bd00202217ffff3a2d4658172d495015bd407c19bd408c18"
+-    "b5ffd943528000085280000917ffff02bd003000bd402420bd003400bd400820bd004800bd401c20bd004c0017fffdcabd00083517ffffdc1e204004"
+-    "17fffe3b1e20400317fffe461e20400117fffe542d465817528000082d49501552800009bd407c19bd408c1817fffeeb0f00040317fffe3b1e2e1001"
+-    "17fffe490f00040417fffe2a1e202020540000a1bd402421528000041e21204054ffb3c0bd003000bd402420bd003400bd400820bd004800bd401c20"
+-    "bd004c0017fffdb7f94004a57100054a54000100f10000bfd29fffe9fa45108454000080f24008bffa4900a054ffa7a8aa0103e55280020ad10020ab"
+-    "eb0b001f540002e0eb00017f54000089cb000169f103fd3f54000249b940b0ac528d0a6972adcd296b09019f540001a1b940b4a97101953f54000141"
+-    "f94010a9910060aef100013ffa4911c4540000a0f240093fd29fffecfa4c012054001048f94004a57100054a54000100f10000bffa451084540000a0"
+-    "f24008bfd29fffe9fa4900a054fffbc852800205d1002029528c882acb00012b72a00c8aeb09001f54000100eb00013f54000069f103fd7f54000089"
+-    "b940b0296b0a013f540001c0f9400421710004a554001260f100003fd29fffe9fa41108454ff9860f240083ffa49002054fffd48d65f03c0d2800001"
+-    "17ffff51f9400c04b4000564f240089f54ff9721f940148191008085f100003ffa4110a454ff9680f240083fd29fffebfa4b002054ff96095280020a"
+-    "d1002029eb09009f5400014054000082cb040129f103fd3f540000c9b940b02c528c286972ae8e096b09019f54000c80f94004217100054a54000ea0"
+-    "f100003ffa4110a454ff93a0f240083ffa4b002054fffd88d65f03c01e2e1000bd406c271e2638861e2020a01e27386754000a401e25182517fffdde"
+-    "d65f03c034000289bd4010201e223b229101c008d28000021e203b00bd004422bd005420121d784971000d3f54000100bc627900bc2278a091000442"
+-    "f100305f54ffff21bd40142017fffe7e9100044217fffff5520001086a08005f54ffcf20d2800002bc626860bc22688091001042f100c05f54ffff81"
+-    "9101c0081e2e1000d2800002bd004439bd002020bd005438121d784971000d3f54000100bc627900bc2278a091000442f100305f54ffff21bd401420"
+-    "17fffe639100044217fffff55280020dd100212ceb0c017f5400022054000082cb0b018cf103fd9f540001a9b940b12f528f0a8c72aa6e8c6b0c01ff"
+-    "54000101b940b52f528d2d0c72acadcc6b0c01ff540000615280006917fffc9bf9400529710005ad54ffed20f100013ffa4911c454ffecc0f240093f"
+-    "d29fffecfa4c012054ffec4917ffffe31e20402517fffd8db940b429528e4eac72a00cac12005d296b0c013f54fff301bd4028211e202028540001a1"
+-    "5280004917fffc83d65f03c01e24204054ffc6411e23224054ffc601bd4018221e21204054ffc5a117fffed4d65f03c052a860411e2700201e202020"
+-    "54000220bd40300152a887211e2700205147d0211e2700221e2028201e2228211e202018540001441e202038540001241e20203052800049528000a1"
+-    "1a81a12917fffc65528000a917fffc631e2140001e21402117fffff7"
++    "f100003ffa401844fa40180454000720b9700044528848a172aa0a416b01009f54000140b9300041528001a4b930085f52802001b9300c5fb930105f"
++    "b9301444b9301841b9301c5fb970044491400c417100049f9a9f0027b40004e32949206ab940b8017940b006515b18217131042154000401d110c3ff"
++    "91008009a9007bfd910003fdf9401404f100009f1a9f17e5eb09009f1a9f17e12a0100a5350000a5f240089fd29fffe1fa410080540002a8b40001a7"
++    "b9400ce8910080ea34007688aa0a03e18b284d4314000003eb01007f540075a0f940002291002021eb00005f54ffff61a9407bfd9110c3ffd65f03c0"
++    "d65f03c0528000085280000a17ffffd9aa0403e15280020ca90153f3a9025bf5d100202beb0b001f54000200eb00017f54000089cb00016bf1007d7f"
++    "54000169b940b02d528d2a0b72a9ac6b6b0b01bf540000c1b940b42d528e0c2b6b0b01bf54001640d503201ff94004217100058c54000100f100003f"
++    "fa411124540000a0f240083fd29fffebfa4b002054fffca8aa0403e15280020bd100202c528d2a0dcb00018e72aacc6deb0c001f540001a0eb00019f"
++    "54000069f1007ddf54000129b940b02c6b0d019f540000c1b940b42c515dd98c7115a58c54001280d503201ff94004217100056b54000100f100003f"
++    "d29fffecfa41112454000080f240083ffa4c002054fffca8aa0403e15280020cd100202b528d298dcb00016e72acaccdeb0b001f54007ca0eb00017f"
++    "54000069f1007ddf54007c29b940b02b6b0d017f54007bc15280002936380f46d285ac058b0500441ac9254a1200014b1ac9250812000108370017aa"
++    "aa0203e1140000049102c021eb01009f540016e0b9407c2534ffff85f9400025eb05001f54ffff21f940500c2a2603e37100011f12000063120000c4"
++    "bd4014202d4608011a8410632d491805b400748cbd4020241e2e1003528000041e23208054000341bd400d8452800024bd408c231e232080540002a1"
++    "bd401d84bd409c231e23208054000221bd400184bd4080231e232080540001a1bd400584bd4084231e23208054000121bd401184bd4090231e232080"
++    "540000a1bd401584bd4094231e2320801a9f07e41e202020540061c1bd4024211e21204054006161bd4008211e252020540000e1bd401c211e262020"
++    "54000081520000632a040063340054e3bd003000bd402420bd003400bd400820bd004800bd401c20bd004c00b400022cbd4020211e2e10001e202020"
++    "540001a1bd408c20bd000d80bd409c20bd001d80bd408020bd000180bd408420bd000580bd409020bd001180bd409420bd001580121f38c3320000c5"
++    "7100011faa0003e41a8300a59100c3ea321c00a55280006b5280000652800003d29fffedf9001be03900e3eb7900b005b4000064f240089f54000500"
++    "7100fcdf7a40d864540044ed51000463937c7c64f864694417fffff752800009373ff106d285ac04aa0203e18b040044d503201fb9407c2534000085"
++    "f9400025eb05001f54fff0209102c021eb01009f54ffff21b40001a7b9400ce4910080e5340079c4aa0503e18b244ca314000003eb03003f540078e0"
++    "f940002291002021eb00005f54ffff61a9407bfda94153f3a9425bf59110c3ffd65f03c0f94014859100808bf10000bffa45116454fffaa0f24008bf"
++    "fa4d00a054fffa49937c7c6e9100e3f05280040fd29ffff3386e6a12d10020aeeb0401d154000240eb0e009f54000062f1007e3f540001c97940a0b1"
++    "7100fc7f937c7c749100c3f6321c02317900a0b151000655110004c67a40da445400008011000463f8346ace38346a15f94004a5710005ef54fff6c0"
++    "f10000bffa45116454fff660f24008bffa5300a054fff60917ffffe334fffa08f100007f1a9f07e16a0b003f540045a00b09052193407c21bc617863"
++    "1e23206054005e2152a884051e2700a01e20207054005c0c52b884051e2700a01e20207054005b8491000421d37ef425bc6178621e22204054005c01"
++    "52a876811e2700201e20205054005a2c52b876811e2700201e202050540059a48b050061bd4004211e2020281e21142054005aa15293334172a7e321"
++    "1e2700201e20203054005824528cccc172a7fcc11e2700201e2020305400578cd503201ff9400c05b40002e5f24008bf540002a1aa0203e114000004"
++    "9102c021eb04003f54000200b9407c2334ffff83f9400023eb0300bf54ffff21bd407024529e5943bd40682672ae29231e2700601e2020881e2014c4"
++    "1e241480540068a0d503201f1e2040471e2040661e204024528016011b017d2193407c25f861c8418b05004b8b050085aa0b03e4eb00003f54000160"
++    "aa0b03e1b9407c233400222391108084eb05009f54006180f9400083aa0403e1eb00007f54ffff01aa0403e1aa0103e49100e02af9405005f8480483"
++    "eb00007f540043604f000400529e594372ae29231e2700659101c00b5280002cbd006825d28000033c8080203c8180203c8280203c8380203c848020"
++    "3c858020ad0400203d802820bd403000f9000020b9007829bd001420bd403400b9007c2cbd002420bd404800bd000820bd404c00bd001c20bc636960"
++    "bc23694091001063f100c07f54ffff81b4004d65d2800003d503201fbc6368a0bc23688091001063f100c07f54ffff811e2e1000bd0020202d465817"
++    "2d495015bd407c19bd408c18bd400c255280000cbd408c20bd400cb01e2528051e252200540003a1bd401032bd409c25bd401cb11e3228a51e252220"
++    "540002e1bd401825bd408031bd4000b21e3108b11e31224054000221bd408431bd4004b21e3108b11e31224054000181bd409031bd4010b21e3108b1"
++    "1e312240540000e1bd409432bd4014b11e3208a51e3120a01a9f17ecd503201f1e2022005280000b540002c1bd401ca5bd409c201e2020a054000241"
++    "bd4000a5bd4080201e2020a0540001c1bd4004a5bd4084201e2020a054000141bd4010a5bd4090201e2020a0540000c1bd4014a5bd4094201e2020a0"
++    "1a9f17ebd503201fbd406830529e594372ae29231e270065bd4014201e25220054002c41bd400c251e2320a054001fe1bd4010251e2220a054001f81"
++    "bd4018251e2120a054001f21b94074236b08007f1a9f07f2d503201f1e262800bd003000bd4024201e272800bd003400bd4008201e240800bd004800"
++    "bd401c201e240800bd004c00bd4038201e210800bd007000bd403c201e210800bd007400bd4044201e232800bd007c00bd4048201e210800bd008000"
++    "bd404c201e210800bd008400bd4054201e222800bd008c00b4000405bd4020251e2e10001e2020a054000140d2800003d503201fbc6368a0bc236880"
++    "91001063f100c07f54ffff811e2e1000bd002020bd408c201e232800bd000ca0bd409c201e222800bd001ca0bd4080201e210800bd0000a0bd408420"
++    "1e210800bd0004a0bd4090201e210800bd0010a0bd4094201e210800bd0014a0121f38c37100011f320000c6aa0003e41a8300c69100c3ee2d018823"
++    "321c00c65280006abd0018215280000b2d0d1c2652800003d29fffecbd007024b9007428f9001be03900e3ea7900b006b4000064f240089f54000100"
++    "7100fd7f7a40d8645400092d51000463937c7c64f86469c417fffff7f94014869100808af10000dffa46114454fffea0f24008dffa4c00c054fffe49"
++    "937c7c6d9100e3f05280040fd29ffff3386d6a1ed10020cdeb0401b154000240eb0d009f54000062f1007e3f540001c97940a0d17100fc7f937c7c74"
++    "9100c3f6321c02317900a0d1510007d51100056b7a40dbc45400008011000463f8346acd38346a15f94004c6710005ef54fffac0f10000dffa461144"
++    "54fffa60f24008dffa5300c054fffa0917ffffe391108083eb05007f540001a0f942108aaa0303e4eb00015f540000c117fffef0f940006aaa0303e4"
++    "eb0a001f54ffdd8091108063eb05007f54ffff41350000e81e2020c80f0004051e2e10001e2504e01e20048054ffcaa0f100003f9a8b102117fffee0"
++    "bd402820b4001f471e2020081a9f17e32a12006334ffc983bd4020241e2e1000f10000bfb94008eb1a9f17ec1e202080321f01832d461406bd407c04"
++    "bd408c001a8c006c7100317f54001d280b0b05645280002ad360fc0d9102e005531b6884d2800003112080848b2440e6b82448ea910030cab90004c0"
++    "b90008cd140000053823694491000463f1004c7f54000060386368a435ffff6491003063382368dff9400c03b4002c83f240086054002c419102e064"
++    "910080c514000005382068a391000400f1004c1f540000603860688335ffff6391008000382068dfd2917463cb020020f2b745c352955562f2d45d03"
++    "72a55542f2e5d1631100056ba94153f39bc37c00a9425bf5bd0034c3d345fc00bd0038c24b090000bd003cc1bd0040c61e2e1001bd0044c59b227c02"
++    "bd0048c4bd004cc0b90050c9d360fc424b807c40b90054c0b90058c8b9005cccb90008ebbd00282117fffd145280003217ffff0b0f0004011e2e1000"
++    "b9007428bd001820bd007020fc00c021fd003421b40009a7bd402021f100019f1a9f17eab94008ec1100114a1e202020321f01432d460803bd407c01"
++    "bd408c001a8a006a7100319f540008080b0c05845280002bd360fc0d9102e005531b6884d2800003112080848b2440e6b82448eb910030cbb90004c0"
++    "b90008cd140000053823696491000463f1004c7f54000060386368a435ffff6491003063382368dff9400c03b4002103f2400860540020c19102e064"
++    "910080c514000005382068a391000400f1004c1f540000603860688335ffff6391008000382068dfd2917463cb020020f2b745c3b90034dff2d45d03"
++    "1e2e1004f2e5d163b90038df529555621100058c9bc37c0072a55542bd003cc4bd0040c3d345fc00bd0044c24b090000bd0048c1bd004cc0b90050c9"
++    "9b227c02d360fc424b807c40b90054c0b90058c8b9005ccab90008ec35ffb4a8a94153f3a9425bf5f900003fb9007c3f17fffcb80f0004021e2e1001"
++    "1e20404317fffdfb1e202a13f10000bf1a9f07e3bd400831bd401c255200018dbd4024321e3722602d4dcc3a1e322b521e310a711e250a6554000521"
++    "1e3222c0540005411e3122a0540009211e252280540004e17100007f7a4019a454000481bd400c25bd4044311e3128b11e39222054003141bd401032"
++    "bd4054311e312a511e382220540030a11e26220054ffcfe11e3a20e054ffcfa11e33208054ffcf61b94074236b08007f54ffcf011e2320a054ffeec1"
++    "1e22224054ffee81bd4018251e2120a054ffee21bd4028301e202208fa4008e454ffce6117fffd671e3222c0bd00143754000040bd0024361e3122a0"
++    "540003e11e25228054000040bd001c345200016b0a0b00636a0301bf54001301bd400c25bd40142017fffe5ca94153f3b900283fa9425bf517fffc6b"
++    "2d4658172d495015bd407c19bd408c18b5ffc2055280000b5280000c17fffe48bd003000bd402420bd003400bd400820bd004800bd401c20bd004c00"
++    "17fffd00bd00083517ffffe17103fd1f54ff8ae82a0803e111000508f9400c0bf8217940b9000ce8350031c5f240089fd29fffe29100c3e3fa420080"
++    "54000748aa0303e1b94008e83900003f7100311f54ff88e80b080504bd407c012d460803531b688411208084bd408c00d360fc099102e0058b2440e2"
++    "d2800001b82448ff91003044b9000440b9000849140000053821688091000421f1004c3f54000060386168a035ffff609100302191007c44d2800020"
++    "3821685f140000053820688191000400f100501f540023008b000061385ff02135ffff41d10004009100800052800043d360fd61110005083820685f"
++    "b900345fb900385fbd003c43bd004042bd004441bd004840b9004c5fb9005043b9005446b900584bb9005c41b90008e817fffc135280002d52800008"
++    "528000017100051f54002289f9400485aa0503e4710041bf54000120f10000bffa451124540000c0f24008bf11000508fa4200a0110005ad54fffe68"
++    "8b21c06117ffffb61e20400117fffd451e20400217fffd331e20400317fffd242d4658175280000b2d4950155280000cbd407c19bd408c1817fffdd8"
++    "0f00040217fffd281e2e100117fffd360f00040317fffd171e202020540000a1bd402421528000041e21204054ff8f60bd003000bd402420bd003400"
++    "bd400820bd004800bd401c20bd004c0017fffc94390080df17ffff05390080df17fffea9d2800003bc6368a0bc23688091001063f100c07f54ffff81"
++    "1e2e1010bd400c25bd401420bd00203017fffdbdf94004217100058c54000100f100003fd29fffebfa41112454000080f240083ffa4b002054ff81a8"
++    "aa0403e15280020cd100202deb0d001f540002e0eb0001bf54000089cb0001abf1007d7f54000249b940b02e528d0a6b72adcd2b6b0b01df540001a1"
++    "b940b42b7101957f54000141f940102b91006030f100017ffa4b1204540000a0f240097fd29fffeefa4e016054001d48f94004217100058c54000100"
++    "f100003ffa411124540000a0f240083fd29fffebfa4b002054fffbc8aa0403e15280020bd100202c528c882dcb00018e72a00c8deb0c001f54000100"
++    "eb00019f54000069f1007ddf54000089b940b02c6b0d019f54000200f94004217100056b54000100f100003fd29fffecfa41112454000080f240083f"
++    "fa4c002054fffd48a94153f3a9425bf517fffb78d280000117fffe10f9400c0bb4ffff4bf240097f54ffff01f94015619100816cf100003ffa411184"
++    "54fffe60f240083fd29fffeffa4f002054fffde95280020ed100202deb0d017f5400014054000082cb0b01adf1007dbf540000c9b940b030528c286d"
++    "72ae8e0d6b0d021f540018e0f9400421710005ce54fffbe0f100003ffa41118454fffb80f240083ffa4f002054fffb2917ffffeb1e2e1000bd406c27"
++    "1e2638661e2020801e27384754001a801e24182417fffcb97103fc9f54ff87a82a0403e111000484f9400c0ad2800008f82178a0b9000ce4b400008a"
++    "f240095f9102e1489a9f0108b94008e92d460803bd407c01bd408c007100313f54ff85a80b090523d360fc049102e005d2800001531b686311208063"
++    "8b2340e2b82348ff91003043b9000440b9000844140000053821686091000421f1004c3f54000060386168a035ffff609100302191008043aa0303e4"
++    "d28000003821685fb50000c8140000083820686191000400f1004c1f54000580386069018b00006435ffff413900009f52800021b900345fd360fd40"
++    "b900385f0b010129a94153f3a9425bf5bd003c43bd004042bd004441bd004840b9004c5fb9005041b9005446b900584ab9005c40b90008e917fffb12"
++    "d280026017fffeec3400064cbd4010201e253b259101c00bd28000031e203b00bd004425bd005420121d786c71000d9f540000e0bc637960bc237940"
++    "91000463f100307f54ffff2117fffe8e9100046317fffff69100cc4417ffffd77100483f1a9fc7e56a05011f54000fa13942c08af94004857100015f"
++    "7a52182054000ecc93407c2e11000421cb0e008491004dce9102c08f93407c248b04006c2a0403e1381ff18aeb0401df54ffdb60386469ea7100489f"
++    "1a9fc7f0910004847100015f1a9f07ec6a0c021f54fffe8117fffed25200016b6a0b007f54ff9900d2800003bc6368a0bc23688091001063f100c07f"
++    "54ffff819101c00b1e2e1000d2800003bd004439bd002020bd005438121d786c71000d9f540000e0bc637960bc23794091000463f100307f54ffff21"
++    "17fffe559100046317fffff69100c3e317fffe775280020fd100216eeb0e01bf5400022054000082cb0d01cef1007ddf540001a9b940b171528f0a8e"
++    "72aa6e8e6b0e023f54000101b940b571528d2d0e72acadce6b0e023f540000615280006917fffb03f940056b710005ef54ffe020f100017ffa4b1204"
++    "54ffdfc0f240097fd29fffeefa4e016054ffdf4917ffffe3b940b42d528e4eb072a00cb012005dad6b1001bf54ffe6a1bd4028211e20202854000380"
++    "52a860411e2700201e202020540002c0bd40300152a887211e2700205147d0211e2700221e2028201e2228211e202018540001441e20203854000124"
++    "1e20203052800049528000a11a81a12917fffadb1e20402417fffbe61e2140001e21402117fffff7528000a917fffad45280004917fffad2aa0503e4"
++    "17fffe72528005e53821c8651100042117ffff81"
+ )
+ 
+ # (0137) The in-game editor runtime: same two Pane::Calculate cuts as
+-- 
+2.43.0
+
