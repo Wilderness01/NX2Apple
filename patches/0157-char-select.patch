@@ -1,19 +1,26 @@
-From 22ff28ece3afd42c385b7b9a3ab91f245c222eee Mon Sep 17 00:00:00 2001
+From 16b5b9d34180329752eb4c781aae5352e276361d Mon Sep 17 00:00:00 2001
 From: seedds <seedds@gmail.com>
-Date: Mon, 16 Nov 2026 13:55:38 +0000
-Subject: [PATCH] =?UTF-8?q?0157:=20title-menu=20character=20+=20costume=20?=
- =?UTF-8?q?picker=20(Mario=20/=20Luigi=20/=20Wario)=20=E2=80=94=20repurpos?=
- =?UTF-8?q?e=20the=20VR=20row=20as=20=E8=A7=92=E8=89=B2=E9=80=89=E6=8B=A9,?=
- =?UTF-8?q?=20fs=20redirect=20for=20the=20model/costume=20files,=20CharSel?=
- =?UTF-8?q?ectEditor=20with=20game-style=20UI;=20Luigi=20models=20+=20Wari?=
- =?UTF-8?q?o=20base=20model?=
+Date: Mon, 16 Nov 2026 11:06:05 +0000
+Subject: [PATCH 1/3] =?UTF-8?q?0157:=20title-menu=20character=20+=20costum?=
+ =?UTF-8?q?e=20picker=20(Mario=20/=20Luigi=20/=20Wario)=20=E2=80=94=20repu?=
+ =?UTF-8?q?rpose=20the=20VR=20row=20as=20=E8=A7=92=E8=89=B2=E9=80=89?=
+ =?UTF-8?q?=E6=8B=A9,=20fs=20redirect=20for=20the=20model/costume=20files,?=
+ =?UTF-8?q?=20CharSelectEditor=20with=20game-style=20UI?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
+Fix (2026-11-16, #70): all 0157 addresses were Mach-O file offsets, not NSO
+vaddrs — patch_nso.py indexes its image by NSO vaddr, so the CUTS assert
+failed (0x797314 held a stp prologue, fd7b01a9, not the tbz). Every 0157
+address is now the NSO vaddr (file offset - 0x300000): CUTS tbz 0x497314,
+FRAME_STEP title setup 0x4972f4, Decide 0x1d78f8, Table A/B 0xec8270/
+0xec8288, re-encoded adrp page 0x120d000, List::setText 0x1d6b70.
+Verified on host: patch_nso.py rewrite of main 1.4.1 exits 0 (cuts 6),
+frame-step test 0 failures.
 ---
- dm/games/0100000000010000/char_select.c       |  57 ++
- dm/games/0100000000010000/patches.py          |  85 ++-
+ dm/games/0100000000010000/char_select.c       |  60 ++
+ dm/games/0100000000010000/patches.py          | 109 +++-
  dm/host/hle_fs.c                              |  79 +++
  dm/host/hud_manual.c                          |  21 +
  dm/ios/Sources/CharSelectEditor.h             |  36 ++
@@ -44,7 +51,8 @@ Content-Transfer-Encoding: 8bit
  .../ObjectData/WarioHandTexture.szs           | Bin 0 -> 139180 bytes
  dm/romfs-overlay/ObjectData/WarioHead.szs     | Bin 0 -> 70720 bytes
  .../ObjectData/WarioHeadTexture.szs           | Bin 0 -> 637708 bytes
- 32 files changed, 804 insertions(+), 2 deletions(-)
+ dm/tools/nso_asm.py                           |   3 +
+ 33 files changed, 833 insertions(+), 3 deletions(-)
  create mode 100644 dm/games/0100000000010000/char_select.c
  create mode 100644 dm/ios/Sources/CharSelectEditor.h
  create mode 100644 dm/ios/Sources/CharSelectEditor.m
@@ -75,10 +83,10 @@ Content-Transfer-Encoding: 8bit
 
 diff --git a/dm/games/0100000000010000/char_select.c b/dm/games/0100000000010000/char_select.c
 new file mode 100644
-index 0000000..4ee3183
+index 0000000..4a52cf7
 --- /dev/null
 +++ b/dm/games/0100000000010000/char_select.c
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,60 @@
 +// char_select.c -- the title-menu character/costume picker stubs (0157).
 +//
 +// Compiled to a word table like hud_runtime.c
@@ -90,7 +98,7 @@ index 0000000..4ee3183
 +// absolute address and no literal pool.
 +//
 +// State page slot (hud_manual.c, the host frame tick):
-+//   +0x260: u32 char-select flag. The Decide stub sets it to 1 when the
++//   +0x260: u32 char-select flag. The switch stub sets it to 1 when the
 +//   player picks the title menu's "角色选择" row; the host's per-present
 +//   frame tick reads it, clears it, and opens the picker (CharSelectEditor).
 +//   The slot is in the free zone +0x250..+0x300 (the HUD masks end at
@@ -113,18 +121,21 @@ index 0000000..4ee3183
 +
 +#define CHAR_SELECT_FLAG_OFF 0x260
 +
-+// The back-to-Update cut (0x1d78f8): the Decide function's "back to
-+// Update" convergence point -- actions 4, 5 and 6 all land here (the
-+// action-4/5/6 check at 0x1d78c8 and the action-6 check at 0x1d78f0 both
-+// branch here), so one cut catches the VR action on both paths. Recompute
-+// the action id the way the game's own switch (0x1d7290) and Decide
-+// (0x1d7800) do -- [obj+0x58] selects the table (0 = pause Table B,
++// The confirm-switch cut (0x1d7290): the switch at 0x1d7290 is the real
++// confirm dispatcher -- it reads [obj+0x58] (table selector) and
++// [obj+0x1c] (selected row), computes action = table[row] and jump-tables
++// to the action handler; its action-6 case (0x1d7334) is the only path to
++// the VR transition (0x1d7740). Decide (0x1d7800) was the first version's
++// hook site and was wrong: it has no BL caller and never runs the VR
++// action (it only special-cases action 0), which is why #71 showed the VR
++// screen and no [char] log line. Recompute the action id the way the
++// switch does -- [obj+0x58] selects the table (0 = pause Table B,
 +// nonzero = title Table A), [obj+0x1c] is the selected row -- and, for
 +// action 6 on the title menu (the repurposed VR row), set the host flag
 +// so the picker opens. Other actions, and the pause menu's VR, are left
-+// alone (the trampoline always continues the back-to-Update sequence).
-+// Returns 1 when the flag was set, 0 otherwise (informational; the
-+// trampoline does not branch on it).
++// alone (the trampoline falls through to the switch). Returns 1 when the
++// flag was set, 0 otherwise; the trampoline returns to the caller on 1
++// (skipping the VR action) and falls through to the switch on 0.
 +int char_select_decide_vr(void *menu, uint8_t *state, const int32_t *tableA, const int32_t *tableB) {
 +    uint8_t sel = *(volatile uint8_t *)((char *)menu + 0x58);
 +    int32_t row = *(volatile int32_t *)((char *)menu + 0x1c);
@@ -137,10 +148,15 @@ index 0000000..4ee3183
 +    return 0;
 +}
 diff --git a/dm/games/0100000000010000/patches.py b/dm/games/0100000000010000/patches.py
-index 8a041fe..a9e46b8 100644
+index 8a041fe..14b6793 100644
 --- a/dm/games/0100000000010000/patches.py
 +++ b/dm/games/0100000000010000/patches.py
-@@ -7,6 +7,15 @@ from nso_asm import ADDI, ADRP, B, LDP_POST, STP_PRE
+@@ -3,10 +3,19 @@
+ # NSO build ID; CUTS, OBS and FRAME_STEP as described there ("Registered patches").
+ # Only FRAME_STEP is used here: the in-game HUD editor runtime (hud_runtime.c,
+ # 0147). There are no word cuts and no observation gates.
+-from nso_asm import ADDI, ADRP, B, LDP_POST, STP_PRE
++from nso_asm import ADDI, ADRP, B, CBNZ, LDP_POST, STP_PRE
  
  BUILD_141 = 'b424be150a8e7d78701cbe7a439d9ebf'   # main 1.4.1 (game.tsv v393216)
  
@@ -156,7 +172,7 @@ index 8a041fe..a9e46b8 100644
  # hud_runtime, compiled from hud_runtime.c (0137 in-game editor runtime, 0147
  # layout-aware matcher + restore to the .bflyt base, 0150 local-matrix write,
  # 0151 third cut + bit-7-guard move + PicView matcher)
-@@ -208,9 +217,83 @@ def _hud_runtime_frame_step(ctx):
+@@ -208,9 +217,105 @@ def _hud_runtime_frame_step(ctx):
      emit(B(here(), 0x909da4))                  # back to the hook site + 4
      fs_put(0x909da0, [B(0x909da0, rstart)], 'Forced recompute 0x909d4c +0x150: the in-game HUD editor runtime, re-applied after the game\'s post-Calculate refresh (hud_runtime.c)')
  
@@ -174,20 +190,35 @@ index 8a041fe..a9e46b8 100644
 +)
 +
 +# (0157) The title-menu "角色选择" row (the repurposed VR row, title row 3,
-+# action 6, pane ParList06) and the Decide intercept that opens the picker.
-+# Two cuts, both in the title setup / Decide paths; the HUD runtime above
-+# is untouched.
++# action 6, pane ParList06) and the confirm intercept that opens the picker.
++# Two cuts, both in the title setup / confirm paths; the HUD runtime above
++# is untouched. The first version hooked Decide's merge point (0x1d78f8);
++# that was wrong: Decide (0x1d7800) has no BL caller and never runs the
++# VR action -- the confirm is dispatched by the switch at 0x1d7290,
++# called from Update (0x1d7548) and from 0x1d7184, whose action-6 case
++# (0x1d7334) is the only path to the VR transition (0x1d7740). The
++# intercept moved to the switch entry (fix report
++# REPORT-CHAR-SELECT-VR-STILL.md in the staging dir).
 +#   * 0x4972f4 (title setup 0x497220, after rows 0-2 are set): the row-3
 +#     text becomes the hardcoded UTF-16 "角色选择" via List::setText.
 +#     The text is a raw UTF-16 pointer (the layout setter 0x6314e0 scans
 +#     it as UTF-16, 0x6a6180), so no MSBT label is needed. setText(row 3)
 +#     reads Table A[3] = 6 and writes panes[6] (ParList06), which exists.
-+#   * 0x1d78f8 (Decide's back-to-Update convergence point): actions 4, 5
-+#     and 6 all land here, so one cut catches the VR action on both of
-+#     Decide's paths. The stub recomputes the action id and, for action 6
-+#     on the title menu (Table A), sets the host flag (state +0x260) so
-+#     the picker opens; the pause menu's VR (Table B) and actions 4/5 are
-+#     left alone, and the back-to-Update sequence always runs.
++#     The trampoline also clears [List+0x59] afterwards: the setup tail
++#     calls the show path (0x1d6d00), which re-applies the VR label to
++#     panes[6] whenever [List+0x59] != 0 (it is 1 from the List ctor,
++#     0x1d6610) and would overwrite the new text. With +0x59 cleared the
++#     show path returns at once and the row keeps "角色选择" (rows 0-2
++#     prove setText alone displays a row's text -- they never go through
++#     show). The CUTS NOP at 0x497314 still forces the show path to run
++#     (so the row is not hidden); the clear only stops it re-writing.
++#   * 0x1d7290 (the confirm switch entry): the stub recomputes the
++#     action id from the same fields the switch reads ([x0+0x58] table
++#     selector, [x0+0x1c] row) and, for action 6 on the title menu
++#     (Table A), sets the host flag (state +0x260) so the picker opens
++#     and the trampoline returns to the caller, skipping the VR action
++#     entirely; the pause menu's VR (Table B) and actions 0-5 fall
++#     through to the re-executed ldrb and the switch runs normally.
 +# The VR row is forced visible by the CUTS entry above (the 2P-activation
 +# gate at 0x497314 is NOPed): the "角色选择" row must always show.
 +def _char_select_frame_step(ctx):
@@ -196,22 +227,28 @@ index 8a041fe..a9e46b8 100644
 +    hx = ''.join(CHAR_SELECT_WORDS)
 +    for i in range(0, len(hx), 8):
 +        emit(int(hx[i:i + 8], 16))
-+    # The Decide intercept at 0x1d78f8: `adrp x1, #0x120d000`.
-+    # No x30 save: Decide (0x1d7800) saves x29/x30 in its own frame at
-+    # entry (0x1d7808) and restores them before ret (0x1d79b4), so the
-+    # trampoline's bl may clobber x30 (the HUD stubs do the same).
-+    # The replaced adrp is RE-ENCODED for the trampoline's PC (adrp is
-+    # PC-relative; the original word would compute the wrong page here).
-+    fs_site(0x1d78f8, 'a18100d0')
-+    dstart = here()
-+    emit(0xaa1303e0)                            # mov x0, x19 (the menu/List)
++    # The confirm-switch intercept at 0x1d7290: `ldrb w11, [x0, #0x58]`.
++    # x0 (the menu/List) and x30 (the return address into Update 0x1d754c
++    # or 0x1d7188) are saved across the bl: the stub clobbers x0 (w0
++    # becomes the row) and the bl clobbers x30. The stub is a leaf and
++    # touches no callee-saved register, so nothing else needs saving.
++    # The replaced ldrb is NOT PC-relative, so it is re-executed verbatim.
++    # cbnz tests the stub's return value (w0), not the flags -- the stub
++    # leaves the flags arbitrary.
++    fs_site(0x1d7290, '0b604139')
++    sstart = here()
++    emit(STP_PRE(0, 30, 31, -16))              # stp x0, x30, [sp, #-16]! (live: the menu/List, the return address)
 +    emit(ADRP(1, here(), FS_STATE_OFF))         # x1 = state page
 +    emit(ADRP(2, here(), 0xec8270))            # x2 = Table A (title)
 +    emit(ADRP(3, here(), 0xec8288))            # x3 = Table B (pause)
 +    emit(B(here(), char_code) | 0x80000000)     # bl char_select_decide_vr
-+    emit(ADRP(1, here(), 0x120d000))            # adrp x1, #0x120d000 (the replaced instruction, re-encoded)
-+    emit(B(here(), 0x1d78fc))                   # back to the hook site + 4
-+    fs_put(0x1d78f8, [B(0x1d78f8, dstart)], 'Decide back-to-Update: title VR row (action 6, Table A) opens the character picker (char_select)')
++    emit(LDP_POST(0, 30, 31, 16))              # ldp x0, x30, [sp], #16
++    ret_at = sstart + 36
++    emit(CBNZ(0, here(), ret_at))               # cbnz w0, ret (stub set the flag: skip the VR action)
++    emit(0x3941600b)                            # ldrb w11, [x0, #0x58] (the replaced instruction)
++    emit(B(here(), 0x1d7294))                  # back to the hook site + 4
++    emit(0xd65f03c0)                            # ret (to the switch's caller)
++    fs_put(0x1d7290, [B(0x1d7290, sstart)], 'Confirm switch entry: title VR row (action 6, Table A) opens the character picker, VR skipped (char_select)')
 +    # The row-3 text: UTF-16LE "角色选择" + NUL, emitted as data words.
 +    row3_str = here()
 +    emit(0x827289d2)                            # bytes D2 89 72 82 (角 色)
@@ -224,6 +261,7 @@ index 8a041fe..a9e46b8 100644
 +    emit(0xaa1403e0)                             # mov x0, x20 (the list)
 +    emit(0x52800061)                             # mov w1, #3 (row 3, the VR row)
 +    emit(B(here(), 0x1d6b70) | 0x80000000)       # bl List::setText
++    emit(0x3901669f)                             # strb wzr, [x20, #0x59] (clear the List's "needs show" flag, so the setup tail's show path does not re-apply the VR label over the new text; x20 is callee-saved, setText preserves it)
 +    emit(0xf9400e68)                             # ldr x8, [x19, #0x18] (the replaced instruction; ldr is not PC-relative)
 +    emit(B(here(), 0x4972f8))                    # back to the hook site + 4
 +    fs_put(0x4972f4, [B(0x4972f4, rstart)], 'Title menu setup: row 3 (VR) text becomes "角色选择" (char_select)')
@@ -235,9 +273,9 @@ index 8a041fe..a9e46b8 100644
 +FRAME_STEP = {BUILD_141: _frame_step_141}
  
  BINDING = [
-+    {'what': "Character picker on the title menu, v1 (char_select.c, 0157: the VR row -- title row 3, action 6, pane ParList06 -- is repurposed as the '角色选择' row. A 7th row cannot be added through the table: the List ctor (0x1d6610, called once from 0x495504 with w5 = 7) allocates the pane array as count * 8 = 56 bytes (7 entries, actions 0-6), the layout has exactly 7 row panes (ParList00-06), and Table A has 6 entries [0,1,2,6,3,5] -- Table B starts right after it (0xec8288), so there is no Table A[6], so writing 7 there would break the pause menu's Continue row. The VR row is repurposed instead: VR on iPhone is barely usable, the pause menu keeps its own VR row (Table B[2] = 6), and the Decide stub tells the two apart by the table selector ([list+0x58]: 1 = title Table A, 0 = pause Table B). One CUTS entry NOPs the VR row's 2P-activation gate (0x497314 tbz -> nop) so the row always shows. Two FRAME_STEP cuts: (a) title setup 0x4972f4 sets row 3's text to the hardcoded UTF-16 '角色选择' via List::setText -- the text is a raw UTF-16 pointer (the layout setter 0x6314e0 scans it as UTF-16, 0x6a6180), so no MSBT label is needed, and setText(row 3) reads Table A[3] = 6 and writes panes[6] (ParList06), which exists; (b) Decide's back-to-Update convergence point 0x1d78f8 (actions 4, 5, 6 all land here, so one cut catches the VR action on both of Decide's paths) recomputes the action id and, for action 6 on the title menu, sets the host flag (state +0x260) so the picker opens; the pause menu's VR and actions 4/5 are left alone, and the back-to-Update sequence always runs. The host flag is polled once per present (dm_char_select_frame_tick, uw.c) and opens CharSelectEditor. The model/costume redirect lives in the host filesystem layer (dm_char_redirect in hle_fs.c): the game never names the player model in code, so there is no game-binary hook for the model; DM_CHAR_SELECT (mario/luigi/wario) + DM_CHAR_CAP / DM_CHAR_CLOTHES (costume name, 'default', or unset = follow the save) rewrite rom:/ObjectData/Mario*.szs to the selected character's versions (Luigi.szs, WarioColorWarioHead.szs, ...) from the romfs-overlay, only when the overlay has the target, falling back to the character's default part so an unadapted costume never turns the player back into Mario and never fails the open. The picker UI (CharSelectEditor, ObjC) reuses the game's own parts: title-menu SelectMenuParts rows for the characters, a Closet-style horizontal strip for the costumes, and the game's own font (dm/font/standard.ttf). Persistence is NSUserDefaults DmCharSelect.* (character + cap + clothes), applied into DM_CHAR_* at launch by the launcher (like DmHudPad.*) and live via setenv (like DM_HUD_*). Models ship in dm/romfs-overlay/ObjectData/ as Luigi*.szs / Wario*.szs (95 files, ~39 MB: Luigi defaults + 3 adapted costumes, Wario defaults + 10 adapted costume sets); Mario uses the base RomFS files. Peach/Toad/Pauline are not in this round (no ready models) and are not listed.", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
++    {'what': "Character picker on the title menu, v1 (char_select.c, 0157: the VR row -- title row 3, action 6, pane ParList06 -- is repurposed as the '角色选择' row. A 7th row cannot be added through the table: the List ctor (0x1d6610, called once from 0x495504 with w5 = 7) allocates the pane array as count * 8 = 56 bytes (7 entries, actions 0-6), the layout has exactly 7 row panes (ParList00-06), and Table A has 6 entries [0,1,2,6,3,5] -- Table B starts right after it (0xec8288), so there is no Table A[6], so writing 7 there would break the pause menu's Continue row. The VR row is repurposed instead: VR on iPhone is barely usable, the pause menu keeps its own VR row (Table B[2] = 6), and the switch stub tells the two apart by the table selector ([list+0x58]: 1 = title Table A, 0 = pause Table B). One CUTS entry NOPs the VR row's 2P-activation gate (0x497314 tbz -> nop) so the row always shows. Two FRAME_STEP cuts: (a) title setup 0x4972f4 sets row 3's text to the hardcoded UTF-16 '角色选择' via List::setText -- the text is a raw UTF-16 pointer (the layout setter 0x6314e0 scans it as UTF-16, 0x6a6180), so no MSBT label is needed, and setText(row 3) reads Table A[3] = 6 and writes panes[6] (ParList06), which exists; (b) the confirm switch entry 0x1d7290 (the switch is the real confirm dispatcher -- Decide 0x1d7800 has no BL caller and never runs the VR action; the switch's action-6 case 0x1d7334 is the only path to the VR transition) recomputes the action id from the same fields the switch reads ([x0+0x58] selector, [x0+0x1c] row) and, for action 6 on the title menu, sets the host flag (state +0x260) so the picker opens and returns to the caller, skipping the VR action entirely; the pause menu's VR and actions 0-5 fall through to the switch normally. The setup trampoline also clears [List+0x59] after setting the text, so the setup tail's show path (0x1d6d00) does not re-apply the VR label over it (the first version's text was overwritten this way). The host flag is polled once per present (dm_char_select_frame_tick, uw.c) and opens CharSelectEditor. The model/costume redirect lives in the host filesystem layer (dm_char_redirect in hle_fs.c): the game never names the player model in code, so there is no game-binary hook for the model; DM_CHAR_SELECT (mario/luigi/wario) + DM_CHAR_CAP / DM_CHAR_CLOTHES (costume name, 'default', or unset = follow the save) rewrite rom:/ObjectData/Mario*.szs to the selected character's versions (Luigi.szs, WarioColorWarioHead.szs, ...) from the romfs-overlay, only when the overlay has the target, falling back to the character's default part so an unadapted costume never turns the player back into Mario and never fails the open. The picker UI (CharSelectEditor, ObjC) reuses the game's own parts: title-menu SelectMenuParts rows for the characters, a Closet-style horizontal strip for the costumes, and the game's own font (dm/font/standard.ttf). Persistence is NSUserDefaults DmCharSelect.* (character + cap + clothes), applied into DM_CHAR_* at launch by the launcher (like DmHudPad.*) and live via setenv (like DM_HUD_*). Models ship in dm/romfs-overlay/ObjectData/ as Luigi*.szs / Wario*.szs (95 files, ~39 MB: Luigi defaults + 3 adapted costumes, Wario defaults + 10 adapted costume sets); Mario uses the base RomFS files. Peach/Toad/Pauline are not in this round (no ready models) and are not listed.", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
 +     'why': "The title menu's List is built for exactly 7 actions and the table has 6 entries, so a new row cannot be added through the table -- the VR row is the only repurposable one, and the stub discriminates title from pause by the table selector so the pause menu's VR is untouched. The row text needs no MSBT work because the layout setter reads a raw UTF-16 pointer. The model has no game-binary hook (the name comes from data through the CRC32-hashed resource system), so the redirect lives in the host filesystem layer where every open's full guest path is visible, and it only rewrites to a file the overlay actually has, so an unadapted costume falls back to the character's default instead of reverting to Mario or failing the open. The picker reuses the game's own UI parts (SelectMenuParts rows, Closet strip, game font) so it looks like the game, not an iOS overlay.",
-+     'blocked': 'device test: the row must read 角色选择 (not 用VR游玩 -- the layout message system may re-apply the VR text after setup, in which case the text-set moves to the List Appear hook); the picker must open on picking the row; Luigi/Wario must load with the right body/head/cap on device (Wario FSKL is 50% larger than Mario, needs device confirmation)'},
++     'blocked': 'device test: the row must read 角色选择 (the show-path overwrite is fixed by the +0x59 clear, proven by disassembly; if it still shows the VR label, the text-set moves to the List Appear hook); the picker must open on picking the row (the switch hook replaces the dead Decide hook -- if it does not open, the next step is a probe log in the switch trampoline); Luigi/Wario must load with the right body/head/cap on device (Wario FSKL is 50% larger than Mario, needs device confirmation)'},
      {'what': "HUD editor runtime, v17 (hud_runtime.c, 0151: three cuts -- entry +0x20 at 0x9094b4, +0x13c at 0x9095d0, and the forced-recompute cut at 0x909da0 inside 0x909d4c; applies ONLY the editor manual deltas from the DM_HUD_* environment variables via hud_manual.c, state page +0x200: 18 floats dx/dy/k for elements 0 compass, 1 lives, 2 coins, 3 moons, 4 hints (unused), 5 regional coins, manual mask +0x248, hidden mask +0x24C; dx clamped +-640, dy +-360, k clamped [0.6, 1.8]; no auto-edge term -- the edge anchor lives in the 0136/0143 .bflyt overlay, so the edge is never applied twice. 0150 writes the pane LOCAL matrix (+0xa0) as well as +0x30/+0x48 and +0x70: Pane::Calculate recomposes +0x70 from the +0xa0 matrix every frame, so a +0x70 write alone is wiped on the next Calculate (the #65 drag failure -- 0147 never wrote the matrix, the e_mod recompute check then mistook the wipe for a game recompose and polluted the stored original, and every later write became a no-op). The runtime stores the original local matrix per entry (e_lm0, entry +128, 12 floats; a NULL +0xa0 skips only the matrix write) and re-derives the matrix write from it with the ABSOLUTE target (tdx/tdy/tk); the restore writes the matrix back to e_lm0 too; the e_mod recompute check only follows e_mod when the live local matrix still holds the shift (a stale-matrix recompose leaves e_mod alone and the write re-applies). Table entry 128 -> 176 bytes, HUD_EDGE_SLOTS_PER_ELEM 16 -> 11 (66 entries, state +0x300..+0x3060, short of the diagnostic probe buffer at +0x3300; the 0147 matcher takes one 'All' per layout instance, so eleven slots per element is still several times the realistic maximum). 0151 S1: the per-frame layout driver (0xa1cb80) restores a counter All pane's local to base and recomposes +0x70 from it AFTER the +0x13c hook and BEFORE Draw, via the forced recompute 0x9036cc -> 0x909d4c (only caller the driver at 0xa1cdf8, force=1), bypassing both Calculate cuts -- the #66 wipe (only the compass moved); the third cut at 0x909da0 (after 0x909d4c's own recompute, before its children loop) re-applies the shift there. 0151 S2: the bit-7 guard moved to after the matcher -- a hidden pane's Calculate clears bit 7, so the old guard skipped it forever and hide->show was dead (#66); a matched pane with a table entry is never skipped now, while a never-calculated pane with no entry is still skipped on its first frame. 0151 S3: an All with a 'PicView' child matches compass (MapMiniPlayer's red needle; MapPlayer's PicView sits under Icon00, so the full-screen map does not match). 0147 layout-aware matcher: only a layout's 'All' container is ever matched (the display side), identified by its direct children -- compass: 'PicMap' child (MapMini) or 'PicView' child (MapMiniPlayer); lives: 'Life' child (CounterLife/Kids/Up); moons: 'Shine' child with a 'TxtShine' child (CounterShine); coins/regional: 'Add' child, told apart by the 'Capture' sibling's tx under the same RootPane (0 = CounterCoin, 130 = CounterCollectCoin; another tx falls back to All tx, nearest of -740/-615; no Capture sibling matches nothing). The old name matcher is gone: 'PicStrap' (BootLoading strip), 'Counter' (moon-tower container), 'TxtGuide01' (hints) and the capture content panes ('TxtCounterSh'/'TxtCounter'/'TxtIconSh'/'TxtIcon' under Capture00-03) are never matched -- moving content panes emptied the 128x128 capture texture (R1, log-51: a manual value moved the glyphs out of the texture and restoring never repainted it), and the name matches hit the wrong layouts (R2). Hints and the white bar have no matcher entry and stay hidden in the overlay. Restore: a mask-0 element takes no table entry and writes nothing; a pane with an existing entry has its local (+0x30/+0x48) and its local matrix (+0xa0) written back to e_orig / e_lm0 (its first-seen local, the overlay's default edge position) and is marked dirty (flags bit 4) so the game recomposes +0x70 from the restored matrix; +0x70 itself is never restored to e_mod; once restored and visible the entry is released. Each element takes 1 slot (its All container). Hide is a TRUE hide (flags bit 0 at +0x58 cleared), only on matched All containers. 0137/0142 kept: +0x70 is written directly at the +0x13c cut from the stored original global (e_mod) and the local as fallback; the global write uses the ABSOLUTE target (tdx/tdy/tk, stored in e_orig slots [1]/[2]/[4]) while the local uses the parent-compensated delta; a dirty flag so a moved container carries its children, an orig/mod table so a fixed offset never drifts. The 0118 auto-edge code (hud_edge.c, _hud_edge_frame_step, HUD_EDGE_WORDS) and the diagnostic probe (HUD_PROBE_WORDS, hud_probe.c) are deleted from this profile -- the probe stays a diagnostic tool only, never shipped", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
       'why': "Pane::Calculate and the pane layout are this build's nn::ui2d code, found by the HUDLOG diagnostic run (log-17) and confirmed by disassembly of DmIOS. The manual settings come from the HUD editor through the same environment-variable channel the launcher already uses for its other settings (DM_SCREEN_ASPECT), so the game reads nothing new: the host copies them to state page +0x200 once per present. The .bflyt ground truth (REPORT-HUD-REDO.md B, all 215 layouts parsed) is why the matcher is layout-aware: the coins and regional-coins content panes share names across two layouts, the capture texture mechanism means only the All container may move, and 'Counter'/'PicStrap' name matches hit the moon tower and the BootLoading strip. The old name matcher moved content panes and emptied the capture texture (log-50/51: coins and regional coins vanished after a manual value, and restoring the default never repainted the texture). The runtime keeps no user-adjustable state in the game beyond the orig/mod table, and its only tree walks are the bounded child-name checks and the bounded flag-only mark-dirty, so the 0113 crash class (a name/match walk reading a pane through a bad pointer) is structurally absent",
       'blocked': 'the stubs have no function-matched form yet'},
@@ -111430,6 +111468,20 @@ i?i3fdv2OU2>^TMf@9oO}{yHvqBu?IKGep1P^Zq~dPA!H2
 literal 0
 HcmV?d00001
 
+diff --git a/dm/tools/nso_asm.py b/dm/tools/nso_asm.py
+index db941fc..0c500a6 100644
+--- a/dm/tools/nso_asm.py
++++ b/dm/tools/nso_asm.py
+@@ -23,6 +23,9 @@ def CMPR(n, m): return 0xEB00001F | (m << 16) | (n << 5)   # cmp xn, xm (subs xz
+ def BEQ(frm, to):
+     off = to - frm; assert -(1 << 20) <= off < (1 << 20) and off % 4 == 0
+     return 0x54000000 | (((off >> 2) & 0x7FFFF) << 5)
++def CBNZ(rt, frm, to):
++    off = to - frm; assert -(1 << 20) <= off < (1 << 20) and off % 4 == 0
++    return 0x35000000 | (((off >> 2) & 0x7FFFF) << 5) | rt   # cbnz w<rt>, <to> (tests the register, not the flags)
+ def BRK(imm): return 0xD4200000 | ((imm & 0xFFFF) << 5)
+ def BLR(n): return 0xD63F0000 | (n << 5)
+ NOP = 0xD503201F
 -- 
 2.43.0
 
