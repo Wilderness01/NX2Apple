@@ -1,0 +1,439 @@
+From 68225c3d5da5a530705bd77d2110fb3bbbbb6a80 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Mon, 16 Nov 2026 01:40:05 +0000
+Subject: [PATCH] 0151: re-apply the HUD shift after the game's forced
+ recompute; fix hide->show deadlock; match the MapMiniPlayer needle
+
+S1: the per-frame layout driver (0xa1cb80) restores a counter All pane's
+local to base and recomposes +0x70 from it AFTER the +0x13c hook and
+BEFORE Draw, via the forced recompute 0x9036cc -> 0x909d4c (only caller
+the driver at 0xa1cdf8, force=1), bypassing both Calculate cuts -- the
+#66 wipe (only the compass moved). New third cut at 0x909da0, inside
+0x909d4c after its own recompute and before its children loop, so the
+same hud_edge re-applies the shift there. Neither in-Calculate recompute
+path can do this: both run before the +0x13c cut and recompose from the
+hook's own shifted values.
+S2: move the bit-7 guard to after the matcher -- a hidden pane's
+Calculate early-exits (0x90969c/0x9096a4) and clears bit 7, so the old
+guard skipped it forever and hide->show was dead. A matched pane with
+a table entry is never skipped now; a never-calculated pane with no
+entry is still skipped on its first frame.
+S3: an All with a PicView direct child matches compass (MapMiniPlayer's
+red needle; MapPlayer's PicView sits under Icon00, so the full-screen
+map does not match).
+Also: hud_probe.c / hud_manual.c stale table-layout comments (96x128,
+16 slots -> 66x176, 11 slots); hud_edge_mark_dirty comment corrected
+(bit 4 -> CalculateLocalMatrix 0x9096d0 from the pane's own components,
+not the bit-5 global computation).
+---
+ dm/games/0100000000010000/hud_probe.c   |   8 +-
+ dm/games/0100000000010000/hud_runtime.c |  92 ++++++++++--
+ dm/games/0100000000010000/patches.py    | 185 +++++++++++++++---------
+ dm/host/hud_manual.c                    |   2 +-
+ 4 files changed, 204 insertions(+), 83 deletions(-)
+
+diff --git a/dm/games/0100000000010000/hud_probe.c b/dm/games/0100000000010000/hud_probe.c
+index 37098f2..60d95fc 100644
+--- a/dm/games/0100000000010000/hud_probe.c
++++ b/dm/games/0100000000010000/hud_probe.c
+@@ -198,9 +198,11 @@ typedef unsigned long uintptr_t;
+ #define HP_R_W2 88
+ #define HP_R_W3 92
+ 
+-// The hud_edge table (must match hud_edge.c): 96 entries of 128 bytes,
+-// sixteen slots per element; entry +0 the pane, +104/+108/+112 the applied
+-// dx/dy/k, +116 the hidden flag, +120 the element index, +124 the valid flag.
++// The hud_edge table (must match hud_runtime.c): 66 entries of 176 bytes,
++// eleven slots per element; entry +0 the pane, +104/+108/+112 the applied
++// dx/dy/k, +116 the hidden flag, +120 the element index, +124 the valid flag,
++// +128 the original local matrix (e_lm0, 12 floats). (0151: was 96 x 128,
++// 16 slots -- stale since 0150.)
+ #define HUD_EDGE_N 6
+ #define HUD_EDGE_ENTRY 128
+ #define HUD_EDGE_SLOTS_PER_ELEM 16
+diff --git a/dm/games/0100000000010000/hud_runtime.c b/dm/games/0100000000010000/hud_runtime.c
+index db27347..8dcc218 100644
+--- a/dm/games/0100000000010000/hud_runtime.c
++++ b/dm/games/0100000000010000/hud_runtime.c
+@@ -60,15 +60,48 @@
+ //
+ // The hook runs from the same two rewriter cuts as the old 0113
+ // (Pane::Calculate main+0x909494: the entry cut at +0x20 and the +0x13c cut
+-// at +0x13c), because one cut misses static panes (see the old hud_calc.c
+-// header: the skip path over the +0x13c site). It matches the five HUD
+-// widgets by pane name only -- no subtree walk, no tree search, no
++// at +0x13c), PLUS a third cut (0151) in the forced-recompute recursion
++// 0x909d4c at +0x150 (see the 0151 note below), because one cut misses
++// static panes (see the old hud_calc.c header: the skip path over the
++// +0x13c site). It matches the five HUD widgets by pane name only -- no subtree walk, no tree search, no
+ // guide/root classification, no camera widening, no log. The only walk is the
+ // dirty-mark for a moved container's children (hud_edge_mark_dirty), which
+ // only sets a flag and uses the v8 single struct-array (no second base
+ // register, so the log-27 sdepth/x18 fault class is structurally absent);
+ // it never reads a pane name and never decides a match.
+ //
++// (0151) The #66 partial failure (REPORT-HUD-66-PARTIAL.md): only the
++// compass moved, hide->show was dead, and the compass's red needle never
++// hid. Three separate causes, three fixes in this file and patches.py:
++//   S1 -- the game refreshes the four counter layouts' transform AFTER the
++//   +0x13c hook and BEFORE Draw, every frame: the per-frame layout driver
++//   (0xa1cb80) calls Pane::Calculate (both hook cuts run), then the
++//   animation/game code restores the All pane's +0x30 (and local matrix)
++//   to its base, then the driver calls the forced recursive recompute
++//   0x9036cc -> 0x909d4c (the ONLY +0x70 recompute in the binary outside
++//   Pane::Calculate; its only caller is the driver at 0xa1cdf8, force=1),
++//   which recomposes +0x70 from the restored base and bypasses both hook
++//   cuts entirely. Neither in-Calculate recompute path can do this: both
++//   run BEFORE the +0x13c cut and recompose from the hook's own shifted
++//   values (disassembly: bit-5 path 0x909558, dirty path via
++//   CalculateLocalMatrix 0x9096d0, which writes only +0x70/+0x90, never
++//   +0xa0). The fix is a third cut in patches.py at 0x909da0, inside
++//   0x909d4c after its own recompute (bl CalculateLocalMatrix at 0x909d9c)
++//   and before its children loop: the same hud_edge re-applies the shift
++//   there, so the children recompose from the shifted parent and Draw
++//   renders the shift. No hud_edge logic change was needed for S1.
++//   S2 -- hide->show deadlock (PROVEN): a hidden pane's Calculate
++//   early-exits (0x90969c/0x9096a4) and clears bit 7, so the old bit-7 guard
++//   above the matcher skipped the pane forever and the bit-0 show write
++//   never ran. The guard moved to AFTER the matcher (below): a matched
++//   pane always gets its bit-0 set/clear applied even when bit 7 is clear.
++//   It still skips a pane that never calculated AND has no table entry
++//   (first frame: +0x70 still zero, e_mod would capture a zero global).
++//   S3 -- the red needle is PicView in the separate MapMiniPlayer layout
++//   (no needle pane exists in MapMini); the matcher now takes an All with
++//   a PicView DIRECT child as compass (idx 0). MapPlayer's PicView sits
++//   under Icon00, so the full-screen map does not match.
++//
+ // (0137) Runtime HUD control for the in-game editor: the DISPLAYED
+ // position is moved by writing the pane's GLOBAL matrix (+0x70) directly,
+ // not by shifting the local and hoping the game recomposes it. 0135 proved
+@@ -312,6 +345,13 @@ typedef unsigned long uintptr_t;
+ // "PicMap": "PicM", "ap\0\0".
+ #define HUD_E_PICMAP0 0x4d636950u
+ #define HUD_E_PICMAP1 0x00007061u
++// (0151) "PicView": "PicV", "iew\0" -- the red view-cone arc in the
++// MapMiniPlayer layout (the compass's separate layout; MapMini itself has
++// no needle pane). Only MapMiniPlayer's All has a PicView DIRECT child;
++// MapPlayer's PicView sits under Icon00, so the direct-child check below
++// does not match the full-screen map.
++#define HUD_E_PICVIEW0 0x56636950u
++#define HUD_E_PICVIEW1 0x00776569u
+ // "Shine": "Shin", "e\0\0\0".
+ #define HUD_E_SHINE0 0x6e696853u
+ #define HUD_E_SHINE1 0x00000065u
+@@ -401,10 +441,15 @@ typedef struct { void *pane; unsigned char depth; } hud_edge_stack_ent;
+ // This is the ONLY subtree walk in this patch, and it only sets a flag: it
+ // never reads a pane name and never decides a match. The parent-changed flag
+ // the game passes to children is 0 on the skip path, so without this a static
+-// container's children never recompute and never follow it. The flag is the
+-// game's own signal (Pane::Calculate sets it when a parent changed and
+-// clears it on recompute), so the game's next Calculate on each descendant
+-// recomputes from the moved parent. Bounded (64 visits, 32 children per
++// container's children never recompute and never follow it. (0151) What bit
++// 4 actually does: the next Pane::Calculate on a dirty pane takes the dirty
++// path through CalculateLocalMatrix (0x9096d0), which recomposes +0x70 from
++// the pane's OWN local components (+0x30/+0x48) and its parent's global --
++// it does NOT route through the bit-5 path (global = parent_global x the
++// +0xa0 local matrix). That is why the hook writes the shift into the local
++// components AND the local matrix AND the global: a dirty child recomposes
++// from its components, a bit-5 child from its matrix, and either alone
++// would leave the other path unshifted. Bounded (64 visits, 32 children per
+ // pane, depth 3); the pane itself is never marked here -- hud_edge marks it separately
+ // after writing its local, so the game recomputes this pane's +0x70 from the
+ // shifted local in the same Calculate call. Only called when the hook
+@@ -538,8 +583,19 @@ void hud_edge(void *pane, const float *aspect_ptr, void *table, const float *par
+     // this pane has ever calculated. On a pane's very first frame its matrix
+     // is still zero; skip it (the +0x13c cut catches it after the game
+     // computes it, and the entry cut catches it from the next frame on).
++    // (0151) S2: this guard used to sit BEFORE the matcher, so a hidden
++    // pane was skipped forever: Calculate early-exits on a hidden pane
++    // (0x90969c/0x9096a4) and clears bit 7, the guard returned, and the
++    // bit-0 show write below never ran (the #66 hide->show deadlock: the
++    // hidden mask cleared in log-53 line 2179 but the compass never came
++    // back). The guard now runs AFTER the matcher, so a matched pane always
++    // gets its flags bit-0 set/clear applied even when bit 7 is clear.
++    // It still skips a pane that has never calculated AND has no table
++    // entry (its very first frame: +0x70 is still zero, so e_mod would
++    // capture a zero global and the write would land at the raw target
++    // instead of base+target). A pane WITH an entry has calculated before
++    // -- its stored originals are valid -- so it is never skipped here.
+     unsigned short pflags = *(const unsigned short *)((const char *)pane + 0x58);
+-    if (!(pflags & 0x80u)) return;
+ 
+     const char *name = (const char *)pane + 0xb8;
+     const u32 *nw = (const u32 *)name;
+@@ -553,6 +609,12 @@ void hud_edge(void *pane, const float *aspect_ptr, void *table, const float *par
+     // (R2: 'Counter' was the moon tower, 'PicStrap' the BootLoading strip).
+     // The layout is identified by the All container's DIRECT children:
+     //   0 compass: a 'PicMap' child (MapMini only, of all 215 layouts).
++    //      (0151) Or a 'PicView' child (MapMiniPlayer, the compass's
++    //      separate layout: its All carries the red view-cone arc PicView
++    //      and PicPlayer; MapMini itself has no needle pane, so the needle
++    //      never hid or followed the drag in #66. MapPlayer's PicView sits
++    //      under Icon00, not directly under its All, so the full-screen map
++    //      does not match.)
+     //   1 lives: a 'Life' child (CounterLife / CounterLifeKids /
+     //      CounterLifeUp, the same element in three states).
+     //   3 moons: a 'Shine' child whose own child is 'TxtShine'
+@@ -568,7 +630,14 @@ void hud_edge(void *pane, const float *aspect_ptr, void *table, const float *par
+     // hidden in the overlay and are never moved by this runtime.
+     int idx = -1;
+     if (nw[0] == HUD_E_ALL0) {
+-        if (hud_edge_child_named(pane, HUD_E_PICMAP0, HUD_E_PICMAP1, 0, 0, 2)) idx = 0;
++        // (0151) 0 compass: a 'PicMap' child (MapMini) OR a 'PicView' child
++        // (MapMiniPlayer, the compass's separate layout: its All carries the
++        // red view-cone arc PicView and PicPlayer, and no needle pane exists
++        // in MapMini itself -- that is why the needle never hid in #66).
++        // MapPlayer's PicView is NOT a direct child of its All (it sits
++        // under Icon00), so the full-screen map does not match here.
++        if (hud_edge_child_named(pane, HUD_E_PICMAP0, HUD_E_PICMAP1, 0, 0, 2) ||
++            hud_edge_child_named(pane, HUD_E_PICVIEW0, HUD_E_PICVIEW1, 0, 0, 2)) idx = 0;
+         else if (hud_edge_child_named(pane, HUD_E_LIFE0, 0, 0, 0, 1)) idx = 1;
+         else if (hud_edge_child_child_named(pane, HUD_E_SHINE0, HUD_E_SHINE1, HUD_E_TSH0, HUD_E_TSH1)) idx = 3;
+         else if (hud_edge_child_named(pane, HUD_E_ADD0, 0, 0, 0, 1)) {
+@@ -587,6 +656,11 @@ void hud_edge(void *pane, const float *aspect_ptr, void *table, const float *par
+     }
+     if (idx < 0) return;   // not a HUD element: leave it alone
+ 
++    // (0151) S2, continued: the bit-7 guard, moved here from above the
++    // matcher. Unmatched panes already returned; a matched pane with an
++    // entry is never skipped, so a hidden pane can be re-shown.
++    if (!(pflags & 0x80u) && !hud_edge_find_entry(table, pane)) return;
++
+     // What this element should be, this frame. (0137) The runtime applies
+     // ONLY the editor's manual adjustments on top of whatever base the
+     // layout already has. The auto-edge base positions come from the 0136
+diff --git a/dm/games/0100000000010000/patches.py b/dm/games/0100000000010000/patches.py
+index 1654d5c..b719168 100644
+--- a/dm/games/0100000000010000/patches.py
++++ b/dm/games/0100000000010000/patches.py
+@@ -8,7 +8,8 @@ from nso_asm import ADDI, ADRP, B, LDP_POST, STP_PRE
+ BUILD_141 = 'b424be150a8e7d78701cbe7a439d9ebf'   # main 1.4.1 (game.tsv v393216)
+ 
+ # hud_runtime, compiled from hud_runtime.c (0137 in-game editor runtime, 0147
+-# layout-aware matcher + restore to the .bflyt base, 0150 local-matrix write)
++# layout-aware matcher + restore to the .bflyt base, 0150 local-matrix write,
++# 0151 third cut + bit-7-guard move + PicView matcher)
+ # with aarch64-linux-gnu-gcc -O2 -ffreestanding -fno-builtin -fno-stack-protector
+ # -fno-jump-tables -fno-unwind-tables -fno-asynchronous-unwind-tables -c,
+ # and objcopy -O binary --only-section=.text (never plain -O binary: the
+@@ -20,78 +21,92 @@ BUILD_141 = 'b424be150a8e7d78701cbe7a439d9ebf'   # main 1.4.1 (game.tsv v393216)
+ # 0150 also writes the pane LOCAL matrix (+0xa0): Pane::Calculate recomposes
+ # +0x70 from that matrix every frame, so a +0x70 write alone is wiped on the
+ # next Calculate (the #65 drag failure -- 0147 never wrote the matrix).
++# 0151 adds a THIRD cut at 0x909da0 (inside the forced-recompute recursion
++# 0x909d4c, after its own recompute and before its children loop): the
++# per-frame layout driver restores a counter All pane's local to base and
++# recomposes +0x70 from it AFTER the +0x13c hook and BEFORE Draw, bypassing
++# both Calculate cuts (the #66 S1 wipe -- only the compass moved). The same
++# hud_edge re-applies the shift there. 0151 also moves the bit-7 guard to
++# after the matcher (a hidden pane's Calculate clears bit 7, so the old
++# guard skipped it forever and hide->show was dead -- #66 S2) and matches
++# an All with a PicView child as compass (MapMiniPlayer's red needle --
++# #66 S3).
+ HUD_RUNTIME_WORDS = (
+-    "f100003ffa401844fa40180454000240b400024329491c647940b006363801c6b940b801515b18217131042154000141f940140191008005f100003f"
+-    "fa451024540000a0f240083fd29fffe8fa480020540000a8d65f03c0528000075280000417ffffeeaa0103e85280020ad1002109eb09001f54004b80"
+-    "eb00013f54000089cb000129f103fd3f54004ae9b940b10b528d2a0972a9ac696b09017f54004a41b940b50b528e0c296b09017f540049c152800009"
+-    "d11003ff120000e71200008836003504d285ac058b050045f100007f1a9f07e16a08003f540047e00b09052193407c21bc6178631e23206054005c21"
+-    "52a884041e2700801e20207054005a0c52b884041e2700801e2020705400598491000421d37ef424bc6178621e22204054005a4152a876811e270020"
+-    "1e2020505400582c52b876811e2700201e202050540057a48b040061bd4004211e2020281e211420540058615293334172a7e3211e2700201e202030"
+-    "54005624528cccc172a7fcc11e2700201e2020305400558cf9400c04b40002e4f240089f540002a1aa0203e1140000049102c021eb05003f54000200"
+-    "b9407c2334ffff83f9400023eb03009f54ffff21bd407024529e5943bd40682572ae29231e2700601e2020881e2014a41e24148054005b80d503201f"
+-    "1e2040471e2040651e204024528016031b037d2393407c61f863c8438b0100428b0100a5aa0203e4eb00007f54000160aa0203e1b9407c2334002723"
+-    "91108084eb05009f540058e0f9400083aa0403e1eb00007f54ffff01aa0403e1aa0103e49100e025f9405003f8480482eb00005f54004be04f000400"
+-    "529e594272ae29221e2700469101c0085280002abd006826d28000023c8080203c8180203c8280203c8380203c8480203c858020ad0400203d802820"
+-    "bd403000f9000020b9007829bd001420bd403400b9007c2abd002420bd404800bd000820bd404c00bd001c20bc626900bc2268a091001042f100c05f"
+-    "54ffff81b4004b83d2800002d503201fbc626860bc22688091001042f100c05f54ffff811e2e1000bd0020202d465c162d495015bd407c19bd408c18"
+-    "bd400c2052800009bd408c26bd400c701e2028c01e202200540003a1bd401032bd409c20bd401c711e3228001e202220540002e1bd401831bd408020"
+-    "bd4000721e200a201e20224054000221bd408420bd4004721e200a201e20224054000181bd409020bd4010721e200a201e202240540000e1bd409432"
+-    "bd4014601e320a311e2022201a9f17e9d503201f1e26220052800008540002c1bd401c66bd409c201e2020c054000241bd400066bd4080201e2020c0"
+-    "540001c1bd400466bd4084201e2020c054000141bd401066bd4090201e2020c0540000c1bd401466bd4094201e2020c01a9f17e8d503201fbd406830"
+-    "529e594272ae29221e270046bd4014201e262200540005401e202a12f100007f1a9f07e2bd400831bd401c265200012abd4024331e3622402d4dc83a"
+-    "1e332b531e310a511e260a46540039211e3322e0540039411e3122a054003e011e262280540038e17100005f7a40194454003881bd400c26bd404431"
+-    "1e3128d11e39222054004781bd401033bd4054311e312a711e382220540046e11e252200540001011e3a20e0540000c11e32208054000081b9407422"
+-    "6b07005f540054801e252800bd003000bd4024201e272800bd003400bd4008201e240800bd004800bd401c201e240800bd004c00bd4038201e210800"
+-    "bd007000bd403c201e210800bd007400bd4044201e232800bd007c00bd4048201e210800bd008000bd404c201e210800bd008400bd4054201e222800"
+-    "bd008c00b4000403bd4020261e2e10001e2020c054000140d2800002d503201fbc626860bc22688091001042f100c05f54ffff811e2e1000bd002020"
+-    "bd408c201e232800bd000c60bd409c201e222800bd001c60bd4080201e210800bd000060bd4084201e210800bd000460bd4090201e210800bd001060"
+-    "bd4094201e210800bd001460121f38c2320000c5710000ff2d0188231a8200a5bd001821321c00a52d0d1c2552800068910003e4bd00702452800003"
+-    "b900742752800002d29fffe6f90003e0390023e87900b005140000077100fc7f7a40d824540007ad51000422937c7c40f86068802a0203e1b4ffff20"
+-    "f240081f54fffee1f940140291008005f100005ffa4210a454fffe40f240085ffa46004054fffde9937c7c27910023e952800408d29fffec3867692b"
+-    "d1002047eb0000ea54000240eb07001f54000062f103fd5f540001c97940a04a7100fc3f937c7c2d910003ef321c014a7900a04a5100056e11000463"
+-    "7a40d9645400008011000421f82d69e7382d692ef94004427100050854fffa60f100005ffa4210a454fffa00f240085ffa4c004054fff9a917ffffe3"
+-    "0f0004001e2e1001b9007427bd001821bd007021fc00c020fd00342035000067f900003fb9007c3f911003ffd65f03c091108083eb05007f540001a0"
+-    "f9421088aa0303e4eb00011f540000c117fffec8f9400068aa0303e4eb08001f54ffd88091108063eb05007f54ffff41350000e71e2020a80f000406"
+-    "1e2e10001e2604e01e20048054fffd20f100003f9a82102117fffeb8d285ac04aa0203e18b040045140000049102c021eb05003f540024a0b9407c24"
+-    "34ffff84f9400024eb04001f54ffff21f94050032a2603e2710000ff12000042120000c4bd4014202d4608011a8410422d491805b4002623bd402024"
+-    "1e2e1003528000041e23208054000341bd400c6452800024bd408c231e232080540002a1bd401c64bd409c231e23208054000221bd400064bd408023"
+-    "1e232080540001a1bd400464bd4084231e23208054000121bd401064bd4090231e232080540000a1bd401464bd4094231e2320801a9f07e41e202020"
+-    "54001dc1bd4024211e21204054001d61bd4008211e252020540000e1bd401c211e26202054000081520000422a04004234fff422bd003000bd402420"
+-    "bd003400bd400820bd004800bd401c20bd004c00b4000223bd4020211e2e10001e202020540001a1bd408c20bd000c60bd409c20bd001c60bd408020"
+-    "bd000060bd408420bd000460bd409020bd001060bd409420bd001460121f38c2320000c3710000ff910003e51a82006352800066321c006352800004"
+-    "52800002d29fffe8f90003e0390023e67900b003d503201fb4000060f240081f540001007100fc9f7a40d84454ffedcd51000442937c7c40f86068a0"
+-    "17fffff7f940140391008006f100007ffa4310c454fffea0f240087ffa48006054fffe49937c7c4a910023e95280040bd29fffee386a692dd100206a"
+-    "eb00014c54000240eb0a001f54000062f103fd9f540001c97940a06c7100fc5f937c7c4f910003f1321c018c7900a06c510005b0110004847a40d9a4"
+-    "5400008011000442f82f6a2a382f6930f94004637100056b54fffac0f100007ffa4310c454fffa60f240087ffa4e006054fffa0917ffffe30f000402"
+-    "1e2e10011e20404317fffde8f94005087100054a54000100f100011ffa4810a4540000a0f240091fd29fffe9fa49010054ffb328aa0103e85280020a"
+-    "d1002109528d298bcb00012c72acaccbeb09001f54000100eb00013f54000069f103fd9f54000089b940b1096b0b013f54000ec0f94005087100054a"
+-    "54000100f100011fd29fffe9fa4810a454000080f240091ffa49010054fffd48aa0103e852800209d100210aeb0a001f540002e0eb00015f54000089"
+-    "cb00014bf103fd7f54000249b940b10c528d0a6b72adcd2b6b0b019f540001a1b940b50b7101957f54000141f940110b9100610ef100017ffa4b11c4"
+-    "540000a0f240097fd29fffecfa4c016054001e48f94005087100052954000100f100011ffa4810a4540000a0f240091fd29fffeafa4a010054fffbc8"
+-    "52800208d1002029528c882acb00012b72a00c8aeb09001f54000100eb00013f54000069f103fd7f54000089b940b0296b0a013f54000bc0f9400421"
+-    "7100050854001f00f100003fd29fffe9fa4110a454ffa800f240083ffa49002054fffd48d65f03c01e3322e0bd00143654000040bd0024371e3122a0"
+-    "540004c11e26228054000040bd001c34520001080a0800426a02015f54000061bd40142017fffe46d2800002bc626860bc22688091001042f100c05f"
+-    "54ffff811e2e1006bd401420bd00202617fffe3c2d465c162d495015bd407c19bd408c18b5ffb983528000085280000917fffe04bd003000bd402420"
+-    "bd003400bd400820bd004800bd401c20bd004c0017ffff2035ffa60717fffeb9bd00083517ffffda53017c8453017ce75280002917fffd231e204001"
+-    "17fffd541e20400217fffd431e20400317fffd342d465c16528000082d49501552800009bd407c19bd408c1817fffde71e2e100117fffd470f000402"
+-    "17fffd360f00040317fffd271e202020540000a1bd402421528000041e21204054ffddc0bd003000bd402420bd003400bd400820bd004800bd401c20"
+-    "bd004c0017ffff07f9400c01b40005a1f240083f54ff9cc1f940142591008028f10000bffa45110454ff9c20f24008bfd29fffe9fa4900a054ff9ba9"
+-    "5280020bd10020aaeb0a003f5400014054000082cb01014af103fd5f540000c9b940b0ac528c286a72ae8e0a6b0a019f540008a0f94004a57100056b"
+-    "54001040f10000bffa45110454ff9940f24008bffa4900a054fffd88d65f03c0d280000117fffe7d1e2e1000bd406c271e2538651e2020801e273847"
+-    "54000f001e24182417fffd22d65f03c034000289bd4010201e263b269101c008d28000021e203b00bd004426bd005420121d784971000d3f54000100"
+-    "bc627900bc2278a091000442f100305f54ffff21bd40142017fffdc29100044217fffff5520001086a08005f54ffb7a0d2800002bc626860bc226880"
+-    "91001042f100c05f54ffff819101c0081e2e1000d2800002bd004439bd002020bd005438121d784971000d3f54000100bc627900bc2278a091000442"
+-    "f100305f54ffff21bd40142017fffda79100044217fffff5b940b4aa528e4eac72a00cac12005d4a6b0c015f54fff6e1bd4028a11e20202854000720"
+-    "52a860411e2700201e202020540001c0bd40300152a887211e2700205147d0211e2700221e2028201e2228211e202018540007441e20203854000724"
+-    "1e2020305400050a53057c8453057ce7528000a917fffc865280020dd100216ceb0c015f540001e054000082cb0a018cf103fd9f54000169b940b16f"
+-    "528f0a8c72aa6e8c6b0c01ff540000c1b940b56f528d2d0c72acadcc6b0c01ff54000180f940056b710005ad54ffdf60f100017ffa4b11c454ffdf00"
+-    "f240097fd29fffecfa4c016054ffde8917ffffe553037c8453037ce75280006917fffc65d65f03c0d65f03c053027c8453027ce75280004917fffc5f"
+-    "1e20402417fffcab1e2320c054ffab811e22226054ffab41bd4018261e2120c054ffaae117fffde51e2140001e21402117ffffc7"
++    "f100003ffa401844fa40180454000220b400022329491c68b940b8017940b006515b18217131042154000141f940140191008004f100003ffa441024"
++    "540000a0f240083fd29fffe5fa450020540000a8d65f03c0528000075280000817ffffefaa0103e55280020ad10020a9eb09001f540001c054000082"
++    "cb000129f103fd3f54000149b940b0ab528d2a0972a9ac696b09017f540000a1b940b4ab528e0c296b09017f54001660f94004a57100054a54000100"
++    "f10000bffa451084540000a0f24008bfd29fffe9fa4900a054fffce8aa0103e552800209d10020aa528d2a0bcb00014c72aacc6beb0a001f540001a0"
++    "eb00015f54000069f103fd9f54000129b940b0aa6b0b015f540000c1b940b4aa515dd94a7115a54a540012c0d503201ff94004a57100052954000100"
++    "f10000bfd29fffeafa45108454000080f24008bffa4a00a054fffca8aa0103e55280020ad10020a9528d298bcb00012c72acaccbeb09001f540056a0"
++    "eb00013f54000069f103fd9f54005629b940b0a96b0b013f540055c15280002936380f86d285ac058b0500441ac92508d11003ff1ac924e71200010a"
++    "120000e7370015c8aa0203e1140000049102c021eb01009f540014e0b9407c2534ffff85f9400025eb05001f54ffff21f94050032a2603e2710000ff"
++    "12000042120000c4bd4014202d4608011a8410422d491805b4005043bd4020241e2e1003528000041e23208054000361bd400c6452800024bd408c23"
++    "1e232080540002c1bd401c64bd409c231e23208054000241bd400064bd4080231e232080540001c1bd400464bd4084231e23208054000141bd401064"
++    "bd4090231e232080540000c1bd401464bd4094231e2320801a9f07e4d503201f1e20202054004881bd4024211e21204054004821bd4008211e252020"
++    "540000e1bd401c211e26202054000081520000422a040042340041c2bd003000bd402420bd003400bd400820bd004800bd401c20bd004c00b4000223"
++    "bd4020211e2e10001e202020540001a1bd408c20bd000c60bd409c20bd001c60bd408020bd000060bd408420bd000460bd409020bd001060bd409420"
++    "bd001460121f38c2320000c3710000ff910003e51a82006352800066321c00635280000452800002d29fffe8f90003e0390023e67900b003d503201f"
++    "b4000060f240081f540002e07100fc9f7a40d84454003b6d51000442937c7c40f86068a017fffff752800009373ff0c6d285ac04aa0203e18b040044"
++    "d503201fb9407c2534000085f9400025eb05001f54ffefe09102c021eb01009f54ffff21d65f03c0f940140391008006f100007ffa4310c454fffcc0"
++    "f240087ffa48006054fffc69937c7c4a910023e95280040bd29fffee386a692dd100206aeb00014c54000240eb0a001f54000062f103fd9f540001c9"
++    "7940a06c7100fc5f937c7c4f910003f1321c018c7900a06c510005b0110004847a40d9a45400008011000442f82f6a2a382f6930f94004637100056b"
++    "54fff8e0f100007ffa4310c454fff880f240087ffa4e006054fff82917ffffe3340034c7d503201ff100007f1a9f07e16a0a003f540034600b090521"
++    "93407c21bc6178641e24208054003bc152a884051e2700a01e2020905400392c52b884051e2700a01e202090540038a491000421d37ef425bc617863"
++    "1e232060540039a152a876811e2700201e202070540037cc52b876811e2700201e202070540037448b050061bd4004211e2020281e21142054003841"
++    "5293334172a7e3211e2700201e20203054003644528cccc172a7fcc11e2700201e202030540035acd503201ff9400c05b40002e5f24008bf540002a1"
++    "aa0203e1140000049102c021eb04003f54000200b9407c2334ffff83f9400023eb0300bf54ffff21bd407025529e5943bd40682672ae29231e270060"
++    "1e2020a81e2014c41e2514a054004400d503201f1e2040671e2040861e204025528016011b017d2193407c25f861c8418b0500428b050085aa0203e4"
++    "eb00003f54000160aa0203e1b9407c23340025a391108084eb05009f54003ce0f9400083aa0403e1eb03001f54ffff01aa0403e1aa0103e49100e025"
++    "f9405003f8480482eb00005f54002c204f000400529e594272ae29221e2700429101c0085280002abd006822d28000023c8080203c8180203c828020"
++    "3c8380203c8480203c858020ad0400203d802820bd403000f9000020b9007829bd001420bd403400b9007c2abd002420bd404800bd000820bd404c00"
++    "bd001c20bc626900bc2268a091001042f100c05f54ffff81b4002b03d2800002d503201fbc626860bc22688091001042f100c05f54ffff811e2e1000"
++    "bd0020202d4658172d495015bd407c19bd408c18bd400c2052800009bd408c22bd400c701e2028401e202200540003a1bd401032bd409c20bd401c71"
++    "1e3228001e202220540002e1bd401831bd408020bd4000721e200a201e20224054000221bd408420bd4004721e200a201e20224054000181bd409020"
++    "bd4010721e200a201e202240540000e1bd409432bd4014601e320a311e2022201a9f17e9d503201f1e22220052800008540002c1bd401c62bd409c20"
++    "1e20204054000241bd400062bd4080201e202040540001c1bd400462bd4084201e20204054000141bd401062bd4090201e202040540000c1bd401462"
++    "bd4094201e2020401a9f17e8d503201fbd406830529e594272ae29221e270042bd4014201e222200540005401e202a13f100007f1a9f07e2bd400831"
++    "bd401c225200012abd4024321e3722602d4dcc3a1e322b521e310a711e220a62540019611e3222c0540019811e3122a054001e011e22228054001921"
++    "7100005f7a401944540018c1bd400c22bd4044311e3128511e39222054003001bd401032bd4054311e312a511e38222054002f611e26220054000101"
++    "1e3a20e0540000c11e3320a054000081b94074226b07005f540039c01e262800bd003000bd4024201e272800bd003400bd4008201e250800bd004800"
++    "bd401c201e250800bd004c00bd4038201e210800bd007000bd403c201e210800bd007400bd4044201e242800bd007c00bd4048201e210800bd008000"
++    "bd404c201e210800bd008400bd4054201e232800bd008c00b4000403bd4020221e2e10001e20204054000140d2800002d503201fbc626860bc226880"
++    "91001042f100c05f54ffff811e2e1000bd002020bd408c201e242800bd000c60bd409c201e232800bd001c60bd4080201e210800bd000060bd408420"
++    "1e210800bd000460bd4090201e210800bd001060bd4094201e210800bd001460121f38c2320000c5710000ff2d018c241a8200a5bd001821321c00a5"
++    "2d0d1c2652800068910003e4bd00702552800003b900742752800002d29fffe6f90003e0390023e87900b005140000077100fc7f7a40d82454000acd"
++    "51000422937c7c40f86068802a0203e1b4ffff20f240081f54fffee1f940140291008005f100005ffa4210a454fffe40f240085ffa46004054fffde9"
++    "937c7c27910023e952800408d29fffec3867692bd1002047eb0000ea54000240eb07001f54000062f103fd5f540001c97940a04a7100fc3f937c7c2d"
++    "910003ef321c014a7900a04a5100056e110004637a40d9645400008011000421f82d69e7382d692ef94004427100050854fffa60f100005ffa4210a4"
++    "54fffa00f240085ffa4c004054fff9a917ffffe391108083eb05007f540001a0f9421088aa0303e4eb00011f540000c117fffed4f9400068aa0303e4"
++    "eb00011f54ffda0091108063eb05007f54ffff41350000e71e2020c80f0004021e2e10001e2204e01e2004a0540001c0f100003f9a82102117fffec4"
++    "0f0004001e2e1001b9007427bd001821bd007021fc00c020fd00342035000067f900003fb9007c3f911003ffd65f03c00f0004031e2e10011e204064"
++    "17fffe851e3222c0bd00143754000040bd0024361e3122a0540004811e22228054000040bd001c34520001080a0800426a02015f54000061bd401420"
++    "17ffff44d2800002bc626860bc22688091001042f100c05f54ffff811e2e1002bd401420bd00202217ffff3a2d4658172d495015bd407c19bd408c18"
++    "b5ffd943528000085280000917ffff02bd003000bd402420bd003400bd400820bd004800bd401c20bd004c0017fffdcabd00083517ffffdc1e204004"
++    "17fffe3b1e20400317fffe461e20400117fffe542d465817528000082d49501552800009bd407c19bd408c1817fffeeb0f00040317fffe3b1e2e1001"
++    "17fffe490f00040417fffe2a1e202020540000a1bd402421528000041e21204054ffb3c0bd003000bd402420bd003400bd400820bd004800bd401c20"
++    "bd004c0017fffdb7f94004a57100054a54000100f10000bfd29fffe9fa45108454000080f24008bffa4900a054ffa7a8aa0103e55280020ad10020ab"
++    "eb0b001f540002e0eb00017f54000089cb000169f103fd3f54000249b940b0ac528d0a6972adcd296b09019f540001a1b940b4a97101953f54000141"
++    "f94010a9910060aef100013ffa4911c4540000a0f240093fd29fffecfa4c012054001048f94004a57100054a54000100f10000bffa451084540000a0"
++    "f24008bfd29fffe9fa4900a054fffbc852800205d1002029528c882acb00012b72a00c8aeb09001f54000100eb00013f54000069f103fd7f54000089"
++    "b940b0296b0a013f540001c0f9400421710004a554001260f100003fd29fffe9fa41108454ff9860f240083ffa49002054fffd48d65f03c0d2800001"
++    "17ffff51f9400c04b4000564f240089f54ff9721f940148191008085f100003ffa4110a454ff9680f240083fd29fffebfa4b002054ff96095280020a"
++    "d1002029eb09009f5400014054000082cb040129f103fd3f540000c9b940b02c528c286972ae8e096b09019f54000c80f94004217100054a54000ea0"
++    "f100003ffa4110a454ff93a0f240083ffa4b002054fffd88d65f03c01e2e1000bd406c271e2638861e2020a01e27386754000a401e25182517fffdde"
++    "d65f03c034000289bd4010201e223b229101c008d28000021e203b00bd004422bd005420121d784971000d3f54000100bc627900bc2278a091000442"
++    "f100305f54ffff21bd40142017fffe7e9100044217fffff5520001086a08005f54ffcf20d2800002bc626860bc22688091001042f100c05f54ffff81"
++    "9101c0081e2e1000d2800002bd004439bd002020bd005438121d784971000d3f54000100bc627900bc2278a091000442f100305f54ffff21bd401420"
++    "17fffe639100044217fffff55280020dd100212ceb0c017f5400022054000082cb0b018cf103fd9f540001a9b940b12f528f0a8c72aa6e8c6b0c01ff"
++    "54000101b940b52f528d2d0c72acadcc6b0c01ff540000615280006917fffc9bf9400529710005ad54ffed20f100013ffa4911c454ffecc0f240093f"
++    "d29fffecfa4c012054ffec4917ffffe31e20402517fffd8db940b429528e4eac72a00cac12005d296b0c013f54fff301bd4028211e202028540001a1"
++    "5280004917fffc83d65f03c01e24204054ffc6411e23224054ffc601bd4018221e21204054ffc5a117fffed4d65f03c052a860411e2700201e202020"
++    "54000220bd40300152a887211e2700205147d0211e2700221e2028201e2228211e202018540001441e202038540001241e20203052800049528000a1"
++    "1a81a12917fffc65528000a917fffc631e2140001e21402117fffff7"
+ )
+ 
+ # (0137) The in-game editor runtime: same two Pane::Calculate cuts as
+-# 0135 (entry +0x20 at 0x9094b4, +0x13c at 0x9095d0), but the called code is
+-# hud_runtime.c, not hud_edge.c. hud_runtime writes the pane GLOBAL matrix
++# 0135 (entry +0x20 at 0x9094b4, +0x13c at 0x9095d0), PLUS a third cut
++# (0151) in the forced-recompute recursion 0x909d4c at +0x150 (0x909da0),
++# but the called code is hud_runtime.c, not hud_edge.c. hud_runtime writes the pane GLOBAL matrix
+ # (+0x70) directly at the +0x13c cut (after the game finalises it) and the
+ # local as fallback; hide is a TRUE hide (flags bit 0 cleared), not +10000.
+ # It applies ONLY the editor manual deltas from the state page (+0x200) on
+@@ -131,11 +146,41 @@ def _hud_runtime_frame_step(ctx):
+     emit(0x7940b268)                          # ldrh w8, [x19, #0x58] (the replaced instruction)
+     emit(B(here(), 0x9094b8))                 # back to the hook site + 4
+     fs_put(0x9094b4, [B(0x9094b4, estart)], 'Pane::Calculate entry: the in-game HUD editor runtime, so static panes are hooked too (hud_runtime.c)')
++    # (0151) The recompute cut: `add x22, x21, #0x20` at 0x909da0, inside the
++    # forced-recompute recursion 0x909d4c, after its own recompute (bl
++    # CalculateLocalMatrix at 0x909d9c) and before its children loop. The
++    # per-frame layout driver (0xa1cb80) calls Pane::Calculate (both cuts
++    # above run), then the animation / game code restores a counter All
++    # pane's +0x30 and local matrix to base, then the driver calls the
++    # forced recompute 0x9036cc -> 0x909d4c (its only caller is the driver
++    # at 0xa1cdf8, force=1), which recomposes +0x70 from the restored base
++    # and bypasses both hook cuts -- that is the #66 S1 wipe (only the
++    # compass moved). This cut re-applies the shift at the last
++    # transform-finalising point, before the children recompose from the
++    # shifted parent. x21 is the pane here (mov x21, x0 at 0x909d60);
++    # x19 (the parent-matrix arg), w20 (the force flag) and w23 (the
++    # flags byte) are live across the site and are saved/restored; x22 is
++    # written by the replaced instruction, so it needs no save. The stub
++    # calls the same hud_edge with the same arguments as the other two.
++    fs_site(0x909da0, 'b6820091')
++    rstart = here()
++    emit(STP_PRE(19, 20, 31, -16))             # stp x19, x20, [sp, #-16]! (live: parent-matrix arg, force flag)
++    emit(STP_PRE(21, 23, 31, -16))             # stp x21, x23, [sp, #-16]! (live: the pane, the flags byte)
++    emit(0xaa1503e0)                           # mov x0, x21 (the pane)
++    emit(ADRP(1, here(), FS_STATE_OFF)); emit(ADDI(1, 1, 0x58))    # x1 = state + 0x58 (the aspect)
++    emit(ADRP(2, here(), FS_STATE_OFF)); emit(ADDI(2, 2, 0x300))   # x2 = state + 0x300 (table)
++    emit(ADRP(3, here(), FS_STATE_OFF)); emit(ADDI(3, 3, 0x200))   # x3 = state + 0x200 (the manual params)
++    emit(B(here(), hud_code) | 0x80000000)     # bl hud_runtime
++    emit(LDP_POST(21, 23, 31, 16))             # ldp x21, x23, [sp], #16
++    emit(LDP_POST(19, 20, 31, 16))             # ldp x19, x20, [sp], #16
++    emit(0x910082b6)                           # add x22, x21, #0x20 (the replaced instruction)
++    emit(B(here(), 0x909da4))                  # back to the hook site + 4
++    fs_put(0x909da0, [B(0x909da0, rstart)], 'Forced recompute 0x909d4c +0x150: the in-game HUD editor runtime, re-applied after the game\'s post-Calculate refresh (hud_runtime.c)')
+ 
+ FRAME_STEP = {BUILD_141: _hud_runtime_frame_step}
+ 
+ BINDING = [
+-    {'what': "HUD editor runtime, v16 (hud_runtime.c, 0150: two Pane::Calculate cuts, entry +0x20 at 0x9094b4 and +0x13c at 0x9095d0; applies ONLY the editor manual deltas from the DM_HUD_* environment variables via hud_manual.c, state page +0x200: 18 floats dx/dy/k for elements 0 compass, 1 lives, 2 coins, 3 moons, 4 hints (unused), 5 regional coins, manual mask +0x248, hidden mask +0x24C; dx clamped +-640, dy +-360, k clamped [0.6, 1.8]; no auto-edge term -- the edge anchor lives in the 0136/0143 .bflyt overlay, so the edge is never applied twice. 0150 writes the pane LOCAL matrix (+0xa0) as well as +0x30/+0x48 and +0x70: Pane::Calculate recomposes +0x70 from the +0xa0 matrix every frame, so a +0x70 write alone is wiped on the next Calculate (the #65 drag failure -- 0147 never wrote the matrix, the e_mod recompute check then mistook the wipe for a game recompose and polluted the stored original, and every later write became a no-op). The runtime stores the original local matrix per entry (e_lm0, entry +128, 12 floats; a NULL +0xa0 skips only the matrix write) and re-derives the matrix write from it with the ABSOLUTE target (tdx/tdy/tk); the restore writes the matrix back to e_lm0 too; the e_mod recompute check only follows e_mod when the live local matrix still holds the shift (a stale-matrix recompose leaves e_mod alone and the write re-applies). Table entry 128 -> 176 bytes, HUD_EDGE_SLOTS_PER_ELEM 16 -> 11 (66 entries, state +0x300..+0x3060, short of the diagnostic probe buffer at +0x3300; the 0147 matcher takes one 'All' per layout instance, so eleven slots per element is still several times the realistic maximum). 0147 layout-aware matcher: only a layout's 'All' container is ever matched (the display side), identified by its direct children -- compass: 'PicMap' child (MapMini); lives: 'Life' child (CounterLife/Kids/Up); moons: 'Shine' child with a 'TxtShine' child (CounterShine); coins/regional: 'Add' child, told apart by the 'Capture' sibling's tx under the same RootPane (0 = CounterCoin, 130 = CounterCollectCoin; another tx falls back to All tx, nearest of -740/-615; no Capture sibling matches nothing). The old name matcher is gone: 'PicStrap' (BootLoading strip), 'Counter' (moon-tower container), 'TxtGuide01' (hints) and the capture content panes ('TxtCounterSh'/'TxtCounter'/'TxtIconSh'/'TxtIcon' under Capture00-03) are never matched -- moving content panes emptied the 128x128 capture texture (R1, log-51: a manual value moved the glyphs out of the texture and restoring never repainted it), and the name matches hit the wrong layouts (R2). Hints and the white bar have no matcher entry and stay hidden in the overlay. Restore: a mask-0 element takes no table entry and writes nothing; a pane with an existing entry has its local (+0x30/+0x48) and its local matrix (+0xa0) written back to e_orig / e_lm0 (its first-seen local, the overlay's default edge position) and is marked dirty (flags bit 4) so the game recomposes +0x70 from the restored matrix; +0x70 itself is never restored to e_mod; once restored and visible the entry is released. Each element takes 1 slot (its All container). Hide is a TRUE hide (flags bit 0 at +0x58 cleared), only on matched All containers. 0137/0142 kept: +0x70 is written directly at the +0x13c cut from the stored original global (e_mod) and the local as fallback; the global write uses the ABSOLUTE target (tdx/tdy/tk, stored in e_orig slots [1]/[2]/[4]) while the local uses the parent-compensated delta; a dirty flag so a moved container carries its children, an orig/mod table so a fixed offset never drifts. The 0118 auto-edge code (hud_edge.c, _hud_edge_frame_step, HUD_EDGE_WORDS) and the diagnostic probe (HUD_PROBE_WORDS, hud_probe.c) are deleted from this profile -- the probe stays a diagnostic tool only, never shipped", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
++    {'what': "HUD editor runtime, v17 (hud_runtime.c, 0151: three cuts -- entry +0x20 at 0x9094b4, +0x13c at 0x9095d0, and the forced-recompute cut at 0x909da0 inside 0x909d4c; applies ONLY the editor manual deltas from the DM_HUD_* environment variables via hud_manual.c, state page +0x200: 18 floats dx/dy/k for elements 0 compass, 1 lives, 2 coins, 3 moons, 4 hints (unused), 5 regional coins, manual mask +0x248, hidden mask +0x24C; dx clamped +-640, dy +-360, k clamped [0.6, 1.8]; no auto-edge term -- the edge anchor lives in the 0136/0143 .bflyt overlay, so the edge is never applied twice. 0150 writes the pane LOCAL matrix (+0xa0) as well as +0x30/+0x48 and +0x70: Pane::Calculate recomposes +0x70 from the +0xa0 matrix every frame, so a +0x70 write alone is wiped on the next Calculate (the #65 drag failure -- 0147 never wrote the matrix, the e_mod recompute check then mistook the wipe for a game recompose and polluted the stored original, and every later write became a no-op). The runtime stores the original local matrix per entry (e_lm0, entry +128, 12 floats; a NULL +0xa0 skips only the matrix write) and re-derives the matrix write from it with the ABSOLUTE target (tdx/tdy/tk); the restore writes the matrix back to e_lm0 too; the e_mod recompute check only follows e_mod when the live local matrix still holds the shift (a stale-matrix recompose leaves e_mod alone and the write re-applies). Table entry 128 -> 176 bytes, HUD_EDGE_SLOTS_PER_ELEM 16 -> 11 (66 entries, state +0x300..+0x3060, short of the diagnostic probe buffer at +0x3300; the 0147 matcher takes one 'All' per layout instance, so eleven slots per element is still several times the realistic maximum). 0151 S1: the per-frame layout driver (0xa1cb80) restores a counter All pane's local to base and recomposes +0x70 from it AFTER the +0x13c hook and BEFORE Draw, via the forced recompute 0x9036cc -> 0x909d4c (only caller the driver at 0xa1cdf8, force=1), bypassing both Calculate cuts -- the #66 wipe (only the compass moved); the third cut at 0x909da0 (after 0x909d4c's own recompute, before its children loop) re-applies the shift there. 0151 S2: the bit-7 guard moved to after the matcher -- a hidden pane's Calculate clears bit 7, so the old guard skipped it forever and hide->show was dead (#66); a matched pane with a table entry is never skipped now, while a never-calculated pane with no entry is still skipped on its first frame. 0151 S3: an All with a 'PicView' child matches compass (MapMiniPlayer's red needle; MapPlayer's PicView sits under Icon00, so the full-screen map does not match). 0147 layout-aware matcher: only a layout's 'All' container is ever matched (the display side), identified by its direct children -- compass: 'PicMap' child (MapMini) or 'PicView' child (MapMiniPlayer); lives: 'Life' child (CounterLife/Kids/Up); moons: 'Shine' child with a 'TxtShine' child (CounterShine); coins/regional: 'Add' child, told apart by the 'Capture' sibling's tx under the same RootPane (0 = CounterCoin, 130 = CounterCollectCoin; another tx falls back to All tx, nearest of -740/-615; no Capture sibling matches nothing). The old name matcher is gone: 'PicStrap' (BootLoading strip), 'Counter' (moon-tower container), 'TxtGuide01' (hints) and the capture content panes ('TxtCounterSh'/'TxtCounter'/'TxtIconSh'/'TxtIcon' under Capture00-03) are never matched -- moving content panes emptied the 128x128 capture texture (R1, log-51: a manual value moved the glyphs out of the texture and restoring never repainted it), and the name matches hit the wrong layouts (R2). Hints and the white bar have no matcher entry and stay hidden in the overlay. Restore: a mask-0 element takes no table entry and writes nothing; a pane with an existing entry has its local (+0x30/+0x48) and its local matrix (+0xa0) written back to e_orig / e_lm0 (its first-seen local, the overlay's default edge position) and is marked dirty (flags bit 4) so the game recomposes +0x70 from the restored matrix; +0x70 itself is never restored to e_mod; once restored and visible the entry is released. Each element takes 1 slot (its All container). Hide is a TRUE hide (flags bit 0 at +0x58 cleared), only on matched All containers. 0137/0142 kept: +0x70 is written directly at the +0x13c cut from the stored original global (e_mod) and the local as fallback; the global write uses the ABSOLUTE target (tdx/tdy/tk, stored in e_orig slots [1]/[2]/[4]) while the local uses the parent-compensated delta; a dirty flag so a moved container carries its children, an orig/mod table so a fixed offset never drifts. The 0118 auto-edge code (hud_edge.c, _hud_edge_frame_step, HUD_EDGE_WORDS) and the diagnostic probe (HUD_PROBE_WORDS, hud_probe.c) are deleted from this profile -- the probe stays a diagnostic tool only, never shipped", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
+      'why': "Pane::Calculate and the pane layout are this build's nn::ui2d code, found by the HUDLOG diagnostic run (log-17) and confirmed by disassembly of DmIOS. The manual settings come from the HUD editor through the same environment-variable channel the launcher already uses for its other settings (DM_SCREEN_ASPECT), so the game reads nothing new: the host copies them to state page +0x200 once per present. The .bflyt ground truth (REPORT-HUD-REDO.md B, all 215 layouts parsed) is why the matcher is layout-aware: the coins and regional-coins content panes share names across two layouts, the capture texture mechanism means only the All container may move, and 'Counter'/'PicStrap' name matches hit the moon tower and the BootLoading strip. The old name matcher moved content panes and emptied the capture texture (log-50/51: coins and regional coins vanished after a manual value, and restoring the default never repainted the texture). The runtime keeps no user-adjustable state in the game beyond the orig/mod table, and its only tree walks are the bounded child-name checks and the bounded flag-only mark-dirty, so the 0113 crash class (a name/match walk reading a pane through a bad pointer) is structurally absent",
+      'blocked': 'the stubs have no function-matched form yet'},
+ ]
+diff --git a/dm/host/hud_manual.c b/dm/host/hud_manual.c
+index 70b2846..920201f 100644
+--- a/dm/host/hud_manual.c
++++ b/dm/host/hud_manual.c
+@@ -17,7 +17,7 @@
+ //   +0x200: 18 floats, per element (dx, dy, k): compass, lives, coins, moons, hints, regional coins
+ //   +0x248: u32 manual mask, one bit per element (the launcher set it)
+ //   +0x24C: u32 hidden mask, one bit per element (the launcher hid it)
+-//   +0x300: the HUD table (96 x 128 bytes, sixteen per element, hud_edge's working copy)
++//   +0x300: the HUD table (66 x 176 bytes, eleven per element, hud_runtime's working copy; 0151: was 96 x 128, 16 slots -- stale since 0150)
+ // The block fits the frame step state's reserved 0x4000 bytes; loader.c's own
+ // fields end below +0x200, so there is no overlap. (0113 used the same +0x200
+ // block for its own params; that block is free now that 0113 is deleted.)
+-- 
+2.43.0
+
