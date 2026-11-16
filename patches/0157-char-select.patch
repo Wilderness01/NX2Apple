@@ -1,4 +1,4 @@
-From 16b5b9d34180329752eb4c781aae5352e276361d Mon Sep 17 00:00:00 2001
+From 170f9d0248e6cc227ceae1f8d2fa719bceb28121 Mon Sep 17 00:00:00 2001
 From: seedds <seedds@gmail.com>
 Date: Mon, 16 Nov 2026 11:06:05 +0000
 Subject: [PATCH 1/3] =?UTF-8?q?0157:=20title-menu=20character=20+=20costum?=
@@ -19,10 +19,10 @@ FRAME_STEP title setup 0x4972f4, Decide 0x1d78f8, Table A/B 0xec8270/
 Verified on host: patch_nso.py rewrite of main 1.4.1 exits 0 (cuts 6),
 frame-step test 0 failures.
 ---
- dm/games/0100000000010000/char_select.c       |  60 ++
- dm/games/0100000000010000/patches.py          | 109 +++-
+ dm/games/0100000000010000/char_select.c       |  83 +++
+ dm/games/0100000000010000/patches.py          | 123 +++-
  dm/host/hle_fs.c                              |  79 +++
- dm/host/hud_manual.c                          |  21 +
+ dm/host/hud_manual.c                          |  38 ++
  dm/ios/Sources/CharSelectEditor.h             |  36 ++
  dm/ios/Sources/CharSelectEditor.m             | 524 ++++++++++++++++++
  dm/ios/Sources/DmGameMenu.h                   |   1 +
@@ -52,7 +52,7 @@ frame-step test 0 failures.
  dm/romfs-overlay/ObjectData/WarioHead.szs     | Bin 0 -> 70720 bytes
  .../ObjectData/WarioHeadTexture.szs           | Bin 0 -> 637708 bytes
  dm/tools/nso_asm.py                           |   3 +
- 33 files changed, 833 insertions(+), 3 deletions(-)
+ 33 files changed, 887 insertions(+), 3 deletions(-)
  create mode 100644 dm/games/0100000000010000/char_select.c
  create mode 100644 dm/ios/Sources/CharSelectEditor.h
  create mode 100644 dm/ios/Sources/CharSelectEditor.m
@@ -83,10 +83,10 @@ frame-step test 0 failures.
 
 diff --git a/dm/games/0100000000010000/char_select.c b/dm/games/0100000000010000/char_select.c
 new file mode 100644
-index 0000000..4a52cf7
+index 0000000..a0778c5
 --- /dev/null
 +++ b/dm/games/0100000000010000/char_select.c
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,83 @@
 +// char_select.c -- the title-menu character/costume picker stubs (0157).
 +//
 +// Compiled to a word table like hud_runtime.c
@@ -97,12 +97,23 @@ index 0000000..4a52cf7
 +// all game addresses are passed in as arguments, so this file holds no
 +// absolute address and no literal pool.
 +//
-+// State page slot (hud_manual.c, the host frame tick):
++// State page slots (hud_manual.c, the host frame tick):
 +//   +0x260: u32 char-select flag. The switch stub sets it to 1 when the
 +//   player picks the title menu's "角色选择" row; the host's per-present
 +//   frame tick reads it, clears it, and opens the picker (CharSelectEditor).
-+//   The slot is in the free zone +0x250..+0x300 (the HUD masks end at
-+//   +0x250, the HUD table starts at +0x300).
++//   +0x264: u32 diagnostic, the full action id of the last switch call.
++//   +0x268: u32 diagnostic, sel | (row << 8) | (ret << 24) of the last call.
++//   +0x26c: u32 diagnostic, switch-call counter (the tick logs when it changes).
++//   All in the free zone +0x250..+0x300 (the HUD masks end at +0x250,
++//   the HUD table starts at +0x300).
++//
++// The diagnostics exist because #72 proved the stub can run and still be
++// wrong: its trampoline passed the table PAGE (0xec8000) instead of the
++// table (0xec8270/0xec8288), so the stub read string data as the action
++// table, never saw action 6, and always returned 0 -- the row-3 tap went
++// to VR and log-57 had zero [char] lines. The tick logs every switch
++// invocation from these slots, so the next device run proves what the
++// hook sees (sel, row, action, ret) instead of leaving it to inference.
 +//
 +// Why the "角色选择" row is the VR row, not a 7th row (verified 2026-11-16):
 +// the title menu's List is built for exactly 7 actions (0-6) -- the ctor
@@ -120,6 +131,9 @@ index 0000000..4a52cf7
 +#include <stdint.h>
 +
 +#define CHAR_SELECT_FLAG_OFF 0x260
++#define CHAR_SELECT_DIAG_ACTION_OFF 0x264
++#define CHAR_SELECT_DIAG_MISC_OFF 0x268
++#define CHAR_SELECT_COUNT_OFF 0x26c
 +
 +// The confirm-switch cut (0x1d7290): the switch at 0x1d7290 is the real
 +// confirm dispatcher -- it reads [obj+0x58] (table selector) and
@@ -141,14 +155,23 @@ index 0000000..4a52cf7
 +    int32_t row = *(volatile int32_t *)((char *)menu + 0x1c);
 +    const int32_t *table = (sel == 0) ? tableB : tableA;
 +    int32_t action = table[row];
-+    if (sel != 0 && action == 6) {
++    int ret = (sel != 0 && action == 6) ? 1 : 0;
++    if (ret) {
 +        *(volatile uint32_t *)(state + CHAR_SELECT_FLAG_OFF) = 1;
-+        return 1;
 +    }
-+    return 0;
++    // Diagnostic (see the state-page comment above): record every switch
++    // invocation so the host tick can log it. Written unconditionally,
++    // not only when the flag is set -- a Confirm that computes the wrong
++    // action is exactly what the log needs to show.
++    *(volatile uint32_t *)(state + CHAR_SELECT_DIAG_ACTION_OFF) = (uint32_t)action;
++    *(volatile uint32_t *)(state + CHAR_SELECT_DIAG_MISC_OFF) =
++        (uint32_t)sel | ((uint32_t)(row & 0xff) << 8) | ((uint32_t)ret << 24);
++    *(volatile uint32_t *)(state + CHAR_SELECT_COUNT_OFF) =
++        *(volatile uint32_t *)(state + CHAR_SELECT_COUNT_OFF) + 1;
++    return ret;
 +}
 diff --git a/dm/games/0100000000010000/patches.py b/dm/games/0100000000010000/patches.py
-index 8a041fe..14b6793 100644
+index 8a041fe..5a9d213 100644
 --- a/dm/games/0100000000010000/patches.py
 +++ b/dm/games/0100000000010000/patches.py
 @@ -3,10 +3,19 @@
@@ -172,7 +195,7 @@ index 8a041fe..14b6793 100644
  # hud_runtime, compiled from hud_runtime.c (0137 in-game editor runtime, 0147
  # layout-aware matcher + restore to the .bflyt base, 0150 local-matrix write,
  # 0151 third cut + bit-7-guard move + PicView matcher)
-@@ -208,9 +217,105 @@ def _hud_runtime_frame_step(ctx):
+@@ -208,9 +217,119 @@ def _hud_runtime_frame_step(ctx):
      emit(B(here(), 0x909da4))                  # back to the hook site + 4
      fs_put(0x909da0, [B(0x909da0, rstart)], 'Forced recompute 0x909d4c +0x150: the in-game HUD editor runtime, re-applied after the game\'s post-Calculate refresh (hud_runtime.c)')
  
@@ -186,7 +209,7 @@ index 8a041fe..14b6793 100644
 +# char_select.c for the why (the VR row is repurposed; a 7th row cannot be
 +# added through the table).
 +CHAR_SELECT_WORDS = (
-+    "39416003b9401c0072001c7f54000120b860d842528000007100185f54000081528000222a0203e0b9026022d65f03c052800000d65f03c0"
++    "39416005b9401c0472001ca5540001a1b864d862528000005280000353181c84b90264222a0500842a030084b9026824b9426c2211000442b9026c22d65f03c0b864d8427100185f540000e112bfe000528000260b0000c32a0603e0b902602617ffffef528000035280000017ffffec"
 +)
 +
 +# (0157) The title-menu "角色选择" row (the repurposed VR row, title row 3,
@@ -219,6 +242,12 @@ index 8a041fe..14b6793 100644
 +#     and the trampoline returns to the caller, skipping the VR action
 +#     entirely; the pause menu's VR (Table B) and actions 0-5 fall
 +#     through to the re-executed ldrb and the switch runs normally.
++#     The trampoline passes the FULL table addresses (ADRP + ADDI):
++#     the tables are not page-aligned, and the #72 version passed only
++#     the page (0xec8000), so the stub read string data as the action
++#     table and never returned 1. The stub also writes diagnostics to
++#     state +0x264/+0x268/+0x26c on every call (action, sel/row/ret,
++#     call counter) so the host tick can log each switch invocation.
 +# The VR row is forced visible by the CUTS entry above (the 2P-activation
 +# gate at 0x497314 is NOPed): the "角色选择" row must always show.
 +def _char_select_frame_step(ctx):
@@ -239,11 +268,19 @@ index 8a041fe..14b6793 100644
 +    sstart = here()
 +    emit(STP_PRE(0, 30, 31, -16))              # stp x0, x30, [sp, #-16]! (live: the menu/List, the return address)
 +    emit(ADRP(1, here(), FS_STATE_OFF))         # x1 = state page
-+    emit(ADRP(2, here(), 0xec8270))            # x2 = Table A (title)
-+    emit(ADRP(3, here(), 0xec8288))            # x3 = Table B (pause)
++    # The tables are NOT page-aligned (Table A 0xec8270, Table B 0xec8288),
++    # so ADRP alone gives the page (0xec8000) -- the #72 trampoline passed
++    # the page as the table, the stub read string data as the action table
++    # and never returned 1 (row 3 went to VR, log-57 had zero [char]).
++    # ADDI the low 12 bits, like the setup trampoline does for its string
++    # and like the game's own switch does (adrp; add).
++    emit(ADRP(2, here(), 0xec8270))            # x2 = Table A page (title)
++    emit(ADDI(2, 2, 0x270))                    # x2 = 0xec8270 (Table A)
++    emit(ADRP(3, here(), 0xec8288))            # x3 = Table B page (pause)
++    emit(ADDI(3, 3, 0x288))                    # x3 = 0xec8288 (Table B)
 +    emit(B(here(), char_code) | 0x80000000)     # bl char_select_decide_vr
 +    emit(LDP_POST(0, 30, 31, 16))              # ldp x0, x30, [sp], #16
-+    ret_at = sstart + 36
++    ret_at = sstart + 44
 +    emit(CBNZ(0, here(), ret_at))               # cbnz w0, ret (stub set the flag: skip the VR action)
 +    emit(0x3941600b)                            # ldrb w11, [x0, #0x58] (the replaced instruction)
 +    emit(B(here(), 0x1d7294))                  # back to the hook site + 4
@@ -372,15 +409,15 @@ index 4d5b5c1..ab9ff99 100644
      if (img_path(path, &mi, &k)) {
          if (k < 0) return err_res("open", path);
 diff --git a/dm/host/hud_manual.c b/dm/host/hud_manual.c
-index 920201f..a1e8c3a 100644
+index 920201f..659d844 100644
 --- a/dm/host/hud_manual.c
 +++ b/dm/host/hud_manual.c
-@@ -248,9 +248,30 @@ static void dm_hud_probe_tick(void) {
+@@ -248,9 +248,47 @@ static void dm_hud_probe_tick(void) {
      hdr[2] = 0;   // reset the record count; the stub appends from 0 again
  }
  
 +// ---------- Character selection (0157) ----------
-+// The guest Decide stub (char_select.c, the back-to-Update cut at 0x4d78f8)
++// The guest switch stub (char_select.c, the confirm-switch cut at 0x1d7290)
 +// sets state +0x260 when the player picks the title menu's "角色选择" row
 +// (the repurposed VR row, action 6, Table A). This runs once per present
 +// (from dm_hud_manual_frame_tick, which uw.c calls every present) and
@@ -388,10 +425,27 @@ index 920201f..a1e8c3a 100644
 +// pick. dm_char_select_open_editor is CharSelectEditor.m (it dispatches to
 +// the main thread; UIKit must run there). The slot is in the free zone
 +// +0x250..+0x300 (the HUD masks end at +0x250, the HUD table starts at
-+// +0x300).
++// +0x300). The stub also writes diagnostics to +0x264/+0x268/+0x26c on
++// every switch call (action, sel/row/ret, call counter); the tick logs
++// each invocation once so the device run proves what the hook sees.
 +#define CHAR_SELECT_FLAG_OFF 0x260
++#define CHAR_SELECT_DIAG_ACTION_OFF 0x264
++#define CHAR_SELECT_DIAG_MISC_OFF 0x268
++#define CHAR_SELECT_COUNT_OFF 0x26c
 +void dm_char_select_open_editor(void);   // CharSelectEditor.m
++static uint32_t g_char_select_last_count;   // last switch-call counter logged
 +static void dm_char_select_frame_tick(uint8_t *st) {
++    // Diagnostic (#72 fix): log every switch invocation the stub saw.
++    // Independent of the flag -- a Confirm that computes the wrong
++    // action (e.g. the guide row) is exactly what the log needs to show.
++    volatile uint32_t *count = (volatile uint32_t *)(st + CHAR_SELECT_COUNT_OFF);
++    if (*count != g_char_select_last_count) {
++        g_char_select_last_count = *count;
++        uint32_t action = *(volatile uint32_t *)(st + CHAR_SELECT_DIAG_ACTION_OFF);
++        uint32_t misc = *(volatile uint32_t *)(st + CHAR_SELECT_DIAG_MISC_OFF);
++        LOG("[char] switch #%u sel=%u row=%u action=%d ret=%u",
++            *count, misc & 0xff, (misc >> 8) & 0xff, (int32_t)action, (misc >> 24) & 0xff);
++    }
 +    volatile uint32_t *flag = (volatile uint32_t *)(st + CHAR_SELECT_FLAG_OFF);
 +    if (*flag != 1) return;
 +    *flag = 0;
