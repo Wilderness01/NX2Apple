@@ -1,0 +1,393 @@
+From 17545b8f0626e45526fa4c87e7e7ff34731fe8b0 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Tue, 17 Nov 2026 06:59:01 +0000
+Subject: [PATCH] 0164: shop probe at the confirm branch (ItemName field trace)
+
+Static tracing cannot resolve the ItemName field offset: the
+0x50a5c0/x22 route ends in a UI-layer item-data object whose
+typeinfos are runtime-constructed in BSS, the UI object's +0x150
+is an animation name (proved), and ItemName lives in the BYML
+layer, read by hash. One logging cut at the router confirm branch
+0x442664 dumps the shop structure at confirm time (x19, list,
+list+0x20, A = vtable[0](list+0x20), x22 = 0x50a5c0(list+0x20),
+0x80 bytes of A and x22, 0x100 bytes of the shop sub-object,
+0x200 bytes of the list object) into the probe buffer at state
++0x3300; the host drains it into [shop] log lines once per present.
+Object B's holder offset is still unpinned, so its pointer is not
+read directly: it must live in the x19/list windows, identified
+there by shape. Every pointer is NULL-guarded; the stub returns
+void, writes only the probe buffer, and never suppresses the buy.
+Delete after use; never ship.
+---
+ dm/games/0100000000010000/patches.py   |  76 ++++++++++
+ dm/games/0100000000010000/shop_probe.c | 187 +++++++++++++++++++++++++
+ dm/host/hud_manual.c                   |  59 ++++++++
+ 3 files changed, 322 insertions(+)
+ create mode 100644 dm/games/0100000000010000/shop_probe.c
+
+diff --git a/dm/games/0100000000010000/patches.py b/dm/games/0100000000010000/patches.py
+index 5a9d213..58a8d34 100644
+--- a/dm/games/0100000000010000/patches.py
++++ b/dm/games/0100000000010000/patches.py
+@@ -320,9 +320,82 @@ def _char_select_frame_step(ctx):
+     emit(B(here(), 0x4972f8))                    # back to the hook site + 4
+     fs_put(0x4972f4, [B(0x4972f4, rstart)], 'Title menu setup: row 3 (VR) text becomes "角色选择" (char_select)')
+ 
++# shop_probe, compiled from shop_probe.c (0164: the in-game shop character
++# picker probe) with aarch64-linux-gnu-gcc -O2 -ffreestanding -fno-builtin
++# -fno-stack-protector -fno-jump-tables -fno-unwind-tables
++# -fno-asynchronous-unwind-tables -c, and objcopy -O binary
++# --only-section=.text (never plain -O binary: the 0131 .eh_frame lesson).
++# One function: shop_probe(shop_sub, state) -- see shop_probe.c for the why
++# (the ItemName field offset is still open; the probe dumps, at shop-confirm
++# time, the pointers and byte windows the ItemName string -- or the Object B
++# pointer that leads to it -- can be read out of).
++SHOP_PROBE_WORDS = (
++    "f100001ffa40182454000de0a9bd7bfd910003fda90153f3aa0103f3b9730021aa0003f4528a084072aa69006b00003f5400"
++    "00a0b9330260b933067fb9330a7fb9330e7fb973066035000b80a9025bf5f9400e95b4000bb5f94012a6910082b6b4000c46"
++    "f94000c1b4000c81aa1603e0d63f0020b4000cc0bd407000aa0003e11e2020185400008ad2800007d280000614000007f940"
++    "3406b4000a46f94000c6b4000a06f9409cc6aa0603e7f9198a74d2866e08f9198e75aa1403e4f9199276aa1503e2f9199661"
++    "8b080265f9199a67aa0003e3f9199e7f91020007b933427fb933467ff919a67ff919aa7fb9335a7fb9335e7ff919b27ff919"
++    "b67fd503201f52800001b40000603940006112001c2191000463380014a1eb07007f54ffff21d2867e05aa0603e38b050260"
++    "910200c552800001b40000663940006112001c219100046338001401eb05007f54ffff21d2868e03910402818b030263d503"
++    "201f3840148012001c0038001460eb04003f54ffff81d286ae00910802a38b00026152800000b40000753940004012001c00"
++    "9100044238001420eb02007f54ffff21b9730a6052808c01a9425bf511000400b9330a60b9330661a94153f3a8c37bfdd65f"
++    "03c0d65f03c0d2800000d2800006d2800007d2800001d280001617ffffb4d280000717ffffb2d2800000d2800007d2800001"
++    "17ffffaed2800007d2800001d2800000d280000617ffffa9d2800006d2800007d280000117ffffa5"
++)
++
++# (0164) The shop probe: one FRAME_STEP cut at the router confirm branch
++# 0x442664 (NrvHelloNewItem's real handler 0x442560, confirm branch
++# ~0x442664-0x44266c: after the 0x4f4f90 == 1 check, 0x4f76b0 and 0x30b4c0,
++# the router sets the nerve to NrvSelectDecideEnd). At that point x19 is
++# the ShopStateInShop sub-object, [x19+0x18] is the list object and
++# [x19+0x18]+0x20 is the argument 0x50a5c0 takes; the player's "confirm
++# selection" decision has just been made. The trampoline saves the live
++# registers (x0 = the 0x30b4c0 result, x30 = the return address, x19 = the
++# shop sub-object; x1 is about to be overwritten by the replaced adrp),
++# calls shop_probe(x19, state page), restores, re-executes the replaced
++# adrp+addi (x1 = 0x12bc9a8, NrvSelectDecideEnd -- the adrp is PC-relative,
++# so it is re-synthesised with ADRP+ADDI from the trampoline's own PC, not
++# copied verbatim) and branches back to 0x44266c (the b #0x442890). The
++# game's own confirm flow is untouched: the stub returns void, writes only
++# the probe buffer (state +0x3300), and never suppresses the buy. The host
++# (hud_manual.c, dm_shop_probe_tick, once per present) drains the buffer
++# into "[shop] ..." log lines and resets it, so the stub can fire again
++# on the next confirm.
++def _shop_probe_frame_step(ctx):
++    here, emit, fs_site, fs_put, FS_STATE_OFF = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state
++    probe_code = here()
++    hx = ''.join(SHOP_PROBE_WORDS)
++    for i in range(0, len(hx), 8):
++        emit(int(hx[i:i + 8], 16))
++    # The router confirm branch at 0x442664: `adrp x1, #0x12bc000`.
++    # x0 (the 0x30b4c0 result) and x30 (the return address into the
++    # router's caller) are saved across the bl: the stub clobbers x0 and
++    # the bl clobbers x30. x19 (the shop sub-object) is passed to the stub
++    # and saved too; x1 is about to be overwritten by the replaced adrp.
++    # The replaced adrp+addi are NOT PC-relative-safe to re-execute
++    # verbatim (adrp computes from the PC), so they are re-synthesised:
++    # ADRP from the trampoline's PC to the 0x12bc000 page, ADDI 0x9a8.
++    # The branch back is to the hook site + 8 (0x44266c), skipping both
++    # replaced instructions; the flags do not matter (the branch is
++    # unconditional and the stub leaves no flag dependency behind).
++    fs_site(0x442664, 'c17300d0')
++    sstart = here()
++    emit(STP_PRE(0, 30, 31, -16))              # stp x0, x30, [sp, #-16]! (live: the 0x30b4c0 result, the return address)
++    emit(STP_PRE(19, 1, 31, -16))              # stp x19, x1, [sp, #-16]! (live: the shop sub-object; x1 is about to be overwritten)
++    emit(0xaa1303e0)                            # mov x0, x19 (the shop sub-object -> probe arg 0)
++    emit(ADRP(1, here(), FS_STATE_OFF))         # x1 = state page (probe arg 1; the stub adds SHOP_PROBE_OFF 0x3300 itself)
++    emit(B(here(), probe_code) | 0x80000000)     # bl shop_probe
++    emit(LDP_POST(19, 1, 31, 16))               # ldp x19, x1, [sp], #16
++    emit(LDP_POST(0, 30, 31, 16))               # ldp x0, x30, [sp], #16
++    emit(ADRP(1, here(), 0x12bc9a8))            # x1 = 0x12bc000 page (the replaced adrp, re-synthesised)
++    emit(ADDI(1, 1, 0x9a8))                     # x1 = 0x12bc9a8 (the replaced addi; NrvSelectDecideEnd)
++    emit(B(here(), 0x44266c))                   # back to the hook site + 8
++    fs_put(0x442664, [B(0x442664, sstart)], 'Shop confirm branch: the shop probe (shop_probe.c) dumps the shop structure at confirm time, game flow untouched')
++
+ def _frame_step_141(ctx):
+     _hud_runtime_frame_step(ctx)
+     _char_select_frame_step(ctx)
++    _shop_probe_frame_step(ctx)
+ 
+ FRAME_STEP = {BUILD_141: _frame_step_141}
+ 
+@@ -333,4 +406,7 @@ BINDING = [
+     {'what': "HUD editor runtime, v17 (hud_runtime.c, 0151: three cuts -- entry +0x20 at 0x9094b4, +0x13c at 0x9095d0, and the forced-recompute cut at 0x909da0 inside 0x909d4c; applies ONLY the editor manual deltas from the DM_HUD_* environment variables via hud_manual.c, state page +0x200: 18 floats dx/dy/k for elements 0 compass, 1 lives, 2 coins, 3 moons, 4 hints (unused), 5 regional coins, manual mask +0x248, hidden mask +0x24C; dx clamped +-640, dy +-360, k clamped [0.6, 1.8]; no auto-edge term -- the edge anchor lives in the 0136/0143 .bflyt overlay, so the edge is never applied twice. 0150 writes the pane LOCAL matrix (+0xa0) as well as +0x30/+0x48 and +0x70: Pane::Calculate recomposes +0x70 from the +0xa0 matrix every frame, so a +0x70 write alone is wiped on the next Calculate (the #65 drag failure -- 0147 never wrote the matrix, the e_mod recompute check then mistook the wipe for a game recompose and polluted the stored original, and every later write became a no-op). The runtime stores the original local matrix per entry (e_lm0, entry +128, 12 floats; a NULL +0xa0 skips only the matrix write) and re-derives the matrix write from it with the ABSOLUTE target (tdx/tdy/tk); the restore writes the matrix back to e_lm0 too; the e_mod recompute check only follows e_mod when the live local matrix still holds the shift (a stale-matrix recompose leaves e_mod alone and the write re-applies). Table entry 128 -> 176 bytes, HUD_EDGE_SLOTS_PER_ELEM 16 -> 11 (66 entries, state +0x300..+0x3060, short of the diagnostic probe buffer at +0x3300; the 0147 matcher takes one 'All' per layout instance, so eleven slots per element is still several times the realistic maximum). 0151 S1: the per-frame layout driver (0xa1cb80) restores a counter All pane's local to base and recomposes +0x70 from it AFTER the +0x13c hook and BEFORE Draw, via the forced recompute 0x9036cc -> 0x909d4c (only caller the driver at 0xa1cdf8, force=1), bypassing both Calculate cuts -- the #66 wipe (only the compass moved); the third cut at 0x909da0 (after 0x909d4c's own recompute, before its children loop) re-applies the shift there. 0151 S2: the bit-7 guard moved to after the matcher -- a hidden pane's Calculate clears bit 7, so the old guard skipped it forever and hide->show was dead (#66); a matched pane with a table entry is never skipped now, while a never-calculated pane with no entry is still skipped on its first frame. 0151 S3: an All with a 'PicView' child matches compass (MapMiniPlayer's red needle; MapPlayer's PicView sits under Icon00, so the full-screen map does not match). 0147 layout-aware matcher: only a layout's 'All' container is ever matched (the display side), identified by its direct children -- compass: 'PicMap' child (MapMini) or 'PicView' child (MapMiniPlayer); lives: 'Life' child (CounterLife/Kids/Up); moons: 'Shine' child with a 'TxtShine' child (CounterShine); coins/regional: 'Add' child, told apart by the 'Capture' sibling's tx under the same RootPane (0 = CounterCoin, 130 = CounterCollectCoin; another tx falls back to All tx, nearest of -740/-615; no Capture sibling matches nothing). The old name matcher is gone: 'PicStrap' (BootLoading strip), 'Counter' (moon-tower container), 'TxtGuide01' (hints) and the capture content panes ('TxtCounterSh'/'TxtCounter'/'TxtIconSh'/'TxtIcon' under Capture00-03) are never matched -- moving content panes emptied the 128x128 capture texture (R1, log-51: a manual value moved the glyphs out of the texture and restoring never repainted it), and the name matches hit the wrong layouts (R2). Hints and the white bar have no matcher entry and stay hidden in the overlay. Restore: a mask-0 element takes no table entry and writes nothing; a pane with an existing entry has its local (+0x30/+0x48) and its local matrix (+0xa0) written back to e_orig / e_lm0 (its first-seen local, the overlay's default edge position) and is marked dirty (flags bit 4) so the game recomposes +0x70 from the restored matrix; +0x70 itself is never restored to e_mod; once restored and visible the entry is released. Each element takes 1 slot (its All container). Hide is a TRUE hide (flags bit 0 at +0x58 cleared), only on matched All containers. 0137/0142 kept: +0x70 is written directly at the +0x13c cut from the stored original global (e_mod) and the local as fallback; the global write uses the ABSOLUTE target (tdx/tdy/tk, stored in e_orig slots [1]/[2]/[4]) while the local uses the parent-compensated delta; a dirty flag so a moved container carries its children, an orig/mod table so a fixed offset never drifts. The 0118 auto-edge code (hud_edge.c, _hud_edge_frame_step, HUD_EDGE_WORDS) and the diagnostic probe (HUD_PROBE_WORDS, hud_probe.c) are deleted from this profile -- the probe stays a diagnostic tool only, never shipped", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
+      'why': "Pane::Calculate and the pane layout are this build's nn::ui2d code, found by the HUDLOG diagnostic run (log-17) and confirmed by disassembly of DmIOS. The manual settings come from the HUD editor through the same environment-variable channel the launcher already uses for its other settings (DM_SCREEN_ASPECT), so the game reads nothing new: the host copies them to state page +0x200 once per present. The .bflyt ground truth (REPORT-HUD-REDO.md B, all 215 layouts parsed) is why the matcher is layout-aware: the coins and regional-coins content panes share names across two layouts, the capture texture mechanism means only the All container may move, and 'Counter'/'PicStrap' name matches hit the moon tower and the BootLoading strip. The old name matcher moved content panes and emptied the capture texture (log-50/51: coins and regional coins vanished after a manual value, and restoring the default never repainted the texture). The runtime keeps no user-adjustable state in the game beyond the orig/mod table, and its only tree walks are the bounded child-name checks and the bounded flag-only mark-dirty, so the 0113 crash class (a name/match walk reading a pane through a bad pointer) is structurally absent",
+      'blocked': 'the stubs have no function-matched form yet'},
++    {'what': "Shop probe, diagnostic only (shop_probe.c, 0164: one FRAME_STEP cut at the router confirm branch 0x442664, NrvHelloNewItem's real handler 0x442560 -- the confirm branch at ~0x442664-0x44266c, after the 0x4f4f90 == 1 check, 0x4f76b0 and 0x30b4c0, where the router sets the nerve to NrvSelectDecideEnd. At that point x19 is the ShopStateInShop sub-object, [x19+0x18] is the list object and [x19+0x18]+0x20 is the argument 0x50a5c0 takes. The trampoline saves the live registers (x0 = the 0x30b4c0 result, x30 = the return address, x19 = the shop sub-object), calls shop_probe(x19, state page), restores, re-synthesises the replaced adrp+addi (x1 = 0x12bc9a8) and branches back to 0x44266c. The stub dumps, per shop confirm, into the probe buffer (state +0x3300): x19, list, list+0x20, A = vtable[0](list+0x20) (the selected list-item UI object), x22 = 0x50a5c0(list+0x20) (replicated inline: NULL when *(A+0x70) < 0, else *(vtable(*(A+0x68)) + 0x138)), 0x80 bytes of A, 0x80 bytes of x22, 0x100 bytes of the shop sub-object and 0x200 bytes of the list object. Object B's holder offset is still unpinned statically, so its pointer is not read directly: it must live in the x19/list windows, and the log reader identifies it there by shape (an object whose +0x18 is a small count and whose +0x20 points at a 0x20-strided array whose entries' +0x00 include A). Every pointer is NULL-guarded; a NULL yields a zero field / zero-filled window, never a fault. The stub returns void, writes only the probe buffer, and never suppresses the buy; the host (hud_manual.c, dm_shop_probe_tick, once per present) drains the buffer into '[shop] ...' log lines and resets it. Delete after use; never ship.", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
++     'why': "Static tracing cannot resolve the ItemName field offset: the 0x50a5c0/x22 route ends in a UI-layer item-data object whose typeinfos are runtime-constructed in BSS (their names are not recoverable from the file), the UI object's +0x150 is an animation name (proved, not ItemName), and ItemName lives in the BYML/source layer, read by hash, so no static xref path exists. One device run with this logging cut reads the shop structure out of the log, then the hook offset is fixed and the probe is deleted.",
++     'blocked': 'device run: open any shop, select any item, confirm, send the log; the ItemName string (or the Object B pointer) is read out of the [shop] lines, then the v1 hook offset is fixed'},
+ ]
+diff --git a/dm/games/0100000000010000/shop_probe.c b/dm/games/0100000000010000/shop_probe.c
+new file mode 100644
+index 0000000..f21f59a
+--- /dev/null
++++ b/dm/games/0100000000010000/shop_probe.c
+@@ -0,0 +1,187 @@
++// shop_probe.c -- diagnostic probe (0164). Adds logging only; changes no game behavior.
++//
++// The user authorised one probe build after static tracing hit a wall:
++// the ItemName field offset is still open (REPORT-CHAR-INGAME-S6-ITEMNAME.md).
++// The 0x50a5c0/x22 route does not lead to ItemName (x22 is a UI-layer
++// item-data object; its typeinfos are runtime-constructed in BSS), the UI
++// object's +0x150 is an animation name (not ItemName, proved), and ItemName
++// lives in the BYML/source layer, read by hash -- so no static xref path
++// exists. This probe dumps, at shop-confirm time, everything reachable
++// from the confirm branch so the ItemName string (or the Object B pointer
++// that leads to it) can be read out of the device log.
++//
++// Hook site: the router confirm branch at 0x442664 (NrvHelloNewItem's real
++// handler 0x442560; NSO vaddr). At that point x19 is the ShopStateInShop
++// sub-object, [x19+0x18] is the list object, and [x19+0x18]+0x20 is the
++// argument 0x50a5c0 takes. The trampoline (patches.py) saves the live
++// registers, calls this stub with (x19, state page), restores, re-executes
++// the replaced adrp+addi (x1 = 0x12bc9a8, NrvSelectDecideEnd) and returns
++// to 0x44266c. The game's own confirm flow is untouched: the stub returns
++// void, writes only the probe buffer, and never suppresses the buy.
++//
++// What is dumped (see the host drain in hud_manual.c, dm_shop_probe_tick):
++//   x19, list = [x19+0x18], list_arg = list+0x20,
++//   A = vtable[0](list_arg) (the selected list-item UI object),
++//   x22 = 0x50a5c0(list_arg) (replicated inline: NULL when *(A+0x70) < 0,
++//     else *(vtable(*(A+0x68)) + 0x138)),
++//   0x80 bytes of A, 0x80 bytes of x22 (pointer values resolve offline
++//     against the NSO's string table -- that is how a name field is found),
++//   0x100 bytes of the shop sub-object (x19) and 0x200 bytes of the list
++//     object. Object B's holder offset is still unpinned statically, so
++//     its pointer is NOT read directly: it must live in one of those two
++//     windows (it is stored in the shop state or the list object), and
++//     the log reader identifies it there by shape (an object whose +0x18
++//     is a small count and whose +0x20 points at a 0x20-strided array
++//     whose entries' +0x00 include A). The objB/src fields in the dump
++//     are therefore zero, documented, and not read.
++// Every pointer is NULL-guarded before it is dereferenced; a NULL anywhere
++// yields a zero field / zero-filled window, never a fault. The stub fires
++// once per shop confirm; if the host has not drained the previous dump
++// (len != 0) the call returns without writing, so a dump is never torn.
++//
++// Compiled with: aarch64-linux-gnu-gcc -O2 -ffreestanding -fno-builtin
++//   -fno-stack-protector -fno-jump-tables -fno-unwind-tables
++//   -fno-asynchronous-unwind-tables -c,
++//   objcopy -O binary --only-section=.text (never plain -O binary: the
++//   0131 .eh_frame lesson). The function takes everything through its
++//   arguments -- no static data, no literal pool, no external calls -- so
++//   the emitted words are position-independent and relocation-free and can
++//   be dropped into the rewriter's patch area verbatim:
++//   x0 = the shop sub-object (x19 at the hook site), x1 = the state page.
++//   Delete after use; never ship.
++
++typedef unsigned int u32;
++typedef unsigned long long u64;
++typedef unsigned long uintptr_t;
++
++// The probe buffer (state + 0x3300, 3328 bytes: the frame-step state page
++// is 0x4000 bytes and the hud_edge table ends at +0x3060, so +0x3300 is
++// past it; the HUD probe buffer lives at the same offset, but its stub is
++// not in this build and its drain keys on its own magic "PRBE", so the two
++// never interact). Header 16 bytes, dump 0x460 bytes: 0x470 total.
++#define SHOP_PROBE_OFF 0x3300
++#define SHOP_PROBE_MAGIC 0x53485042u   // "SHPB"
++#define SHOP_PROBE_DUMP_LEN 0x460
++// Header offsets (relative to probe_buf).
++#define SP_MAGIC 0
++#define SP_LEN 4
++#define SP_FIRE 8
++#define SP_RESERVED 12
++// Dump offsets (relative to probe_buf + 0x10).
++#define SP_D_X19 0x00
++#define SP_D_LIST 0x08
++#define SP_D_LIST_ARG 0x10
++#define SP_D_A 0x18
++#define SP_D_X22 0x20
++#define SP_D_OBJB 0x28
++#define SP_D_OBJB_COUNT 0x30
++#define SP_D_OBJB_ARRAY 0x38
++#define SP_D_SRC 0x40
++#define SP_D_SRC_COUNT 0x48
++#define SP_D_SRC_ARRAY 0x50
++#define SP_D_RESERVED 0x58
++#define SP_D_A_BYTES 0x60        // 0x80 bytes
++#define SP_D_X22_BYTES 0xe0      // 0x80 bytes
++#define SP_D_X19_BYTES 0x160     // 0x100 bytes
++#define SP_D_LIST_BYTES 0x260    // 0x200 bytes
++#define SP_D_A_LEN 0x80
++#define SP_D_X22_LEN 0x80
++#define SP_D_X19_LEN 0x100
++#define SP_D_LIST_LEN 0x200
++
++// Store a u64 / u32 into the probe buffer (volatile: one access, exactly
++// as written -- no vectorising, no combining; the buffer is shared with
++// the host, which sets nothing here but drains the dump).
++static inline __attribute__((always_inline)) void sp_put_u64(volatile char *base, int off, u64 v) {
++    *(volatile u64 *)(base + off) = v;
++}
++static inline __attribute__((always_inline)) void sp_put_u32(volatile char *base, int off, u32 v) {
++    *(volatile u32 *)(base + off) = v;
++}
++
++// Copy n bytes from game memory into the probe buffer, one byte at a time
++// (volatile on both sides: no vectorising, no widening, no reading past
++// the window). A NULL source fills with zeros.
++static inline __attribute__((always_inline)) void sp_copy_bytes(volatile char *dst, const void *src, int n) {
++    const volatile unsigned char *s = (const volatile unsigned char *)src;
++    for (int i = 0; i < n; i++) dst[i] = src ? s[i] : 0;
++}
++
++// A = vtable[0](list_arg): the selected list-item UI object. This is the
++// first step 0x50a5c0 takes (ldr x8,[x0]; ldr x8,[x8]; blr x8). Every
++// pointer is guarded; a NULL anywhere yields NULL, never a fault.
++static inline __attribute__((always_inline)) void *sp_get_a(void *list_arg) {
++    if (!list_arg) return 0;
++    void *vt = (void *)*(volatile void **)list_arg;
++    if (!vt) return 0;
++    typedef void *(*get_t)(void *);
++    get_t f = *(volatile get_t *)vt;
++    if (!f) return 0;
++    return f(list_arg);
++}
++
++// x22 = 0x50a5c0(list_arg), replicated inline (no call into the game, so
++// no calling-convention risk): NULL when *(A+0x70) < 0 (the float gate),
++// else *(vtable(*(A+0x68)) + 0x138) -- vtable entry #39 of the sub-object
++// at *(A+0x68). Verified against the 0x50a5c0 disassembly
++// (REPORT-CHAR-INGAME-S6-ITEMNAME.md §1.1).
++static inline __attribute__((always_inline)) void *sp_get_x22(void *a) {
++    if (!a) return 0;
++    float g = *(volatile float *)((char *)a + 0x70);
++    if (!(g >= 0.0f)) return 0;   // gate: < 0 (or NaN) -> NULL, as fcmp + b.ge
++    void *sub = (void *)*(volatile void **)((char *)a + 0x68);
++    if (!sub) return 0;
++    void *subt = (void *)*(volatile void **)sub;
++    if (!subt) return 0;
++    return (void *)*(volatile void **)((char *)subt + 0x138);
++}
++
++void shop_probe(void *shop_sub, unsigned char *state) {
++    if (!shop_sub || !state) return;
++    volatile char *buf = (volatile char *)state + SHOP_PROBE_OFF;
++    volatile u32 *hdr = (volatile u32 *)buf;
++    // Initialise the header the first time (the state page starts zeroed).
++    if (hdr[SP_MAGIC / 4] != SHOP_PROBE_MAGIC) {
++        hdr[SP_MAGIC / 4] = SHOP_PROBE_MAGIC;
++        hdr[SP_LEN / 4] = 0;
++        hdr[SP_FIRE / 4] = 0;
++        hdr[SP_RESERVED / 4] = 0;
++    }
++    // The host has not drained the previous dump yet: return without
++    // writing, so a dump is never torn or overwritten mid-read.
++    if (hdr[SP_LEN / 4] != 0) return;
++    volatile char *d = buf + 0x10;
++
++    void *x19 = shop_sub;
++    void *list = (void *)*(volatile void **)((char *)x19 + 0x18);
++    void *list_arg = list ? (char *)list + 0x20 : 0;
++    void *a = sp_get_a(list_arg);
++    void *x22 = sp_get_x22(a);
++
++    // Pointer block. Object B and the source container are zero: their
++    // holder offsets are unpinned (see the header comment) -- the reader
++    // finds Object B in the x19/list windows below by shape.
++    sp_put_u64(d, SP_D_X19, (u64)(uintptr_t)x19);
++    sp_put_u64(d, SP_D_LIST, (u64)(uintptr_t)list);
++    sp_put_u64(d, SP_D_LIST_ARG, (u64)(uintptr_t)list_arg);
++    sp_put_u64(d, SP_D_A, (u64)(uintptr_t)a);
++    sp_put_u64(d, SP_D_X22, (u64)(uintptr_t)x22);
++    sp_put_u64(d, SP_D_OBJB, 0);
++    sp_put_u32(d, SP_D_OBJB_COUNT, 0);
++    sp_put_u32(d, SP_D_OBJB_COUNT + 4, 0);
++    sp_put_u64(d, SP_D_OBJB_ARRAY, 0);
++    sp_put_u64(d, SP_D_SRC, 0);
++    sp_put_u32(d, SP_D_SRC_COUNT, 0);
++    sp_put_u32(d, SP_D_SRC_COUNT + 4, 0);
++    sp_put_u64(d, SP_D_SRC_ARRAY, 0);
++    sp_put_u64(d, SP_D_RESERVED, 0);
++    // Byte windows (NULL sources fill with zeros).
++    sp_copy_bytes(d + SP_D_A_BYTES, a, SP_D_A_LEN);
++    sp_copy_bytes(d + SP_D_X22_BYTES, x22, SP_D_X22_LEN);
++    sp_copy_bytes(d + SP_D_X19_BYTES, x19, SP_D_X19_LEN);
++    sp_copy_bytes(d + SP_D_LIST_BYTES, list, SP_D_LIST_LEN);
++    // Publish: fire count first, length last -- the host only reads the
++    // dump once len is non-zero, so it can never see a partial dump.
++    hdr[SP_FIRE / 4] = hdr[SP_FIRE / 4] + 1;
++    hdr[SP_LEN / 4] = SHOP_PROBE_DUMP_LEN;
++}
+diff --git a/dm/host/hud_manual.c b/dm/host/hud_manual.c
+index 659d844..f79bda9 100644
+--- a/dm/host/hud_manual.c
++++ b/dm/host/hud_manual.c
+@@ -285,11 +285,70 @@ static void dm_char_select_frame_tick(uint8_t *st) {
+     dm_char_select_open_editor();
+ }
+ 
++// ---------- Shop probe (0164, diagnostic only) ----------
++// The guest stub (shop_probe.c, the confirm-branch cut at 0x442664) writes
++// one dump per shop confirm into the frame-step state page at +0x3300
++// (the HUD probe buffer region; the HUD probe stub is not in this build,
++// so the region is free -- this drain keys on its own magic "SHPB", and
++// dm_hud_probe_tick keys on "PRBE", so the two never interact).
++// Layout: +0x00 u32 magic "SHPB", +0x04 u32 len (dump bytes, 0 = empty),
++// +0x08 u32 fire count, +0x0C u32 reserved; +0x10 the dump (0x460 bytes):
++//   +0x00 u64 x19 (shop sub-object), +0x08 u64 list ([x19+0x18]),
++//   +0x10 u64 list_arg (list+0x20), +0x18 u64 A (selected UI object),
++//   +0x20 u64 x22 (0x50a5c0 return), +0x28 u64 objB (0: holder unpinned),
++//   +0x30 u32 objB_count, +0x38 u64 objB_array, +0x40 u64 src,
++//   +0x48 u32 src_count, +0x50 u64 src_array, +0x58 u64 reserved,
++//   +0x60 A bytes 0x00-0x7F, +0xE0 x22 bytes 0x00-0x7F,
++//   +0x160 x19 bytes 0x00-0xFF, +0x260 list bytes 0x00-0x1FF.
++// The host logs the dump once per present and resets len, so the stub can
++// fire again on the next confirm. The hex lines carry a region label
++// (ptrs/A/x22/x19/list) so the reader knows which window a byte came
++// from; pointer values resolve offline against the NSO's string table.
++// Delete after use; never ship.
++#define SHOP_PROBE_OFF 0x3300
++#define SHOP_PROBE_MAGIC 0x53485042u   // "SHPB"
++#define SHOP_PROBE_LEN 0x460
++static void dm_shop_probe_tick(void) {
++    uint8_t *st = dm_fps_state;
++    if (!st) return;
++    uint8_t *pb = st + SHOP_PROBE_OFF;
++    uint32_t *hdr = (uint32_t *)pb;
++    if (hdr[0] != SHOP_PROBE_MAGIC) return;   // the stub has not fired yet
++    uint32_t len = hdr[1];
++    if (len == 0) return;   // nothing to drain
++    if (len > SHOP_PROBE_LEN) len = SHOP_PROBE_LEN;
++    uint32_t fire = hdr[2];
++    uint8_t *d = pb + 0x10;
++    uint64_t x19 = *(uint64_t *)(d + 0x00);
++    uint64_t list = *(uint64_t *)(d + 0x08);
++    uint64_t list_arg = *(uint64_t *)(d + 0x10);
++    uint64_t a = *(uint64_t *)(d + 0x18);
++    uint64_t x22 = *(uint64_t *)(d + 0x20);
++    LOG("[shop] probe #%u x19=0x%llx list=0x%llx list+0x20=0x%llx A=0x%llx x22=0x%llx objB=0 src=0",
++        fire, (unsigned long long)x19, (unsigned long long)list,
++        (unsigned long long)list_arg, (unsigned long long)a, (unsigned long long)x22);
++    for (uint32_t off = 0; off < len; off += 64) {
++        uint32_t n = len - off;
++        if (n > 64) n = 64;
++        const char *region = off < 0x60 ? "ptrs" : off < 0xe0 ? "A" : off < 0x160 ? "x22" : off < 0x260 ? "x19" : "list";
++        char hex[129];
++        for (uint32_t k = 0; k < n; k++) {
++            unsigned char b = d[off + k];
++            hex[2 * k] = "0123456789abcdef"[b >> 4];
++            hex[2 * k + 1] = "0123456789abcdef"[b & 0xf];
++        }
++        hex[2 * n] = '\0';
++        LOG("[shop] hex %s off=0x%03x bytes=%u hex=%s", region, off, n, hex);
++    }
++    hdr[1] = 0;   // reset: the stub may fire again on the next confirm
++}
++
+ void dm_hud_manual_frame_tick(void) {
+     uint8_t *st = dm_fps_state;
+     if (!st) return;
+     dm_char_select_frame_tick(st);   // (0157) the title menu's "角色选择" row: open the picker when the guest set state +0x260
+     dm_hud_probe_tick();   // drain the 0129 probe buffer every present (it is a no-op unless DM_HUD_PROBE=1)
++    dm_shop_probe_tick();   // (0164) drain the shop probe buffer every present (it is a no-op until the stub fires)
+     float dx[DM_HUD_N], dy[DM_HUD_N], k[DM_HUD_N];
+     uint32_t manual = 0, hidden = 0;
+     for (int i = 0; i < DM_HUD_N; i++) {
+-- 
+2.43.0
+
