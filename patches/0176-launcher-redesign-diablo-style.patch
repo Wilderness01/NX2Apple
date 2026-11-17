@@ -1,0 +1,466 @@
+From a623201b6aaab146437088c1f00ebed1221d160e Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Tue, 17 Nov 2026 13:08:31 +0000
+Subject: [PATCH] 0176: launcher redesigned in the Diablo III launcher's
+ language
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Left hero (edition line, huge serif SUPER MARIO / ODYSSEY title, Chinese
+title, flavor line, big red Play, two glass buttons) and a dark glass
+Launch Config panel on the right holding every settings row; top bar with
+the location line and version/device pills, bottom bar with the offline note
+and the spaced-caps tagline. Two columns in landscape, stacked in portrait.
+No row, control, action or text value changes — layout only.
+---
+ dm/ios/Sources/Launcher.swift | 356 +++++++++++++++++++++++++++-------
+ 1 file changed, 286 insertions(+), 70 deletions(-)
+
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index 5da34a0..4207a2a 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -2,6 +2,8 @@
+ // from dm/games/settings.tsv (dm/games/settings.py): each sets an environment variable the host reads when the game starts. A variable an env file set (Documents/env.txt, the bundle's
+ // dm/env.txt; main.m lists them in DM_ENV_FILE_KEYS) is shown but kept. All settings share one screen, grouped by section (rows: LauncherRow.swift). Choices that differ from the game's default are kept
+ // in UserDefaults; Reset to tested defaults shows the defaults, and Play then forgets them. DM_LAUNCHER=0 in Documents/env.txt starts the game at once with the saved choices; DM_SAVED_CHOICES=0 ignores them (and keeps them)
++//
++// Layout (0176): rebuilt in the Diablo III launcher's language — a full-bleed title-screen backdrop, a hero column on the left (edition line, huge serif title, Chinese title, flavor line, big red Play, two glass buttons) and a dark glass "Launch Config" panel on the right holding every settings row. Two columns in landscape, stacked in portrait. Only the layout changed: every row, control, action and text value is the same as before.
+ import SwiftUI
+ import UIKit
+ import UniformTypeIdentifiers
+@@ -16,13 +18,16 @@ private func info(_ key: String) -> Any? { Bundle.main.object(forInfoDictionaryK
+ /// picker — so a game's RomFS kept on an external drive or in iCloud Drive could not be used at all
+ /// before this. Picking an image (romfs.img) or a folder stores a bookmark (DataBookmark.m), and
+ /// romfs_locate() prefers it from the next launch on.
++///
++/// The picker trigger is a binding (0176): the hero's "Import game data" glass button opens the
++/// same picker as this section's own button, so both stay one action.
+ private struct GameDataSection: View {
++    @Binding var picking: Bool
+     @State private var picked: String = ""
+     @State private var note: String = ""
+-    @State private var picking = false
+ 
+     var body: some View {
+-        Section {
++        VStack(alignment: .leading, spacing: 10) {
+             HStack {
+                 Text(LauncherText.text("ui.gameData", "Game data"))
+                 Spacer()
+@@ -47,10 +52,10 @@ private struct GameDataSection: View {
+                     dm_clear_picked_data(); refresh(); note = ""
+                 }
+             }
+-        } footer: {
+             Text(note.isEmpty
+                  ? LauncherText.text("ui.pickGameDataNote", "Pick the game's romfs.img or its RomFS folder — an external drive or iCloud Drive works. The app remembers the choice; a re-signed build asks once more.")
+                  : note)
++                .font(.footnote).foregroundStyle(.secondary)
+         }
+         .onAppear(perform: refresh)
+     }
+@@ -72,13 +77,16 @@ private struct GameDataSection: View {
+ /// Cloud saves: an iCloud Drive folder shared with the Mac app (chosen in its settings window's
+ /// Cloud saves too). The host brings the save in from there when the game starts and
+ /// sends it there after each save (dm/host/save_sync.h); the folder is a bookmark (CloudSaves.m).
++///
++/// The picker trigger is a binding (0176), as in GameDataSection: the hero's "Import save backup"
++/// glass button opens the same picker as this section's own button.
+ private struct CloudSavesSection: View {
++    @Binding var picking: Bool
+     @State private var folder: String = ""
+     @State private var note: String = ""
+-    @State private var picking = false
+ 
+     var body: some View {
+-        Section {
++        VStack(alignment: .leading, spacing: 10) {
+             HStack {
+                 Text(LauncherText.text("ui.cloudSaves", "Cloud saves"))
+                 Spacer()
+@@ -103,10 +111,10 @@ private struct CloudSavesSection: View {
+                     dm_clear_cloud_saves(); refresh(); note = ""
+                 }
+             }
+-        } footer: {
+             Text(note.isEmpty
+                  ? LauncherText.text("ui.cloudFolderNote", "Choose a folder in iCloud Drive, and the same one in the Mac app's Cloud saves. The save comes in when the game starts and goes out after each save; a save that is replaced is kept in save-backups.")
+                  : note)
++                .font(.footnote).foregroundStyle(.secondary)
+         }
+         .onAppear(perform: refresh)
+     }
+@@ -222,96 +230,304 @@ private struct LauncherBackdrop: View {
+     }
+ }
+ 
++/// The device's hardware model (0176): sysctlbyname("hw.machine") — the same call save_sync.c already uses
++/// on iOS — mapped to the marketing name the top bar's device pill shows. Only the models listed here
++/// get a marketing name; anything else falls back to the raw identifier, so the pill never lies.
++private func dmDeviceMachine() -> String {
++    var size = 0
++    guard sysctlbyname("hw.machine", nil, &size, nil, 0) == 0, size > 0 else { return "" }
++    var machine = [CChar](repeating: 0, count: size)
++    guard sysctlbyname("hw.machine", &machine, &size, nil, 0) == 0 else { return "" }
++    return String(cString: machine)
++}
++
++private func dmDeviceModelName() -> String {
++    switch dmDeviceMachine() {
++    case "iPhone14,7": return "iPhone 14"
++    case "iPhone14,8": return "iPhone 14 Plus"
++    case "iPhone15,2": return "iPhone 14 Pro"
++    case "iPhone15,3": return "iPhone 14 Pro Max"
++    case "iPhone15,4": return "iPhone 15"
++    case "iPhone15,5": return "iPhone 15 Plus"
++    case "iPhone16,1": return "iPhone 15 Pro"
++    case "iPhone16,2": return "iPhone 15 Pro Max"
++    case "iPhone17,1": return "iPhone 16 Pro"
++    case "iPhone17,2": return "iPhone 16 Pro Max"
++    case "iPhone17,3": return "iPhone 16"
++    case "iPhone17,4": return "iPhone 16 Plus"
++    case "iPhone17,5": return "iPhone 16e"
++    case "iPhone18,1": return "iPhone 17"
++    case "iPhone18,2": return "iPhone 17 Pro"
++    case "iPhone18,3": return "iPhone 17 Pro Max"
++    case "iPad12,1", "iPad12,2": return "iPad (9th generation)"
++    case "iPad13,1", "iPad13,2": return "iPad Air (4th generation)"
++    case "iPad13,4", "iPad13,5": return "iPad Pro 11-inch (3rd generation)"
++    case "iPad13,8", "iPad13,9": return "iPad Pro 12.9-inch (5th generation)"
++    case "iPad13,16", "iPad13,17": return "iPad Air (5th generation)"
++    case "iPad13,18", "iPad13,19": return "iPad (10th generation)"
++    case "iPad14,1", "iPad14,2": return "iPad mini (6th generation)"
++    case "iPad14,3", "iPad14,4": return "iPad Pro 11-inch (4th generation)"
++    case "iPad14,5", "iPad14,6": return "iPad Pro 12.9-inch (6th generation)"
++    case "iPad14,8", "iPad14,9": return "iPad Air 11-inch (M2)"
++    case "iPad14,10", "iPad14,11": return "iPad Air 13-inch (M2)"
++    case "iPad16,3", "iPad16,4": return "iPad Pro 11-inch (M4)"
++    case "iPad16,5", "iPad16,6": return "iPad Pro 13-inch (M4)"
++    default: return dmDeviceMachine()
++    }
++}
++
++/// Free storage on the app's volume (0176): FileManager's systemFreeSize, formatted like the memory
++/// row below. The launcher never computed this before — it only showed available memory — so the
++/// device pill computes it here instead of hardcoding a model or a number.
++private func dmFreeDiskSpace() -> Int64 {
++    guard let attrs = try? FileManager.default.attributesOfFileSystem(forPath: NSHomeDirectory()),
++          let free = attrs[.systemFreeSize] as? NSNumber else { return 0 }
++    return free.int64Value
++}
++
++/// A thin pill for the top bar (0176): the version and the device, as in the reference's top-right.
++private struct DmPill: View {
++    let text: String
++    var body: some View {
++        Text(text)
++            .font(.caption.weight(.semibold))
++            .padding(.horizontal, 10).padding(.vertical, 5)
++            .background(.white.opacity(0.12), in: Capsule())
++            .overlay(Capsule().strokeBorder(.white.opacity(0.25), lineWidth: 1))
++    }
++}
++
++/// The hero column (0176): the left side of the reference — edition line, huge serif title with the
++/// second line in Odyssey red, Chinese title, the "by 与荒野制作" byline, a flavor line, then the
++/// big red Play beside the save-backup glass button and the import-game-data glass button below.
++/// ViewThatFits picks the roomiest variant that fits the height: on a short iPhone landscape screen
++/// the title and spacing shrink instead of clipping.
++private struct DiabloHero: View {
++    let play: () -> Void
++    @Binding var gameDataPicking: Bool
++    @Binding var cloudPicking: Bool
++
++    var body: some View {
++        ViewThatFits(in: .vertical) {
++            heroContent(titleSize: 56, spacing: 12)
++            heroContent(titleSize: 48, spacing: 8)
++            heroContent(titleSize: 40, spacing: 6)
++            heroContent(titleSize: 34, spacing: 4)   // short landscape phones: the roomiest three do not fit ~335 pt of content height
++        }
++    }
++
++    @ViewBuilder private func heroContent(titleSize: CGFloat, spacing: CGFloat) -> some View {
++        VStack(alignment: .leading, spacing: spacing) {
++            Text("SINGLE-GAME EDITION · 单游戏版")
++                .font(.caption.weight(.semibold)).tracking(2).foregroundStyle(odysseyGold)
++            VStack(alignment: .leading, spacing: 0) {
++                Text("SUPER MARIO")
++                    .font(.system(size: titleSize, weight: .black, design: .serif))
++                    .minimumScaleFactor(0.6).lineLimit(1)
++                Text("ODYSSEY")
++                    .font(.system(size: titleSize, weight: .black, design: .serif))
++                    .foregroundStyle(odysseyRed)
++                    .minimumScaleFactor(0.6).lineLimit(1)
++            }
++            Text("超级马里奥 奥德赛")
++                .font(.title2.weight(.bold))
++            Text("by 与荒野制作")
++                .font(.subheadline).foregroundStyle(odysseyGold)
++            Text("戴上帽子，出发吧——穿梭一个个王国，收集能量月亮，把桃花公主从库巴手中救回来。")
++                .font(.callout).foregroundStyle(.secondary).lineLimit(3)
++            HStack(spacing: 12) {
++                playButton.frame(maxWidth: .infinity)
++                glassSecondaryButton(title: "存档备份导入", systemImage: "icloud") { cloudPicking = true }
++                    .frame(maxWidth: .infinity)
++            }
++            glassSecondaryButton(title: "导入游戏数据", systemImage: "square.and.arrow.down") { gameDataPicking = true }
++                .frame(maxWidth: .infinity)
++            Spacer(minLength: 0)
++        }
++    }
++
++    @ViewBuilder var playButton: some View {
++        let button = Button(action: play) { Text(LauncherText.text("ui.play", "Play")).font(.title3.weight(.semibold)) }.controlSize(.large)
++            .tint(odysseyRed)   // (0171) Odyssey red: the Play button is Mario red, not system blue; glassProminent takes the tint on iOS 26, borderedProminent below it
++        if #available(iOS 26.0, *) { button.buttonStyle(.glassProminent) } else { button.buttonStyle(.borderedProminent) }
++    }
++
++    @ViewBuilder private func glassSecondaryButton(title: String, systemImage: String, action: @escaping () -> Void) -> some View {
++        let button = Button(action: action) { Label(title, systemImage: systemImage).font(.headline.weight(.semibold)) }.controlSize(.large)
++        if #available(iOS 26.0, *) { button.buttonStyle(.glass) } else { button.buttonStyle(.bordered) }
++    }
++}
++
++/// One settings section inside the config panel (0176): the Chinese name with the English name in
++/// spaced gold caps on the right, as in the reference's panel, then the rows with their 0171 gold
++/// icons. SettingRow itself is untouched — it is shared with the Mac settings window.
++private struct ConfigSection: View {
++    let section: String
++    @ObservedObject var m: LauncherModel
++
++    var body: some View {
++        VStack(alignment: .leading, spacing: 0) {
++            HStack {
++                Text(LauncherText.sectionName(section)).font(.headline)
++                Spacer()
++                Text(section.uppercased()).font(.caption.weight(.semibold)).tracking(2).foregroundStyle(odysseyGold)
++            }
++            .padding(.bottom, 6)
++            let rows = m.rows(in: section)
++            ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
++                if index > 0 { Rectangle().fill(.white.opacity(0.10)).frame(height: 1) }
++                if let icon = dmSettingIcon(row.env) {
++                    HStack(spacing: 12) {
++                        Image(systemName: icon).font(.title3).foregroundStyle(odysseyGold).frame(width: 26)
++                        SettingRow(s: row, m: m)
++                    }
++                    .padding(.vertical, 7)
++                } else {
++                    SettingRow(s: row, m: m)
++                        .padding(.vertical, 7)
++                }
++            }
++        }
++    }
++}
++
++/// The right panel (0176): the reference's dark glass "Launch Config" — header, the settings
++/// sections, Reset, the game-data and cloud-saves sections, and the memory row. In landscape it is
++/// a fixed-height card whose content scrolls; in portrait it is a plain stack and the page scrolls.
++private struct ConfigPanel: View {
++    @ObservedObject var m: LauncherModel
++    @Binding var gameDataPicking: Bool
++    @Binding var cloudPicking: Bool
++    var memory: UInt64
++    var scrolls: Bool
++
++    var body: some View {
++        VStack(alignment: .leading, spacing: 0) {
++            HStack {
++                Text("启动配置").font(.title3.weight(.bold))
++                Spacer()
++                Text("LAUNCH CONFIG").font(.caption.weight(.semibold)).tracking(3).foregroundStyle(.secondary)
++            }
++            .padding(.horizontal, 20).padding(.top, 18).padding(.bottom, 10)
++            Rectangle().fill(.white.opacity(0.12)).frame(height: 1).padding(.horizontal, 20)
++            Group {
++                if scrolls {
++                    ScrollView {
++                        panelContent.padding(.horizontal, 20).padding(.vertical, 12)
++                    }
++                    .clipShape(RoundedRectangle(cornerRadius: 24))
++                } else {
++                    panelContent.padding(.horizontal, 20).padding(.vertical, 12)
++                }
++            }
++        }
++        .tint(odysseyGold)   // (0176) the reference's gold toggles: the switches and menu values in the panel take the coin gold
++        .dmGlassCard()
++    }
++
++    private var panelContent: some View {
++        VStack(alignment: .leading, spacing: 18) {
++            ForEach(m.sections, id: \.self) { section in
++                if !m.rows(in: section).isEmpty {
++                    ConfigSection(section: section, m: m)
++                }
++            }
++            VStack(alignment: .leading, spacing: 6) {
++                Button(LauncherText.text("ui.resetDefaults", "Reset to tested defaults")) { m.reset() }
++                    .disabled(!m.changed)
++                Text(LauncherText.text("ui.resetDefaultsNote", "Brings back all settings this game was tested with."))
++                    .font(.footnote).foregroundStyle(.secondary)
++            }
++            GameDataSection(picking: $gameDataPicking)
++            CloudSavesSection(picking: $cloudPicking)
++            HStack {
++                Text(LauncherText.text("ui.memoryAvailable", "Memory available"))
++                Spacer()
++                Text(ByteCountFormatter.string(fromByteCount: Int64(memory), countStyle: .memory)).monospacedDigit().foregroundStyle(.secondary)
++            }
++        }
++    }
++}
++
+ private struct LauncherView: View {
+     @ObservedObject var m: LauncherModel
+     let play: () -> Void
+     @State private var memory = os_proc_available_memory()
++    @State private var freeSpace: Int64 = dmFreeDiskSpace()
++    @State private var gameDataPicking = false
++    @State private var cloudPicking = false
++    private let deviceModel = dmDeviceModelName()
++
++    private var version: String { (info("CFBundleShortVersionString") as? String) ?? "" }
++
++    private var devicePillText: String {
++        let free = freeSpace > 0 ? ByteCountFormatter.string(fromByteCount: freeSpace, countStyle: .file) : ""
++        if deviceModel.isEmpty { return free.isEmpty ? "" : "可用 \(free)" }
++        return free.isEmpty ? deviceModel : "\(deviceModel) · 可用 \(free)"
++    }
+ 
+     var body: some View {
+         GeometryReader { geometry in
+-            HStack(spacing: 0) {
+-                VStack(spacing: 16) {
+-                    if let icon = appIcon() {
+-                        Image(uiImage: icon).resizable().frame(width: 96, height: 96)
+-                            .clipShape(RoundedRectangle(cornerRadius: 22))
+-                            .overlay(RoundedRectangle(cornerRadius: 22).strokeBorder(odysseyGold.opacity(0.55), lineWidth: 1))   // (0171) a thin coin-gold ring round the icon
+-                            .accessibilityHidden(true)
++            let insets = geometry.safeAreaInsets
++            let wide = geometry.size.width > geometry.size.height   // landscape: two columns; portrait: stacked
++            let contentWidth = geometry.size.width - 40 - insets.leading - insets.trailing
++            ZStack {
++                LauncherBackdrop()
++                // (0176) the Diablo mood: the title art is bright red, so a left-to-right dark grade
++                // (deepest behind the hero text) plus a bottom grade for the tagline, over the 0173 scrim.
++                LinearGradient(colors: [.black.opacity(0.42), .black.opacity(0.12)], startPoint: .leading, endPoint: .trailing)
++                    .ignoresSafeArea()
++                LinearGradient(colors: [.clear, .black.opacity(0.30)], startPoint: .top, endPoint: .bottom)
++                    .ignoresSafeArea()
++                VStack(spacing: 0) {
++                    // Top bar: the location line on the left, the version and device pills on the right.
++                    HStack {
++                        Text("蘑菇王国 · 帽子国")
++                            .font(.subheadline.weight(.semibold)).tracking(1).foregroundStyle(.white.opacity(0.85))
++                        Spacer()
++                        DmPill(text: "\(LauncherText.text("ui.version", "Version")) \(version)")
++                        if !devicePillText.isEmpty { DmPill(text: devicePillText) }
+                     }
+-                    Text((info("CFBundleDisplayName") as? String) ?? "Game")
+-                        .font(.title.weight(.bold)).multilineTextAlignment(.center)
+-                    Text("by 与荒野制作")
+-                        .font(.subheadline).foregroundStyle(odysseyGold)   // (0171) coin gold, not system grey
+-                    Text("\(LauncherText.text("ui.version", "Version")) \((info("CFBundleShortVersionString") as? String) ?? "")")
+-                        .font(.callout).foregroundStyle(.secondary)
+-                    playButton
+-                }
+-                .padding(20)   // (0171) a little more air inside the glass card
+-                .frame(width: geometry.size.width / 3, height: geometry.size.height)
+-                .dmGlassCard()   // (0171) the game card is a glass slab: the icon, title and Play button sit on it
+-                List {
+-                    ForEach(m.sections, id: \.self) { section in
+-                        let rows = m.rows(in: section)
+-                        if !rows.isEmpty {
+-                            Section(header: Text(LauncherText.sectionName(section)).foregroundStyle(.white)) {   // (0173) title-screen white, not system grey — the list reads like the title menu
+-                                ForEach(rows) { row in
+-                                    if let icon = dmSettingIcon(row.env) {
+-                                        HStack(spacing: 12) {
+-                                            Image(systemName: icon).font(.title3).foregroundStyle(odysseyGold).frame(width: 26)
+-                                            SettingRow(s: row, m: m)
+-                                        }
+-                                    } else {
+-                                        SettingRow(s: row, m: m)
+-                                    }
+-                                }
++                    .padding(.bottom, 12)
++                    if wide {
++                        HStack(alignment: .top, spacing: 20) {
++                            DiabloHero(play: play, gameDataPicking: $gameDataPicking, cloudPicking: $cloudPicking)
++                                .frame(width: contentWidth * 0.42)
++                            ConfigPanel(m: m, gameDataPicking: $gameDataPicking, cloudPicking: $cloudPicking, memory: memory, scrolls: true)
++                                .frame(width: contentWidth * 0.58 - 20)
++                        }
++                        .frame(maxHeight: .infinity)   // the two columns take the remaining height; the hero's ViewThatFits and the panel's ScrollView size against it
++                    } else {
++                        ScrollView {
++                            VStack(alignment: .leading, spacing: 20) {
++                                DiabloHero(play: play, gameDataPicking: $gameDataPicking, cloudPicking: $cloudPicking)
++                                ConfigPanel(m: m, gameDataPicking: $gameDataPicking, cloudPicking: $cloudPicking, memory: memory, scrolls: false)
+                             }
+                         }
+                     }
+-                    Section {
+-                        Button(LauncherText.text("ui.resetDefaults", "Reset to tested defaults")) { m.reset() }
+-                            .disabled(!m.changed)
+-                    } footer: {
+-                        Text(LauncherText.text("ui.resetDefaultsNote", "Brings back all settings this game was tested with."))
+-                    }
+-                    GameDataSection()
+-                    CloudSavesSection()
+-                    Section {
++                    // Bottom bar: the offline note on the left, the spaced-caps tagline centred.
++                    ZStack {
++                        Text("THE ODYSSEY AWAITS")
++                            .font(.caption.weight(.semibold)).tracking(4).foregroundStyle(.secondary)
+                         HStack {
+-                            Text(LauncherText.text("ui.memoryAvailable", "Memory available"))
++                            Text("离线启动 · 无需联网").font(.caption).foregroundStyle(.secondary)
+                             Spacer()
+-                            Text(ByteCountFormatter.string(fromByteCount: Int64(memory), countStyle: .memory)).monospacedDigit().foregroundStyle(.secondary)
+                         }
+                     }
++                    .padding(.top, 12)
+                 }
+-                .listStyle(.insetGrouped)
+-                .scrollContentBackground(.hidden)   // (0171) the list's own background goes, so the glass sheet behind it shows
+-                .listRowBackground(Color.clear)   // (0171) every row is clear: the rows sit on the one glass sheet, not on their own cards
+-                .background(Color.clear.dmGlassCard())   // (0171) the settings list is one glass sheet over the backdrop; the toggles, sliders and menus on it are already glass on iOS 26, system-drawn
+-                .contentMargins(.horizontal, 12, for: .scrollContent)
+-                .frame(width: geometry.size.width * 2 / 3)
++                .padding(EdgeInsets(top: max(8, insets.top), leading: 20 + insets.leading, bottom: max(8, insets.bottom), trailing: 20 + insets.trailing))
+             }
+         }
+-        .background(LauncherBackdrop())   // (0171) the backdrop the glass refracts
+         .preferredColorScheme(.dark)
+         .task {
+             while !Task.isCancelled {
+                 memory = os_proc_available_memory()
++                freeSpace = dmFreeDiskSpace()
+                 try? await Task.sleep(for: .seconds(2))
+             }
+         }
+     }
+-
+-    @ViewBuilder var playButton: some View {
+-        let button = Button(action: play) { Text(LauncherText.text("ui.play", "Play")).font(.title3.weight(.semibold)).frame(maxWidth: 220) }.controlSize(.large)
+-            .tint(odysseyRed)   // (0171) Odyssey red: the Play button is Mario red, not system blue; glassProminent takes the tint on iOS 26, borderedProminent below it
+-        if #available(iOS 26.0, *) { button.buttonStyle(.glassProminent) } else { button.buttonStyle(.borderedProminent) }
+-    }
+-
+-    private func appIcon() -> UIImage? {
+-        if let i = UIImage(named: "AppIcon") { return i }
+-        guard let icons = info("CFBundleIcons") as? [String: Any], let primary = icons["CFBundlePrimaryIcon"] as? [String: Any],
+-              let files = primary["CFBundleIconFiles"] as? [String], let last = files.last else { return nil }
+-        return UIImage(named: last)
+-    }
+ }
+ 
+ // Shows the launcher over the root view controller and calls done once the settings are in the environment; false (done is not called) when there is no launcher
+-- 
+2.43.0
+
