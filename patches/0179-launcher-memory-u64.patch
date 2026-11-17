@@ -1,0 +1,43 @@
+From 5ef57b32d64ce89791f148dbbd14da4a0adfaa2a Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Tue, 17 Nov 2026 22:16:22 +0800
+Subject: [PATCH] 0179: coerce os_proc_available_memory() to UInt64 for
+ ConfigPanel.memory
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Build #81 failed at Launcher.swift:497:119 — ConfigPanel.memory is
+UInt64 but the @State var (inferred from os_proc_available_memory())
+is Int in this Swift toolchain, so the call site does not compile.
+Wrap both the initial value and the 2-second refresh assignment in
+UInt64(...), which compiles whether the function returns Int or UInt64.
+---
+ dm/ios/Sources/Launcher.swift | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index 2f1cfef..4e510f2 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -452,7 +452,7 @@ private struct ConfigPanel: View {
+ private struct LauncherView: View {
+     @ObservedObject var m: LauncherModel
+     let play: () -> Void
+-    @State private var memory = os_proc_available_memory()
++    @State private var memory: UInt64 = UInt64(os_proc_available_memory())
+     @State private var freeSpace: Int64 = dmFreeDiskSpace()
+     @State private var gameDataPicking = false
+     @State private var cloudPicking = false
+@@ -523,7 +523,7 @@ private struct LauncherView: View {
+         .preferredColorScheme(.dark)
+         .task {
+             while !Task.isCancelled {
+-                memory = os_proc_available_memory()
++                memory = UInt64(os_proc_available_memory())
+                 freeSpace = dmFreeDiskSpace()
+                 try? await Task.sleep(for: .seconds(2))
+             }
+-- 
+2.43.0
+
