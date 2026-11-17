@@ -1,0 +1,203 @@
+From 2e856225c5b7cbd5ea0538447c2405a13bd9d3e8 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Tue, 17 Nov 2026 10:44:57 +0000
+Subject: [PATCH] 0171: liquid glass for the launcher and the in-game menu (row
+ icons, Odyssey red/gold)
+
+---
+ dm/ios/Sources/GameMenu.swift | 25 +++++++++---
+ dm/ios/Sources/Launcher.swift | 73 +++++++++++++++++++++++++++++++++--
+ dm/ios/Sources/front_ios.m    |  1 +
+ 3 files changed, 91 insertions(+), 8 deletions(-)
+
+diff --git a/dm/ios/Sources/GameMenu.swift b/dm/ios/Sources/GameMenu.swift
+index b10c74b..f863d66 100644
+--- a/dm/ios/Sources/GameMenu.swift
++++ b/dm/ios/Sources/GameMenu.swift
+@@ -18,9 +18,9 @@ private func gameMenuItems() -> [UIMenuElement] {
+     let layouts = (0..<3).filter { dm_pad_layout_offered(Int32($0)) }.map { l in
+         UIAction(title: names[l], state: dm_pad_layout() == l ? .on : .off) { _ in dm_pad_layout_set(Int32(l)) }
+     }
+-    let layout = UIMenu(title: LauncherText.text("ui.controllerLayout", "Controller layout"), options: .singleSelection, children: layouts)   // a choice's value shows in its submenu: a subtitle would make each row two lines
+-    let padSettings = UIAction(title: "按键设置") { _ in dm_gamepad_open_pad_settings() }   // the button editor (DmGamepad.m): the icons' size and where they sit
+-    let hudSettings = UIAction(title: "HUD 设置") { _ in dm_hud_pad_open_editor() }   // (0148) the pad-style HUD editor (HudPadEditor.m): drag the elements on the game, live in the running game
++    let layout = UIMenu(title: LauncherText.text("ui.controllerLayout", "Controller layout"), image: UIImage(systemName: "gamecontroller"), options: .singleSelection, children: layouts)   // a choice's value shows in its submenu: a subtitle would make each row two lines
++    let padSettings = UIAction(title: "按键设置", image: UIImage(systemName: "gamecontroller.fill")) { _ in dm_gamepad_open_pad_settings() }   // the button editor (DmGamepad.m): the icons' size and where they sit
++    let hudSettings = UIAction(title: "HUD 设置", image: UIImage(systemName: "gauge")) { _ in dm_hud_pad_open_editor() }   // (0148) the pad-style HUD editor (HudPadEditor.m): drag the elements on the game, live in the running game
+     var items: [UIMenuElement] = []
+     var placed = false
+     if let m = gameMenuModel {
+@@ -36,17 +36,32 @@ private func gameMenuItems() -> [UIMenuElement] {
+     return items
+ }
+ 
++/// A leading icon for a menu row (0171): by the setting's env key, so the icon matches what the row does. Rows without a mapping get none. SF Symbols; the menu draws them in its own tint, and a toggle's checkmark is the system's (on iOS 26 it shares the leading slot — see the report's device check).
++private func gameMenuRowIcon(_ env: String) -> UIImage? {
++    switch env {
++    case "DM_RUMBLE": return UIImage(systemName: "iphone.radiowaves.left.and.right")   // Game rumble
++    case "DM_TOUCH_HAPTICS": return UIImage(systemName: "hand.tap")   // Touch feedback
++    case "DM_SHOW_FPS": return UIImage(systemName: "speedometer")   // Frame-rate counter
++    case "DM_PICTURE_FIT": return UIImage(systemName: "photo")   // Picture: fill or fit
++    case "DM_OPMODE": return UIImage(systemName: "tv")   // Console mode: docked is the TV
++    case "DM_SCREEN_ASPECT": return UIImage(systemName: "aspectratio")   // Picture shape
++    case "DM_PRESENT_UPSCALE": return UIImage(systemName: "sparkles")   // Upscaling
++    case "DM_LANG": return UIImage(systemName: "globe")   // Game language
++    default: return nil
++    }
++}
++
+ private func gameMenuRow(_ m: LauncherModel, _ s: Setting) -> UIMenuElement {
+     let now = m.values[s.env] ?? s.def, fixed = m.fixed.contains(s.env)
+     let attributes: UIMenuElement.Attributes = fixed ? .disabled : []
+     func pick(_ v: String) { m.choose(s, v); _ = dm_setting_live(s.env, v) }
+     if s.kind == "toggle" {
+-        let a = UIAction(title: s.label, attributes: attributes, state: now == s.onValue ? .on : .off) { _ in pick(now == s.onValue ? s.offValue : s.onValue) }
++        let a = UIAction(title: s.label, image: gameMenuRowIcon(s.env), attributes: attributes, state: now == s.onValue ? .on : .off) { _ in pick(now == s.onValue ? s.offValue : s.onValue) }
+         if fixed { a.subtitle = LauncherText.text("ui.setInEnvTxt", "Set in env.txt") }
+         return a
+     }
+     let options = s.options ?? []
+     let current = options.first { $0[0] == now }?[1] ?? now
+     let actions = options.map { o in UIAction(title: o[1], attributes: attributes, state: o[0] == now ? .on : .off) { _ in pick(o[0]) } }
+-    return UIMenu(title: s.label, subtitle: fixed ? "\(current), \(LauncherText.text("ui.setInEnvTxtInline", "set in env.txt"))" : nil, options: .singleSelection, children: actions)
++    return UIMenu(title: s.label, subtitle: fixed ? "\(current), \(LauncherText.text("ui.setInEnvTxtInline", "set in env.txt"))" : nil, image: gameMenuRowIcon(s.env), options: .singleSelection, children: actions)
+ }
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index b7655c7..dbc9774 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -151,6 +151,57 @@ private struct DocumentPicker: UIViewControllerRepresentable {
+     }
+ }
+ 
++/// Odyssey red and coin gold (0171): the game's own palette — Mario red for the Play button, muted coin gold for the byline and the row icons. Tasteful at small sizes: the red is only the one button, the gold only thin lines and small icons, everything else stays dark glass.
++private let odysseyRed = Color(red: 0.90, green: 0.15, blue: 0.13)
++private let odysseyGold = Color(red: 0.85, green: 0.68, blue: 0.35)
++
++/// A leading icon for a settings row (0171): by the setting's env key, so the icon matches what the row does. Rows without a mapping get none. SF Symbols, so they scale with Dynamic Type; the launcher tints them coin gold.
++private func dmSettingIcon(_ env: String) -> String? {
++    switch env {
++    case "DM_OPMODE": return "tv"   // Console mode: docked is the TV
++    case "DM_PRESENT_UPSCALE": return "sparkles"   // Upscaling: the enhancement
++    case "DM_LANG": return "globe"   // Game language
++    case "DM_PICTURE_FIT": return "photo"   // Picture: fill or fit
++    case "DM_SHOW_FPS": return "speedometer"   // Frame-rate counter
++    case "DM_SCREEN_ASPECT": return "aspectratio"   // Picture shape
++    case "DM_RUMBLE": return "iphone.radiowaves.left.and.right"   // Game rumble
++    case "DM_TOUCH_HAPTICS": return "hand.tap"   // Touch feedback
++    default: return nil
++    }
++}
++
++/// Liquid Glass for the launcher's panels (0171): iOS 26 native .glassEffect, regular; below iOS 26 a translucent material fill. The deployment target is iOS 26, so the fallback is dead code kept for the pattern's sake — the same ladder the pad's discs use (0111: real UIGlassEffect on 26+, vector disc below). Layered, not flat: a soft inner highlight along the top edge and a gentle drop shadow give the card depth; the corner radius is a little larger (32) for the game's rounded, playful shapes. Glass needs something behind it to refract: the backdrop is a deep navy-black base with two soft colour glows (Mario red top-left, coin gold bottom-right), subtle on purpose — the text is white on dark glass, and a loud backdrop would fight it.
++private extension View {
++    @ViewBuilder func dmGlassCard(cornerRadius: CGFloat = 32) -> some View {
++        Group {
++            if #available(iOS 26.0, *) {
++                self.glassEffect(.regular, in: RoundedRectangle(cornerRadius: cornerRadius))
++            } else {
++                self.background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: cornerRadius))
++            }
++        }
++        .overlay(
++            RoundedRectangle(cornerRadius: cornerRadius)
++                .strokeBorder(
++                    LinearGradient(colors: [.white.opacity(0.45), .white.opacity(0.06)], startPoint: .top, endPoint: .bottom),
++                    lineWidth: 1
++                )
++        )
++        .shadow(color: .black.opacity(0.28), radius: 16, x: 0, y: 8)
++    }
++}
++
++private struct LauncherBackdrop: View {
++    var body: some View {
++        ZStack {
++            Color(red: 0.04, green: 0.06, blue: 0.11)
++            RadialGradient(colors: [odysseyRed.opacity(0.30), .clear], center: .topLeading, startRadius: 0, endRadius: 620)
++            RadialGradient(colors: [Color(red: 0.95, green: 0.75, blue: 0.30).opacity(0.24), .clear], center: .bottomTrailing, startRadius: 0, endRadius: 680)
++        }
++        .ignoresSafeArea()
++    }
++}
++
+ private struct LauncherView: View {
+     @ObservedObject var m: LauncherModel
+     let play: () -> Void
+@@ -163,24 +214,35 @@ private struct LauncherView: View {
+                     if let icon = appIcon() {
+                         Image(uiImage: icon).resizable().frame(width: 96, height: 96)
+                             .clipShape(RoundedRectangle(cornerRadius: 22))
++                            .overlay(RoundedRectangle(cornerRadius: 22).strokeBorder(odysseyGold.opacity(0.55), lineWidth: 1))   // (0171) a thin coin-gold ring round the icon
+                             .accessibilityHidden(true)
+                     }
+                     Text((info("CFBundleDisplayName") as? String) ?? "Game")
+                         .font(.title.weight(.bold)).multilineTextAlignment(.center)
+                     Text("by 与荒野制作")
+-                        .font(.subheadline).foregroundStyle(.secondary)
++                        .font(.subheadline).foregroundStyle(odysseyGold)   // (0171) coin gold, not system grey
+                     Text("\(LauncherText.text("ui.version", "Version")) \((info("CFBundleShortVersionString") as? String) ?? "")")
+                         .font(.callout).foregroundStyle(.secondary)
+                     playButton
+                 }
+-                .padding(16)
++                .padding(20)   // (0171) a little more air inside the glass card
+                 .frame(width: geometry.size.width / 3, height: geometry.size.height)
++                .dmGlassCard()   // (0171) the game card is a glass slab: the icon, title and Play button sit on it
+                 List {
+                     ForEach(m.sections, id: \.self) { section in
+                         let rows = m.rows(in: section)
+                         if !rows.isEmpty {
+                             Section(header: Text(LauncherText.sectionName(section))) {
+-                                ForEach(rows) { SettingRow(s: $0, m: m) }
++                                ForEach(rows) { row in
++                                    if let icon = dmSettingIcon(row.env) {
++                                        HStack(spacing: 12) {
++                                            Image(systemName: icon).font(.title3).foregroundStyle(odysseyGold).frame(width: 26)
++                                            SettingRow(s: row, m: m)
++                                        }
++                                    } else {
++                                        SettingRow(s: row, m: m)
++                                    }
++                                }
+                             }
+                         }
+                     }
+@@ -201,10 +263,14 @@ private struct LauncherView: View {
+                     }
+                 }
+                 .listStyle(.insetGrouped)
++                .scrollContentBackground(.hidden)   // (0171) the list's own background goes, so the glass sheet behind it shows
++                .listRowBackground(Color.clear)   // (0171) every row is clear: the rows sit on the one glass sheet, not on their own cards
++                .background(Color.clear.dmGlassCard())   // (0171) the settings list is one glass sheet over the backdrop; the toggles, sliders and menus on it are already glass on iOS 26, system-drawn
+                 .contentMargins(.horizontal, 12, for: .scrollContent)
+                 .frame(width: geometry.size.width * 2 / 3)
+             }
+         }
++        .background(LauncherBackdrop())   // (0171) the backdrop the glass refracts
+         .preferredColorScheme(.dark)
+         .task {
+             while !Task.isCancelled {
+@@ -216,6 +282,7 @@ private struct LauncherView: View {
+ 
+     @ViewBuilder var playButton: some View {
+         let button = Button(action: play) { Text(LauncherText.text("ui.play", "Play")).font(.title3.weight(.semibold)).frame(maxWidth: 220) }.controlSize(.large)
++            .tint(odysseyRed)   // (0171) Odyssey red: the Play button is Mario red, not system blue; glassProminent takes the tint on iOS 26, borderedProminent below it
+         if #available(iOS 26.0, *) { button.buttonStyle(.glassProminent) } else { button.buttonStyle(.borderedProminent) }
+     }
+ 
+diff --git a/dm/ios/Sources/front_ios.m b/dm/ios/Sources/front_ios.m
+index 4225b98..c9be3ec 100644
+--- a/dm/ios/Sources/front_ios.m
++++ b/dm/ios/Sources/front_ios.m
+@@ -179,6 +179,7 @@ static void launcher_done(void) { [g_root startGame]; }
+     if (self.fill) LOG("front end: picture Fill (DM_PICTURE_FIT=fill), the 16:9 picture covers the screen in landscape and its edges are cropped");
+     self.view.clipsToBounds = YES;   // with Fill the game view is larger than the screen
+     self.view.window.traitOverrides.preferredContentSizeCategory = UIContentSizeCategorySmall;   // UIKit draws the in-game menu (GameMenu.swift) in this window: it keeps one compact text size over the game, whatever the system's text size
++    self.view.window.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;   // (0171) the in-game menu is a system UIMenu (GameMenu.swift): iOS draws it, and on iOS 26 it is Liquid Glass automatically — but in the system's light style it reads as a flat pale panel over the dark game scene. Dark here makes it dark glass, white text on dark glass, which reads over the game. The pad's own panels already use explicit dark colours (DmGamepad.m buildEditBar, HudPadEditor.m buildEditBar; the frame-rate label, hints and progress views are explicit white on black), so they do not change; the quit prompt goes dark with it.
+     self.game = [[DmGameView alloc] initWithFrame:self.view.bounds];
+     [self.view addSubview:self.game];
+     g_layer = (CAMetalLayer *)self.game.layer;
+-- 
+2.43.0
+
