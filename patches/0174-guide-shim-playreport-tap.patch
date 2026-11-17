@@ -1,29 +1,31 @@
-From 4c196ea9fcc2ba4daf14aba6ddb99fe621641036 Mon Sep 17 00:00:00 2001
+From 15943e76ef0b8fef81754a4c834fbad5fa6cac5a Mon Sep 17 00:00:00 2001
 From: seedds <seedds@gmail.com>
-Date: Tue, 17 Nov 2026 12:07:25 +0000
+Date: Tue, 17 Nov 2026 13:14:17 +0000
 Subject: [PATCH] =?UTF-8?q?0174:=20guide=20SHIM=20=E2=80=94=20playReport?=
- =?UTF-8?q?=20stub=20+=20tap-to-click=20for=20pages=20that=20swallow=20tou?=
- =?UTF-8?q?ches?=
+ =?UTF-8?q?=20stub=20+=20capture-phase=20tap-to-pressA?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
-The action guide's window.onload calls window.nx.playReport.setCounterSetIdentifier(1);
-the SHIM had no playReport, so onload threw at that call and aborted -- btnActive stayed
-false and menuSelect was a no-op (log-61:479). playReport is now a logged no-op stub
-(iOS has no Switch play-activity service), same shape as setCursorScrollSpeed.
-
-Once onload runs, the guide's TouchEventFunc preventDefaults every touch, which kills
-the native compatibility click the SHIM's click handler waits for. Window-bubble
-touchstart/touchend listeners now rebuild the click from a swallowed tap (<~12px):
-elementFromPoint + focus + click, only when the page cancelled the touch, so pages
-that do not swallow touches are untouched.
+The action guide swallows every touch (its TouchEventFunc preventDefaults
+touchstart/move/end on document), which stops WebKit firing the
+compatibility click -- taps on menu items did nothing. The SHIM now
+rebuilds the tap at capture, where timing is deterministic and nothing
+depends on defaultPrevented: a tap (<~12px, one finger) on a clickable
+element gets focus, then pressA (a Space keydown/keyup, plus the click
+unless the page consumed the key). The native click is suppressed by
+preventDefault alone, so it cannot double-fire, and the synthetic click
+is untrusted so the 'click' handler above ignores it (no second pressA).
+General, no per-page rule: the pause menu's A path is the same Space
+keydown, so it is unchanged in effect. Each synthesis logs one line so
+a device log shows whether taps reach it. playReport is stubbed so the
+guide's onload gets past its setCounterSetIdentifier call.
 ---
- dm/host/web_apple.m | 31 +++++++++++++++++++++++++++++++
- 1 file changed, 31 insertions(+)
+ dm/host/web_apple.m | 36 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
 
 diff --git a/dm/host/web_apple.m b/dm/host/web_apple.m
-index ba25f68..ca3bf1d 100644
+index ba25f68..8dd53be 100644
 --- a/dm/host/web_apple.m
 +++ b/dm/host/web_apple.m
 @@ -48,6 +48,11 @@ static NSString *const SHIM = @R"JS(
@@ -38,36 +40,41 @@ index ba25f68..ca3bf1d 100644
      footer: stub({
        setAssign: function (b, label, fn) { assign[b] = typeof fn === 'function' ? fn : true; },
        unsetAssign: function (b) { assign[b] = false; },
-@@ -178,6 +183,32 @@ static NSString *const SHIM = @R"JS(
+@@ -178,6 +183,37 @@ static NSString *const SHIM = @R"JS(
      if (el.focus) el.focus();
      pressA(el, true);
    }, true);
 +  // Taps on pages that swallow them: a page may call preventDefault on every touch (the action guide does, in its TouchEventFunc), which stops WebKit
-+  // from firing the compatibility click the 'click' handler above waits for -- so a tap on a link or button would do nothing at all. Rebuild the click
-+  // from the tap, but only when the page suppressed the native click: these window-bubble listeners run after the page's own handlers, so defaultPrevented
-+  // on the touchstart or the touchend says whether the tap was swallowed (a cancelled touchstart or touchend suppresses the compatibility click; a
-+  // cancelled touchmove does not, so it is not counted). On pages that do not swallow touches nothing changes -- the native click still fires and this
-+  // stays out of the way. The host injects no clickable DOM of its own, so [data-dm-pad] matches nothing today; it is excluded explicitly so future
-+  // host UI can never be activated this way.
-+  var tapStart = null, tapSwallowed = false;
++  // from firing the compatibility click the 'click' handler above waits for -- so a tap on a link or button would do nothing at all. The first
++  // version of this rebuild watched defaultPrevented at window-bubble time; it did not fire on device (log-67: the guide opens, onload runs, no
++  // error, yet taps do nothing -- and the mock that "verified" it fired only window handlers with defaultPrevented hard-coded true, so it proved
++  // nothing about the real event order). Rebuild the tap at capture instead, where the timing is deterministic and nothing depends on
++  // defaultPrevented: a tap (<~12px, one finger) on a clickable element gets exactly what a native tap on a page that does not swallow touches
++  // gets -- focus, then pressA (a Space keydown/keyup, plus the click unless the page consumed the key). The native click is suppressed by
++  // preventDefault alone, so it cannot double-fire, and the synthetic click is untrusted so the 'click' handler above ignores it
++  // (no second pressA). The event is otherwise left to propagate, so a page's own touchend handlers still run. This is general, no per-page
++  // rule: the pause menu's A path is the same Space keydown, so it is unchanged in effect.
++  // The host injects no clickable DOM of its own, so [data-dm-pad] matches nothing today; it is excluded explicitly so future host UI can never
++  // be activated this way. Each synthesis logs one line, so a device log shows whether taps reach here.
++  var tapStart = null;
 +  window.addEventListener('touchstart', function (e) {
 +    var t = e.changedTouches && e.changedTouches[0];
 +    tapStart = (t && e.touches.length === 1) ? {x: t.clientX, y: t.clientY} : null;
-+    tapSwallowed = !!e.defaultPrevented;
-+  });
++  }, true);
 +  window.addEventListener('touchend', function (e) {
 +    var t = e.changedTouches && e.changedTouches[0];
-+    if (e.defaultPrevented) tapSwallowed = true;
-+    if (!t || !tapStart || !tapSwallowed || e.changedTouches.length !== 1) { tapStart = null; tapSwallowed = false; return; }
++    if (!t || !tapStart || e.changedTouches.length !== 1) { tapStart = null; return; }
 +    var dx = t.clientX - tapStart.x, dy = t.clientY - tapStart.y;
-+    tapStart = null; tapSwallowed = false;
++    tapStart = null;
 +    if (dx * dx + dy * dy > 144) return;   // moved more than ~12px: a drag, not a tap
 +    var el = document.elementFromPoint(t.clientX, t.clientY);
 +    var c = el && el.closest && (clickable(el) || el.closest('[tabindex]'));
 +    if (!c || c.closest('[data-dm-pad]')) return;
++    e.preventDefault();
 +    if (c.focus) c.focus();
-+    c.click();
-+  });
++    pressA(c, false);
++    post({k: 'log', d: 'tap -> A on ' + (c.id || c.tagName)});
++  }, true);
  })();
  )JS";
  

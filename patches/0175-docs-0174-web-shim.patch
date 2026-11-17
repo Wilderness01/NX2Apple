@@ -1,4 +1,4 @@
-From d244cbb191b09b428ed03e30a9d861ca2b81d0f7 Mon Sep 17 00:00:00 2001
+From 9c99524f02ce3652c02d42754866c2fcf37a944a Mon Sep 17 00:00:00 2001
 From: seedds <seedds@gmail.com>
 Date: Tue, 17 Nov 2026 12:21:52 +0000
 Subject: [PATCH] 0175: docs for the web SHIM playReport stub + tap-to-click
@@ -11,7 +11,7 @@ Subject: [PATCH] 0175: docs for the web SHIM playReport stub + tap-to-click
  3 files changed, 9 insertions(+)
 
 diff --git a/dm/games/0100000000010000/README.md b/dm/games/0100000000010000/README.md
-index 8a9e587..f4cf408 100644
+index b3d9e61..1a4c20a 100644
 --- a/dm/games/0100000000010000/README.md
 +++ b/dm/games/0100000000010000/README.md
 @@ -70,6 +70,7 @@ General host and tool changes first needed here; each applies to every game:
@@ -35,7 +35,7 @@ index bdca25d..6668911 100644
  - the sound stutters and the input box lags while the player types a name (Octopath Traveler 0 on an iPhone: one 4.7 s frame, 5,035 wakeups a second instead of about 1,800, and no audio underruns). → [The software keyboard blocks only its caller](../reference/services.md#the-software-keyboard-blocks-only-its-caller)
  - null read in `applet::CreateLibraryApplet` under `swkbd::InlineKeyboard::Initialize` (3D World, entering the save select after the character select). → [The inline keyboard as a resident library applet](../reference/services.md#the-inline-keyboard-as-a-resident-library-applet)
 diff --git a/docs/reference/services.md b/docs/reference/services.md
-index 7c95705..775d4d7 100644
+index 7c95705..73d2627 100644
 --- a/docs/reference/services.md
 +++ b/docs/reference/services.md
 @@ -518,6 +518,13 @@ Most service calls can be found before they crash, before the first boot or the
@@ -46,7 +46,7 @@ index 7c95705..775d4d7 100644
 +
 +- **Symptom:** a game's offline help page opens but its menu never responds: tapping a menu item does nothing, and the log has `TypeError: window.nx.playReport.setCounterSetIdentifier is not a function` (Super Mario Odyssey: the Action Guide opens and its menu items are dead).
 +- **Cause:** the page calls `window.nx.playReport.setCounterSetIdentifier` from its `onload`, and the host's web SHIM (`web_apple.m`) has no `playReport`: its proxy answers unknown properties with a no-op function, so `.setCounterSetIdentifier` is `undefined` and the call throws. `onload` aborts at that line, so the page never reaches the `firstpage()` call that arms `btnActive`, the flag its menu handler requires. A second, independent cause: once `onload` runs, the page's touch handlers call `preventDefault()` on every touch, which suppresses the native click the SHIM's click handler waits for.
-+- **Fix:** the SHIM's `nx` object gains `playReport` as a stub (a no-op that logs once, like the existing `setCursorScrollSpeed` empty function): iOS has no Switch play-report service, so the stub is a workaround for a platform limit, and the page's `onload` now runs to completion. The SHIM also adds a tap fallback: on `touchend` it finds the element under the point and, only when the page already swallowed the click, calls `focus()` + `click()` on it. It never synthesises a click the page did not swallow, so the pause menu's native click path is untouched. (`web_apple.m`.)
++- **Fix:** the SHIM's `nx` object gains `playReport` as a stub (a no-op that logs once, like the existing `setCursorScrollSpeed` empty function): iOS has no Switch play-report service, so the stub is a workaround for a platform limit, and the page's `onload` now runs to completion. The SHIM also adds a tap fallback: a capture-phase `touchend` listener finds the element under the point and gives it what a native tap gives -- `focus()`, then `pressA` (a Space keydown/keyup, plus the click unless the page consumed the key) -- while `preventDefault()` suppresses the native click so nothing double-fires. It does not watch `defaultPrevented`: the first version did, and it never fired on device. The pause menu's A path is the same Space keydown, so its behaviour is unchanged in effect. (`web_apple.m`.)
 +- **Found on:** [Super Mario Odyssey](../../dm/games/0100000000010000/README.md) (1.4.1; the Action Guide).
 +
  ### Library applets take the application's focus
