@@ -1,0 +1,76 @@
+From 4c196ea9fcc2ba4daf14aba6ddb99fe621641036 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Tue, 17 Nov 2026 12:07:25 +0000
+Subject: [PATCH] =?UTF-8?q?0174:=20guide=20SHIM=20=E2=80=94=20playReport?=
+ =?UTF-8?q?=20stub=20+=20tap-to-click=20for=20pages=20that=20swallow=20tou?=
+ =?UTF-8?q?ches?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The action guide's window.onload calls window.nx.playReport.setCounterSetIdentifier(1);
+the SHIM had no playReport, so onload threw at that call and aborted -- btnActive stayed
+false and menuSelect was a no-op (log-61:479). playReport is now a logged no-op stub
+(iOS has no Switch play-activity service), same shape as setCursorScrollSpeed.
+
+Once onload runs, the guide's TouchEventFunc preventDefaults every touch, which kills
+the native compatibility click the SHIM's click handler waits for. Window-bubble
+touchstart/touchend listeners now rebuild the click from a swallowed tap (<~12px):
+elementFromPoint + focus + click, only when the page cancelled the touch, so pages
+that do not swallow touches are untouched.
+---
+ dm/host/web_apple.m | 31 +++++++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/dm/host/web_apple.m b/dm/host/web_apple.m
+index ba25f68..ca3bf1d 100644
+--- a/dm/host/web_apple.m
++++ b/dm/host/web_apple.m
+@@ -48,6 +48,11 @@ static NSString *const SHIM = @R"JS(
+     sendMessage: function (s) { post({k: 'msg', d: String(s)}); return true; },
+     endApplet: function () { post({k: 'end', r: 0}); },
+     setCursorScrollSpeed: function () {},
++    // playReport: the Switch's play-activity service (setCounterSetIdentifier, incrementCounter). iOS has no such service, so every method is a logged
++    // no-op -- a stub, not a fix: the cause is known and lies where the host cannot fix it (the page's own code, which calls it unconditionally on load;
++    // without this the page's window.onload throws at the call and aborts, so its menu never becomes selectable). Same shape as setCursorScrollSpeed
++    // and footer.setFixed above.
++    playReport: stub({}, 'playReport.'),
+     footer: stub({
+       setAssign: function (b, label, fn) { assign[b] = typeof fn === 'function' ? fn : true; },
+       unsetAssign: function (b) { assign[b] = false; },
+@@ -178,6 +183,32 @@ static NSString *const SHIM = @R"JS(
+     if (el.focus) el.focus();
+     pressA(el, true);
+   }, true);
++  // Taps on pages that swallow them: a page may call preventDefault on every touch (the action guide does, in its TouchEventFunc), which stops WebKit
++  // from firing the compatibility click the 'click' handler above waits for -- so a tap on a link or button would do nothing at all. Rebuild the click
++  // from the tap, but only when the page suppressed the native click: these window-bubble listeners run after the page's own handlers, so defaultPrevented
++  // on the touchstart or the touchend says whether the tap was swallowed (a cancelled touchstart or touchend suppresses the compatibility click; a
++  // cancelled touchmove does not, so it is not counted). On pages that do not swallow touches nothing changes -- the native click still fires and this
++  // stays out of the way. The host injects no clickable DOM of its own, so [data-dm-pad] matches nothing today; it is excluded explicitly so future
++  // host UI can never be activated this way.
++  var tapStart = null, tapSwallowed = false;
++  window.addEventListener('touchstart', function (e) {
++    var t = e.changedTouches && e.changedTouches[0];
++    tapStart = (t && e.touches.length === 1) ? {x: t.clientX, y: t.clientY} : null;
++    tapSwallowed = !!e.defaultPrevented;
++  });
++  window.addEventListener('touchend', function (e) {
++    var t = e.changedTouches && e.changedTouches[0];
++    if (e.defaultPrevented) tapSwallowed = true;
++    if (!t || !tapStart || !tapSwallowed || e.changedTouches.length !== 1) { tapStart = null; tapSwallowed = false; return; }
++    var dx = t.clientX - tapStart.x, dy = t.clientY - tapStart.y;
++    tapStart = null; tapSwallowed = false;
++    if (dx * dx + dy * dy > 144) return;   // moved more than ~12px: a drag, not a tap
++    var el = document.elementFromPoint(t.clientX, t.clientY);
++    var c = el && el.closest && (clickable(el) || el.closest('[tabindex]'));
++    if (!c || c.closest('[data-dm-pad]')) return;
++    if (c.focus) c.focus();
++    c.click();
++  });
+ })();
+ )JS";
+ 
+-- 
+2.43.0
+
