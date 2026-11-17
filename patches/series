@@ -121,5 +121,10 @@
 0161-preview-pngs-mario-caps.patch
 0162-preview-pngs-mario-clothes-luigi-wario.patch
 0163-char-high-redirect-guard.patch
-0164-shop-probe.patch
 0165-char-family-redirect-guard.patch
+0167-shop-character-rows-luigi-icon.patch
+0168-title-row-3-vr-shop-picker.patch
+0169-delete-mario-cap-preview-pngs.patch
+0170-delete-remaining-preview-pngs.patch
+0171-liquid-glass-settings.patch
+0172-shop-probe2-readonly.patch
