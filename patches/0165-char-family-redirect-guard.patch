@@ -1,0 +1,61 @@
+From 467fc4dfe790ec4f0ac8572fc3acd4bfac7660a7 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Tue, 17 Nov 2026 07:57:41 +0000
+Subject: [PATCH] 0165: char-select family redirect guard (log-62 Mechanic
+ crash fix)
+
+dm_char_redirect parsed any non-empty core as a costume slot target, so MarioMechanic.szs + luigi + clothes=MarioColorWario redirected to LuigiColorWario.szs. That file's inner model is MarioColorWario.bfres, not MarioMechanic.bfres; the Mechanic loader looked the model up by name, got NULL and crashed reading [NULL+0x28] (SIGSEGV addr=0x28 at main+0x6ad530, log-62, one line after the redirect) -- the same class as the log-60 High crash (0163), different faulting site.
+
+The 0163 High/64-only family guard is generalized: any non-empty core is a model identity, not a costume, and maps only to the character's own same-core file (<Char><Core><Part>), with the cap/clothes slots ignored; when the character ships none (Luigi has no Mechanic file) the original is kept. The slot override now applies only to base files (empty core). An audit found 101 of 129 cores have no same-core file in either overlay, so no per-core list -- the rule has to be stated on 'any non-empty core'. Host redirect test 87/87 (old code fails 22, including the byte-for-byte log-62 repro).
+---
+ dm/host/hle_fs.c | 34 ++++++++++++++++++++--------------
+ 1 file changed, 20 insertions(+), 14 deletions(-)
+
+diff --git a/dm/host/hle_fs.c b/dm/host/hle_fs.c
+index 343bbc7..97067e9 100644
+--- a/dm/host/hle_fs.c
++++ b/dm/host/hle_fs.c
+@@ -925,20 +925,26 @@ static int dm_char_redirect(const char *p, char *out, size_t n) {
+         LOG("[char] fs %s kept (sel=%s: no overlay mount)", p, sel);
+         return 0;
+     }
+-    // Special families: a core of exactly "High" (title-screen high-detail
+-    // model; the file's inner model is MarioHigh.bfres) or "64" (N64-style
+-    // model; inner Mario64.bfres) is a model FAMILY, not a costume. A forced
+-    // costume slot must never be applied to one: MarioHigh.szs asked with
+-    // clothes=MarioColorWaluigi produced LuigiColorWaluigi.szs (inner
+-    // MarioColorWaluigi.bfres), the High loader looked up MarioHigh.bfres,
+-    // got NULL and crashed writing [NULL+8] (log-60: SIGSEGV addr=0x8 at
+-    // main+0x66d6d8, one line after the redirect). A family file only ever
+-    // maps to the character's own family file (<Char>High<Part> /
+-    // <Char>64<Part>); when the character ships none (Luigi has no High or
+-    // 64 files) the original is kept, so the title screen still shows Mario
+-    // while the in-game model is the picked character.
+-    const int is_family = (core_len == 4 && !memcmp(core, "High", 4)) ||
+-                          (core_len == 2 && !memcmp(core, "64", 2));
++    // Named-model rule (generalizes the 0163 High/64 family guard): a
++    // NON-EMPTY core names a distinct model identity -- a costume or a
++    // model form (High, 64, 64Metal, Mechanic, Aloha, Pilot, ...). The
++    // loader looks the model's bfres up by that name (log-60:
++    // MarioHigh.bfres; log-62: MarioMechanic.bfres), and every overlay
++    // file's inner bfres is named for its own stem (LuigiColorWario.szs
++    // holds MarioColorWario.bfres, WarioHigh.szs holds MarioHigh.bfres,
++    // ...), so a file with a core may only ever map to the SAME core for
++    // the picked character (<Char><Core><Part>). The cap/clothes slot must
++    // never be applied to one: MarioMechanic.szs asked with
++    // clothes=MarioColorWario produced LuigiColorWario.szs (inner
++    // MarioColorWario.bfres), the Mechanic loader got NULL and the game
++    // crashed reading [NULL+0x28] (log-62: SIGSEGV addr=0x28 at
++    // main+0x6ad530, one line after the redirect) -- the same class as the
++    // log-60 High crash (NULL+8 at main+0x66d6d8). When the character
++    // ships no file for that core (Luigi has no Mechanic file) the
++    // original is kept, so the shop preview / form still shows Mario
++    // instead of crashing. Only a base file (empty core: Mario.szs,
++    // MarioEye.szs, MarioHead.szs, ...) may take the slot.
++    const int is_family = core_len > 0;
+     // The slot env var (cap files follow DM_CHAR_CAP, everything else DM_CHAR_CLOTHES).
+     // A set value names the costume to force ("default" = the character's own
+     // default part); unset follows the save, with the adapted-or-default rule.
+-- 
+2.43.0
+
