@@ -1,0 +1,63 @@
+From 835432ba10e7054f9627ec3e1c10b4cf4872b031 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Tue, 17 Nov 2026 11:21:28 +0800
+Subject: [PATCH] 0163: char-select High/64 family redirect guard (log-60 crash
+ fix)
+
+dm_char_redirect parsed MarioHigh.szs as Mario + costume 'High'
+('High' is not in dm_char_parts) and let a forced DM_CHAR_CLOTHES
+replace the core, so MarioHigh.szs + luigi + clothes=MarioColorWaluigi
+redirected to LuigiColorWaluigi.szs. That file's inner model is
+MarioColorWaluigi.bfres, not MarioHigh.bfres; the High loader looked
+the model up by name, got NULL and crashed writing [NULL+8]
+(SIGSEGV addr=0x8 at main+0x66d6d8, log-60, one line after the
+redirect). A core of exactly 'High' or '64' is a model family, not a
+costume: it now maps only to the character's own family file
+(<Char>High<Part> / <Char>64<Part>), with the costume slots ignored,
+and the original is kept when the character ships none (Luigi has no
+High or 64 files, so the title screen still shows Mario while the
+in-game model is Luigi; Wario ships all 7 High files and the full 64
+set). Host redirect test 68/68 (53 old + 15 new, the new ones fail on
+the old code, the first one byte-for-byte the log-60 redirect).
+---
+ dm/host/hle_fs.c | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/dm/host/hle_fs.c b/dm/host/hle_fs.c
+index d4f97fb..343bbc7 100644
+--- a/dm/host/hle_fs.c
++++ b/dm/host/hle_fs.c
+@@ -925,13 +925,29 @@ static int dm_char_redirect(const char *p, char *out, size_t n) {
+         LOG("[char] fs %s kept (sel=%s: no overlay mount)", p, sel);
+         return 0;
+     }
++    // Special families: a core of exactly "High" (title-screen high-detail
++    // model; the file's inner model is MarioHigh.bfres) or "64" (N64-style
++    // model; inner Mario64.bfres) is a model FAMILY, not a costume. A forced
++    // costume slot must never be applied to one: MarioHigh.szs asked with
++    // clothes=MarioColorWaluigi produced LuigiColorWaluigi.szs (inner
++    // MarioColorWaluigi.bfres), the High loader looked up MarioHigh.bfres,
++    // got NULL and crashed writing [NULL+8] (log-60: SIGSEGV addr=0x8 at
++    // main+0x66d6d8, one line after the redirect). A family file only ever
++    // maps to the character's own family file (<Char>High<Part> /
++    // <Char>64<Part>); when the character ships none (Luigi has no High or
++    // 64 files) the original is kept, so the title screen still shows Mario
++    // while the in-game model is the picked character.
++    const int is_family = (core_len == 4 && !memcmp(core, "High", 4)) ||
++                          (core_len == 2 && !memcmp(core, "64", 2));
+     // The slot env var (cap files follow DM_CHAR_CAP, everything else DM_CHAR_CLOTHES).
+     // A set value names the costume to force ("default" = the character's own
+     // default part); unset follows the save, with the adapted-or-default rule.
+     const char *slot = !strcmp(part, "Cap") ? cap : clothes;
+     char cand[2][256];
+     int ncand = 0;
+-    if (slot && !strcmp(slot, "default")) {
++    if (is_family) {
++        snprintf(cand[ncand], sizeof cand[0], "%s%.*s%s", ch, (int)core_len, core, part); ncand++;
++    } else if (slot && !strcmp(slot, "default")) {
+         snprintf(cand[ncand], sizeof cand[0], "%s%s", ch, part); ncand++;
+     } else if (slot && !strncmp(slot, "Mario", 5) && slot[5]) {
+         snprintf(cand[ncand], sizeof cand[0], "%s%s%s", ch, slot + 5, part); ncand++;
+-- 
+2.43.0
+
