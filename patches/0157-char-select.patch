@@ -1,7 +1,7 @@
-From 170f9d0248e6cc227ceae1f8d2fa719bceb28121 Mon Sep 17 00:00:00 2001
+From eecf74b5cdb1e655fd2dda158764746348e00639 Mon Sep 17 00:00:00 2001
 From: seedds <seedds@gmail.com>
-Date: Mon, 16 Nov 2026 11:06:05 +0000
-Subject: [PATCH 1/3] =?UTF-8?q?0157:=20title-menu=20character=20+=20costum?=
+Date: Tue, 17 Nov 2026 01:53:31 +0000
+Subject: [PATCH 1/6] =?UTF-8?q?0157:=20title-menu=20character=20+=20costum?=
  =?UTF-8?q?e=20picker=20(Mario=20/=20Luigi=20/=20Wario)=20=E2=80=94=20repu?=
  =?UTF-8?q?rpose=20the=20VR=20row=20as=20=E8=A7=92=E8=89=B2=E9=80=89?=
  =?UTF-8?q?=E6=8B=A9,=20fs=20redirect=20for=20the=20model/costume=20files,?=
@@ -10,23 +10,21 @@ MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
-Fix (2026-11-16, #70): all 0157 addresses were Mach-O file offsets, not NSO
-vaddrs — patch_nso.py indexes its image by NSO vaddr, so the CUTS assert
-failed (0x797314 held a stp prologue, fd7b01a9, not the tbz). Every 0157
-address is now the NSO vaddr (file offset - 0x300000): CUTS tbz 0x497314,
-FRAME_STEP title setup 0x4972f4, Decide 0x1d78f8, Table A/B 0xec8270/
-0xec8288, re-encoded adrp page 0x120d000, List::setText 0x1d6b70.
-Verified on host: patch_nso.py rewrite of main 1.4.1 exits 0 (cuts 6),
-frame-step test 0 failures.
+Includes the content:/ redirect fix (dm_char_redirect matches both
+rom:/ObjectData/ and content:/ObjectData/, overlay looked up on the
+mount the game named) and the pre-rendered preview PNG loader
+(CharSelectEditor loads char_<id> / cap_<id>_<Costume> /
+clothes_<id>_<Costume> from the bundle, badge only as fallback).
 ---
- dm/games/0100000000010000/char_select.c       |  83 +++
- dm/games/0100000000010000/patches.py          | 123 +++-
- dm/host/hle_fs.c                              |  79 +++
- dm/host/hud_manual.c                          |  38 ++
- dm/ios/Sources/CharSelectEditor.h             |  36 ++
- dm/ios/Sources/CharSelectEditor.m             | 524 ++++++++++++++++++
+ dm/games/0100000000010000/char_select.c       |  83 ++
+ dm/games/0100000000010000/patches.py          | 123 ++-
+ dm/host/hle_fs.c                              | 125 +++
+ dm/host/hud_manual.c                          |  38 +
+ dm/ios/Sources/CharSelectEditor.h             |  42 +
+ dm/ios/Sources/CharSelectEditor.m             | 927 ++++++++++++++++++
  dm/ios/Sources/DmGameMenu.h                   |   1 +
  dm/ios/Sources/Launcher.swift                 |   3 +-
+ dm/ios/project-framework.yml                  |   2 +
  dm/romfs-overlay/ObjectData/Luigi.szs         | Bin 0 -> 403940 bytes
  .../ObjectData/LuigiColorLuigi.szs            | Bin 0 -> 407108 bytes
  .../ObjectData/LuigiColorLuigiHead.szs        | Bin 0 -> 77464 bytes
@@ -52,7 +50,7 @@ frame-step test 0 failures.
  dm/romfs-overlay/ObjectData/WarioHead.szs     | Bin 0 -> 70720 bytes
  .../ObjectData/WarioHeadTexture.szs           | Bin 0 -> 637708 bytes
  dm/tools/nso_asm.py                           |   3 +
- 33 files changed, 887 insertions(+), 3 deletions(-)
+ 34 files changed, 1344 insertions(+), 3 deletions(-)
  create mode 100644 dm/games/0100000000010000/char_select.c
  create mode 100644 dm/ios/Sources/CharSelectEditor.h
  create mode 100644 dm/ios/Sources/CharSelectEditor.m
@@ -317,10 +315,10 @@ index 8a041fe..5a9d213 100644
       'why': "Pane::Calculate and the pane layout are this build's nn::ui2d code, found by the HUDLOG diagnostic run (log-17) and confirmed by disassembly of DmIOS. The manual settings come from the HUD editor through the same environment-variable channel the launcher already uses for its other settings (DM_SCREEN_ASPECT), so the game reads nothing new: the host copies them to state page +0x200 once per present. The .bflyt ground truth (REPORT-HUD-REDO.md B, all 215 layouts parsed) is why the matcher is layout-aware: the coins and regional-coins content panes share names across two layouts, the capture texture mechanism means only the All container may move, and 'Counter'/'PicStrap' name matches hit the moon tower and the BootLoading strip. The old name matcher moved content panes and emptied the capture texture (log-50/51: coins and regional coins vanished after a manual value, and restoring the default never repainted the texture). The runtime keeps no user-adjustable state in the game beyond the orig/mod table, and its only tree walks are the bounded child-name checks and the bounded flag-only mark-dirty, so the 0113 crash class (a name/match walk reading a pane through a bad pointer) is structurally absent",
       'blocked': 'the stubs have no function-matched form yet'},
 diff --git a/dm/host/hle_fs.c b/dm/host/hle_fs.c
-index 4d5b5c1..ab9ff99 100644
+index 4d5b5c1..d4f97fb 100644
 --- a/dm/host/hle_fs.c
 +++ b/dm/host/hle_fs.c
-@@ -832,8 +832,87 @@ HLE_FORCE("_ZN2nn2fs7UnmountEPKc", "fsp-srv; host mounts are permanent, a no-op,
+@@ -832,8 +832,133 @@ HLE_FORCE("_ZN2nn2fs7UnmountEPKc", "fsp-srv; host mounts are permanent, a no-op,
      sdk_unmount(name);
  }
  
@@ -345,16 +343,48 @@ index 4d5b5c1..ab9ff99 100644
 +    "Cap", "2D",
 +};
 +static int dm_char_redirect(const char *p, char *out, size_t n) {
-+    const char *sel = getenv("DM_CHAR_SELECT");
-+    if (!sel || !strcmp(sel, "mario")) return 0;
-+    const char *ch = !strcmp(sel, "luigi") ? "Luigi" : !strcmp(sel, "wario") ? "Wario" : NULL;
-+    if (!ch) return 0;
-+    if (!p || strncmp(p, "rom:/ObjectData/", 16)) return 0;
-+    const char *file = p + 16;
++    // The path checks come first, so a player-model open is logged even when
++    // no character is picked: the log then proves the game opens the file at
++    // all, and what DM_CHAR_* it sees when it does.
++    // The game mounts its RomFS as "content" and opens the player model as
++    // content:/ObjectData/Mario.szs, never rom:/... (REPORT-CHAR-MODEL-PATH.md:
++    // zero "rom:/" literals in the binary, 21 "content:/" literals; log-59
++    // mounts content: -> romfs.img and no rom: mount at all). Accept either
++    // prefix, and build the output path with the prefix that matched, so the
++    // open still resolves against the mount the game named. (The original
++    // rom:-only check could never fire, which is why the pick saved but the
++    // in-game model stayed Mario even after a full relaunch; the resource
++    // cache was not the cause.)
++    static const struct { const char *prefix; const char *mount; } prefixes[] = {
++        { "rom:/ObjectData/", "rom" },
++        { "content:/ObjectData/", "content" },
++    };
++    const char *file = NULL;
++    const char *matched = NULL;
++    const char *mntname = NULL;
++    if (p) {
++        for (size_t i = 0; i < sizeof prefixes / sizeof *prefixes; i++) {
++            size_t l = strlen(prefixes[i].prefix);
++            if (!strncmp(p, prefixes[i].prefix, l)) { matched = prefixes[i].prefix; mntname = prefixes[i].mount; file = p + l; break; }
++        }
++    }
++    if (!file) return 0;
 +    if (strchr(file, '/')) return 0;   // only the files directly under ObjectData
 +    size_t flen = strlen(file);
 +    if (flen < 5 || strcmp(file + flen - 4, ".szs")) return 0;
 +    if (strncmp(file, "Mario", 5)) return 0;   // only the player/costume family
++    const char *sel = getenv("DM_CHAR_SELECT");
++    const char *cap = getenv("DM_CHAR_CAP");
++    const char *clothes = getenv("DM_CHAR_CLOTHES");
++    if (!sel || !strcmp(sel, "mario")) {
++        LOG("[char] fs %s kept (sel=%s)", p, sel ? sel : "(unset)");
++        return 0;
++    }
++    const char *ch = !strcmp(sel, "luigi") ? "Luigi" : !strcmp(sel, "wario") ? "Wario" : NULL;
++    if (!ch) {
++        LOG("[char] fs %s kept (sel=%s: unknown character)", p, sel);
++        return 0;
++    }
 +    char stem[256];
 +    size_t slen = flen - 4;
 +    if (slen >= sizeof stem) return 0;
@@ -370,13 +400,25 @@ index 4d5b5c1..ab9ff99 100644
 +    }
 +    size_t core_len = slen - plen - 5;
 +    const char *core = stem + 5;   // the costume name minus "Mario" ("" for a default part)
++    // The overlay lives on the mount the game named (h_fs_MountRom attaches
++    // DM_ROMFS_OVERLAY to the MountRom name, i.e. "content"); there is no
++    // "rom" mount on device, so a lookup for a mount named "rom" finds
++    // nothing. Find the mount the matched prefix names first, and fall back
++    // to any mount that has an overlay set.
 +    const mount_t *rom = NULL;
-+    for (int i = 0; i < g_nmnt; i++) if (mnt_named(&g_mnt[i], "rom")) { rom = &g_mnt[i]; break; }
-+    if (!rom || !rom->overlay[0]) return 0;
++    for (int i = 0; i < g_nmnt; i++) if (mnt_named(&g_mnt[i], mntname)) { rom = &g_mnt[i]; break; }
++    if (!rom || !rom->overlay[0]) {
++        rom = NULL;
++        for (int i = 0; i < g_nmnt; i++) if (g_mnt[i].overlay[0]) { rom = &g_mnt[i]; break; }
++    }
++    if (!rom || !rom->overlay[0]) {
++        LOG("[char] fs %s kept (sel=%s: no overlay mount)", p, sel);
++        return 0;
++    }
 +    // The slot env var (cap files follow DM_CHAR_CAP, everything else DM_CHAR_CLOTHES).
 +    // A set value names the costume to force ("default" = the character's own
 +    // default part); unset follows the save, with the adapted-or-default rule.
-+    const char *slot = !strcmp(part, "Cap") ? getenv("DM_CHAR_CAP") : getenv("DM_CHAR_CLOTHES");
++    const char *slot = !strcmp(part, "Cap") ? cap : clothes;
 +    char cand[2][256];
 +    int ncand = 0;
 +    if (slot && !strcmp(slot, "default")) {
@@ -394,10 +436,12 @@ index 4d5b5c1..ab9ff99 100644
 +        char rest[1024], tmp[1024];
 +        snprintf(rest, sizeof rest, "/ObjectData/%s.szs", cand[i]);
 +        if (!rom_overlay_path(rom, rest, tmp, sizeof tmp)) continue;
-+        snprintf(out, n, "rom:/ObjectData/%s.szs", cand[i]);
-+        if (g_flag.fs) LOG("fs char-select: %s -> %s", p, out);
++        snprintf(out, n, "%s%s.szs", matched, cand[i]);
++        LOG("[char] fs %s -> %s (sel=%s cap=%s clothes=%s)", p, out, sel,
++            cap ? cap : "(unset)", clothes ? clothes : "(unset)");
 +        return 1;
 +    }
++    LOG("[char] fs %s kept (sel=%s: no overlay file for %s)", p, sel, cand[0]);
 +    return 0;
 +}
 +
@@ -462,10 +506,10 @@ index 920201f..659d844 100644
      uint32_t manual = 0, hidden = 0;
 diff --git a/dm/ios/Sources/CharSelectEditor.h b/dm/ios/Sources/CharSelectEditor.h
 new file mode 100644
-index 0000000..9bb17dd
+index 0000000..e9c8e3e
 --- /dev/null
 +++ b/dm/ios/Sources/CharSelectEditor.h
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,42 @@
 +// CharSelectEditor.h -- the title-menu character/costume picker (0157).
 +//
 +// The picker opens over the title menu when the player picks the
@@ -475,13 +519,19 @@ index 0000000..9bb17dd
 +// their costumes, all at once. Peach / Toad / Pauline are not in this
 +// round (no ready models) and are not listed.
 +//
-+// Style (the user asked for the game's own UI, not an iOS one): the
-+// character rows reuse the title menu's SelectMenuParts row (white rounded
-+// window, TxtContent, Cursor); the costume lists reuse the Closet's
-+// horizontal strip (white 9-slice cards, selection frame, counters); the
-+// text uses the game's own font (dm/font/standard.ttf, registered from
-+// DM_FONT_DIR) instead of the iOS system font the other editors use.
-+// See CharSelectEditor.m for the layout and the costume lists.
++// Style (redone for V1.3.29 to look like the in-game Crazy Cap shop):
++// an opaque deep-purple full-screen panel (the title menu never shows
++// through), a big character preview on the left (accent disc + name +
++// outfit summary), two horizontal costume strips on the right (caps,
++// then clothes -- shop cards with a purple emblem + the Chinese name,
++// gold frame when selected), the selected costume's Chinese name +
++// description below the strips, and a bottom bar (返回 / 默认 / 选择).
++// Costume names + descriptions are the game's own Chinese text
++// (LocalizedData/CNzh, ItemCap.msbt / ItemCloth.msbt). The card "image"
++// is a drawn emblem, not a game texture: the <Name>2D.szs files are 3D
++// models, not flat portraits, so there is no costume portrait PNG to
++// extract (see CharSelectEditor.m). Text uses the game's own font
++// (dm/font/standard.ttf, registered from DM_FONT_DIR).
 +#pragma once
 +
 +#ifdef __cplusplus
@@ -495,19 +545,19 @@ index 0000000..9bb17dd
 +
 +#import <UIKit/UIKit.h>
 +
-+// The editor itself: a full-screen dimmed overlay on the key window, with
-+// a centred game-style panel. The title menu shows through dimmed behind
-+// it. Created by dm_char_select_open_editor, removed by Done (closeEditor).
++// The editor itself: a full-screen opaque shop-style panel on the key
++// window. Created by dm_char_select_open_editor, removed by 选择 (save)
++// or 返回 (discard).
 +@interface CharSelectEditor : UIView
 +- (void)openEditor;   // read the saved settings, apply them live, show the panel
-+- (void)closeEditor;  // Done: save the settings and remove the editor
++- (void)closeEditor;  // 选择: save the settings and remove the editor
 +@end
 diff --git a/dm/ios/Sources/CharSelectEditor.m b/dm/ios/Sources/CharSelectEditor.m
 new file mode 100644
-index 0000000..b31e078
+index 0000000..aee5f9c
 --- /dev/null
 +++ b/dm/ios/Sources/CharSelectEditor.m
-@@ -0,0 +1,524 @@
+@@ -0,0 +1,927 @@
 +// CharSelectEditor.m -- the title-menu character/costume picker (0157).
 +//
 +// The picker opens over the title menu when the player picks the
@@ -515,29 +565,55 @@ index 0000000..b31e078
 +// Wario) and their costumes, all at once. Peach / Toad / Pauline are not
 +// in this round (no ready models) and are not listed.
 +//
-+// Style (the user asked for the game's own UI, not an iOS one):
-+//   * Character rows reuse the title menu's SelectMenuParts row: a white
-+//     rounded window (WinSh shadow, WinSelect), the name as TxtContent,
-+//     a gold frame + cursor for the selected row.
-+//   * Costume lists reuse the Closet's horizontal strip: white cards
-+//     (the Closet's 132x160 WinSh card, here text-sized), a gold
-+//     selection frame (the Closet's PicSelect), a "默认" first card and a
-+//     "跟随存档" last card. The Closet shows the costume icon from
-+//     <Name>2D.szs; this picker shows the name instead -- the icons live
-+//     in the RomFS as textures and are not UIKit images (a polish item).
++// Style (redone for V1.3.29 to look like the in-game Crazy Cap shop -- the
++// user asked for it directly, "界面做成这种！"):
++//   * OPAQUE: the whole editor is a solid deep-purple panel (the shop's
++//     purple); the title menu does NOT show through behind it. The old
++//     white centred panel over a dimmed menu (which the user called ugly
++//     because it was see-through) is gone.
++//   * LEFT: a big character preview -- a large accent-coloured disc with
++//     the character's first Chinese character, the character name, and
++//     the current outfit (cap + clothes) as a summary. Three character
++//     tabs above it.
++//   * RIGHT: two horizontal costume strips (caps, then clothes). Each card
++//     is a shop-style card: a purple emblem with the costume's first
++//     Chinese character on top (the "image"), the Chinese name below, a
++//     gold frame when selected. "默认" first, "跟随存档" last.
++//   * BELOW the strips: the selected costume's Chinese name + description
++//     (the shop's item name + description area).
++//   * BOTTOM BAR (like the shop's L 选择 / B 放弃 / A 确定): 返回 (close
++//     without saving), 默认 (reset), 选择 (gold: save + apply + close).
 +//   * Text uses the game's own font (dm/font/standard.ttf, registered
 +//     from DM_FONT_DIR) instead of the iOS system font the other editors
 +//     use; it falls back to the system font when the file is missing.
-+//   * Colours are the game's own: white windows, dark text, gold
-+//     (#C9A227) for the selection frame, per-character accent dots
-+//     (Mario red, Luigi green, Wario yellow).
++//   * Costume names + descriptions are the game's own Chinese text
++//     (LocalizedData/CNzh, ItemCap.msbt / ItemCloth.msbt); a costume with
++//     no MSBT name falls back to the cleaned internal name (never a raw
++//     internal name like "ColorWario" on a card).
++//
++// Images: the shop shows a live 3D render of each costume's <Name>2D.szs
++// model on its cards. Those files are 3D models (FMDL + an embedded BNTX
++// holding small dot-pattern textures), not flat portraits -- there is no
++// costume portrait PNG inside them to extract, and the shop layout's
++// __Combined.bntx atlases hold only UI chrome (CmBase, NyShopLogo,
++// NyFrameItem, NyListBeak). So the renders are made OFFLINE instead: the
++// game's own BFRES models are rendered to transparent PNGs on the host
++// (Blender + the ranidspace BFRES importer; REPORT-CHAR-PREVIEW.md) and
++// bundled here as dm/ios/Sources/CharPreviews/*.png, like the PadIcons.
++// A card shows its render when one exists; the drawn emblem (the costume's
++// first Chinese character in gold on purple) is only the fallback for an
++// item with no render (the MarioInvisible cap has no cap file at all, so
++// no render exists for it). The big preview shows the character wearing
++// the selected clothes (the clothes render), or the default outfit;
++// a cap pick does not change it -- a cap+clothes combination has no
++// single render, and the cap itself is shown on its card.
 +//
 +// Persistence: NSUserDefaults DmCharSelect.character ("mario" | "luigi" |
 +// "wario"), DmCharSelect.cap and DmCharSelect.clothes (a costume name, or
 +// "default" for the character's own default part, or no key = follow the
 +// save). The live channel is setenv/unsetenv DM_CHAR_SELECT /
 +// DM_CHAR_CAP / DM_CHAR_CLOTHES (the host fs redirect re-reads getenv on
-+// every open, so a pick takes effect at the next spawn). "完成" saves;
++// every open, so a pick takes effect at the next spawn). "选择" saves;
 +// the launcher applies the saved settings before the game starts
 +// (dm_char_select_apply_saved, like DmHudPad.*).
 +//
@@ -555,8 +631,6 @@ index 0000000..b31e078
 +//     MarioHigh / MarioPilot / MarioPrimitiveMan / MarioCaptain (Captain
 +//     is cap+head only; as clothes it gives the Captain head with the
 +//     default body).
-+// A costume name is shown without its "Mario" prefix (MarioColorLuigi
-+// reads "ColorLuigi", MarioAloha reads "Aloha").
 +//
 +// The text is Chinese: the user asked for the settings panel in Chinese
 +// (the rest of the repository is English).
@@ -568,8 +642,7 @@ index 0000000..b31e078
 +#import <stdlib.h>
 +#import <string.h>
 +
-+// ---- Costume tables (the full name is the DM_CHAR_* value; the display
-+// name strips the "Mario" prefix) ----
++// ---- Costume tables (the full name is the DM_CHAR_* value) ----
 +static const char *const kCharCapMario[] = {
 +    "Mario64", "Mario64Metal", "MarioAloha", "MarioArmor", "MarioArmorWestern",
 +    "MarioBandman", "MarioBatter", "MarioCaptain", "MarioClown",
@@ -612,6 +685,137 @@ index 0000000..b31e078
 +static NSString *const kCharIds[3] = {@"mario", @"luigi", @"wario"};
 +static NSString *const kCharNames[3] = {@"马里奥", @"路易吉", @"瓦里奥"};
 +static const uint32_t kCharColors[3] = {0xE52521, 0x43B047, 0xFBD000};   // Mario red, Luigi green, Wario yellow
++
++// ---- The shop's purple (the Crazy Cap shop: deep purple panel, darker
++// top/bottom bands, gold selection) ----
++static const uint32_t kShopPurple = 0x3B1A5E;   // panel
++static const uint32_t kShopBand   = 0x2A0E45;   // top/bottom band
++static const uint32_t kShopEmblem = 0x5B2A86;   // card emblem
++static const uint32_t kShopGold   = 0xC9A227;   // selection frame / primary button
++
++// ---- Costume display text (the game's own MSBT, LocalizedData/CNzh) ----
++// Generated from ItemCap.msbt / ItemCloth.msbt (SystemMessage.szs).
++// { internal name, Chinese name, description (_Explain) }.
++typedef struct { const char *key; const char *name; const char *desc; } CharCostumeText;
++static const CharCostumeText kCharCapText[] = {
++    { "Mario64", "６４帽", "造型令人怀念的报童帽。" },
++    { "Mario64Metal", "金属马力欧帽", "造型令人怀念的金属风报童帽。" },
++    { "MarioAloha", "阿罗哈帽", "有放松效果的凉快编织帽。 " },
++    { "MarioArmor", "武者帽", "作为工艺品也别有风格的精美武士风帽子。" },
++    { "MarioArmorWestern", "装甲帽", "看上去很坚硬的板甲头盔。" },
++    { "MarioBandman", "乐手帽", "在传统的庆典上负责活跃气氛的演奏者所穿戴的帽子。" },
++    { "MarioBatter", "棒球帽", "右打者用的安全帽，整顶都是透亮的热情红。" },
++    { "MarioCaptain", "船长帽", "充满威严的奥德赛号船长帽。" },
++    { "MarioClown", "小丑帽", "从搞笑到杂耍样样精通的小丑帽。" },
++    { "MarioColorClassic", "经典帽子", "令人怀旧的经典帽子。" },
++    { "MarioColorGold", "金色帽子", "彻底追求金色的帽子。" },
++    { "MarioColorLuigi", "路易吉帽", "鲜绿色的经典报童帽。" },
++    { "MarioColorWaluigi", "瓦路易吉帽", "装饰有颠倒Ｌ字母的帽子。 " },
++    { "MarioColorWario", "瓦力欧帽", "装饰有独具特色Ｗ字母的帽子。" },
++    { "MarioConductor", "指挥家帽", "让人瞬间变身成指挥家的假发。" },
++    { "MarioCook", "厨师帽", "波尔波诺的绅士淑女们喜爱的民族帽。" },
++    { "MarioDiddyKong", "迪迪帽", "重现长帽檐这一特征的红色帽子。" },
++    { "MarioDoctor", "医生帽", "擅用特制胶囊的名医额镜。" },
++    { "MarioDot3d", "8-bit马力欧帽", "能够重拾初心的神奇帽子。" },
++    { "MarioExplorer", "探险家帽", "戴上这顶帽子，在大自然深处也能安心。" },
++    { "MarioFootball", "美式橄榄球帽", "线条用色很酷的复刻版安全帽。" },
++    { "MarioGolf", "高尔夫球帽", "鲜艳的条纹很抢眼的帽子。" },
++    { "MarioGunman", "牛仔枪手帽", "令人联想到开垦的复古帽子。" },
++    { "MarioHappi", "法被帽", "设计简洁的卷头巾。" },
++    { "MarioHariet", "哈利艾特帽", "能让人联想到布鲁达尔兹中的唯一女性哈利艾特的帽子。" },
++    { "MarioInvisible", "透明帽", "在最终环形山获得的稀世帽子。" },
++    { "MarioKing", "国王帽", "在兔子环形山获得的华丽帽子。" },
++    { "MarioKoopa", "新郎酷霸王帽", "酷霸王特别订做的独特帽子的复制品。" },
++    { "MarioMaker", "建筑工帽", "适合一般工程到点检作业，用途广泛的工作帽。" },
++    { "MarioMechanic", "机械师帽", "最适合作业时戴的机械师帽子。" },
++    { "MarioNew3DS", "时髦帽子", "将经典红帽改造得很时髦。" },
++    { "MarioPainter", "画工帽", "画家就要戴这款帽子。" },
++    { "MarioPeach", "新娘桃花公主帽", "重现了桃花公主头纱的复制品。大受欢迎。" },
++    { "MarioPilot", "飞行员帽", "许多飞机师爱用的遮耳帽。" },
++    { "MarioPirate", "海盗帽", "让人想出海闯荡的帽子。" },
++    { "MarioPoncho", "彭丘帽", "阿炽尼亚地区的传统民族帽。" },
++    { "MarioPrimitiveMan", "原始人帽", "深受欢迎的帽子，设计灵感取自啪嗒枯骨怪的头。" },
++    { "MarioRacer", "赛手帽", "能使开车时情绪高昂的安全帽。" },
++    { "MarioRango", "朗格帽", "能让人联想到布鲁达尔兹的技术员朗格的帽子。" },
++    { "MarioSailor", "水手帽", "以两条天蓝色条纹为特色的帽子。" },
++    { "MarioSanta", "圣诞老人帽", "一戴上就连小朋友都会非常开心的经典帽款。" },
++    { "MarioSatellite", "卫星游戏帽", "在某项服务里使用过的安全帽。" },
++    { "MarioScientist", "博士帽", "具科学家风格的奇怪帽子。" },
++    { "MarioShopman", "克雷吉佳普店员帽", "克雷吉佳普公司独创的帽子。" },
++    { "MarioSnowSuit", "防寒帽", "彻底抵御严寒的羽绒兜帽。" },
++    { "MarioSpaceSuit", "宇航帽", "似乎能承受各种环境的帽子。" },
++    { "MarioSpewart", "斯普瓦特帽", "能让人联想到布鲁达尔兹的艺术家斯普瓦特的帽子。" },
++    { "MarioSuit", "西帽", "大受欢迎的设计，也能搭配成休闲风格。 " },
++    { "MarioSunshine", "太阳之光帽", "能让人回忆起常夏之岛的太阳镜。" },
++    { "MarioSwimwear", "泳镜", "即使不游泳也想戴戴看的时尚单品。" },
++    { "MarioTailCoat", "绅士帽", "克雷吉佳普 戴布伦店热卖中的高雅帽子。" },
++    { "MarioTopper", "托帕帽", "能让人联想到布鲁达尔兹的队长托帕的帽子。" },
++    { "MarioTuxedo", "新郎马力欧帽", "适合人生中最美妙舞台的白色大礼帽。" },
++    { "MarioZombie", "僵尸帽", "反复进行多次仿旧加工的头饰。" },
++};
++static const CharCostumeText kCharClothText[] = {
++    { "Mario64", "６４服", "造型令人怀念的服装。" },
++    { "Mario64Metal", "金属马力欧服", "造型令人怀念的金属风６４服。" },
++    { "MarioAloha", "阿罗哈服", "如果要住度假村，当然要穿这款衣服。" },
++    { "MarioArmor", "武者服", "作为工艺品也别有风格的精美武士风服饰。" },
++    { "MarioArmorWestern", "装甲服", "看上去很耐打的板甲。" },
++    { "MarioBandman", "乐手服", "在传统的庆典上负责活跃气氛的演奏者所穿戴的衣服。" },
++    { "MarioBatter", "棒球服", "让人想试穿的细条纹队服。" },
++    { "MarioClown", "小丑服", "从搞笑到杂耍样样精通的小丑装。" },
++    { "MarioColorClassic", "经典衣服", "至今仍深受喜爱，色调简单的服装。" },
++    { "MarioColorGold", "金色衣服", "彻底追求金色的服装。" },
++    { "MarioColorLuigi", "路易吉服", "鲜绿色的经典服饰。" },
++    { "MarioColorWaluigi", "瓦路易吉服", "用来搭配颠倒Ｌ字母帽子的衣服。" },
++    { "MarioColorWario", "瓦力欧服", "用来搭配Ｗ字母帽子的衣服。" },
++    { "MarioConductor", "指挥家服", "让人瞬间变身成指挥家的人气服装。" },
++    { "MarioCook", "厨师服", "围着红色围巾的波尔波诺经典造型。" },
++    { "MarioDiddyKong", "迪迪服", "衣服上的长尾巴引人注目。" },
++    { "MarioDoctor", "医生服", "擅用特制胶囊的名医白袍。" },
++    { "MarioExplorer", "探险家服", "穿上这款衣服，在大自然深处也能安心。" },
++    { "MarioFootball", "美式橄榄球服", "条纹用色很酷的队服。" },
++    { "MarioGolf", "高尔夫球服", "鲜艳的条纹很抢眼的衣服。" },
++    { "MarioGunman", "牛仔枪手服", "令人联想到开垦的复古衣服。" },
++    { "MarioHappi", "法被服", "设计成在祭典上方便活动的传统服饰。" },
++    { "MarioHariet", "哈利艾特服", "能让人联想到布鲁达尔兹中的唯一女性哈利艾特的衣服。" },
++    { "MarioKing", "国王服", "在兔子环形山获得的华丽服装。" },
++    { "MarioKoopa", "新郎酷霸王服", "酷霸王特别订做的硬派服装的复制品。" },
++    { "MarioMaker", "建筑工服", "适合一般工程到点检作业，用途广泛的工作服。" },
++    { "MarioMechanic", "机械师服", "最适合作业时穿的机械师套装。" },
++    { "MarioNew3DS", "时髦衣服", "由３种图案组合而成的时尚风格。" },
++    { "MarioPainter", "画工服", "画家就要穿这款衣服。" },
++    { "MarioPeach", "新娘桃花公主服", "知名婚纱的精美复制品。" },
++    { "MarioPilot", "飞行员服", "许多飞机师爱用的飞行夹克。" },
++    { "MarioPirate", "海盗服", "让人想出海闯荡的服装。" },
++    { "MarioPoncho", "彭丘服", "阿炽尼亚地区的传统民族服饰。" },
++    { "MarioPrimitiveMan", "原始人服", "最便于活动，从古流传至今的服装。" },
++    { "MarioRacer", "赛手服", "能使开车时情绪高昂的套装。" },
++    { "MarioRango", "朗格服", "能让人联想到布鲁达尔兹的技术员朗格的衣服。" },
++    { "MarioSailor", "水手服", "以天蓝色条纹为特色的衣服。" },
++    { "MarioSanta", "圣诞老人服", "一穿上去就会受小朋友喜爱的经典服装。" },
++    { "MarioSatellite", "卫星游戏服", "在某项服务里使用过的纪念服装。" },
++    { "MarioScientist", "博士服", "具科学家风格的轻便白袍。" },
++    { "MarioShopman", "克雷吉佳普店员服", "克雷吉佳普公司独创的服装。" },
++    { "MarioSnowSuit", "防寒服", "彻底抵御严寒的羽绒外套。" },
++    { "MarioSpaceSuit", "宇航服", "似乎能承受各种环境的服装。" },
++    { "MarioSpewart", "斯普瓦特服", "能让人联想到布鲁达尔兹的艺术家斯普瓦特的衣服。" },
++    { "MarioSuit", "西服", "用途广泛，大受欢迎的设计。 " },
++    { "MarioSunshine", "太阳之光服", "能让人回忆起常夏之岛的阿罗哈衫。" },
++    { "MarioSwimwear", "泳衣", "衣服上装饰的游泳圈其实浮不起来。" },
++    { "MarioTailCoat", "绅士服", "克雷吉佳普戴布伦店热卖中的时髦服装。" },
++    { "MarioTopper", "托帕服", "能让人联想到布鲁达尔兹的队长托帕的衣服。" },
++    { "MarioTuxedo", "新郎马力欧服", "适合人生中最美妙舞台的最高级燕尾服。" },
++    { "MarioZombie", "僵尸服", "缝补起来就会魅力减半的仿旧服装。" },
++    { "MarioHakama", "和服", "风格沉稳，Ｍ字母设计大受欢迎的服装。" },
++    { "MarioBone", "枯骨服", "难以说明清楚，非常离奇的奇怪服装。" },
++    { "MarioUnderwear", "短裤", "蘑菇斑点色彩鲜艳，穿起来很舒服的短裤。" },
++};
++// Wario-only entries with no MSBT name: MarioHigh has no Chinese name in the
++// game (an unused costume); MarioCaptain as clothes is the Captain head, so
++// it reuses the cap name. These are looked up after the two tables above.
++static const CharCostumeText kCharWarioFallbackText[] = {
++    { "MarioHigh", "High", "" },
++    { "MarioCaptain", "船长帽", "充满威严的奥德赛号船长帽。" },
++};
 +
 +// ---- The game's font (dm/font/standard.ttf, registered from DM_FONT_DIR) ----
 +static NSString *charSelectFontName(void) {
@@ -673,65 +877,222 @@ index 0000000..b31e078
 +    if (clothes) setenv("DM_CHAR_CLOTHES", clothes.UTF8String, 1); else unsetenv("DM_CHAR_CLOTHES");
 +}
 +
++// ---- Costume display text: MSBT name + description, or a cleaned fallback ----
++// Returns the Chinese name for a costume key (nil = "跟随存档", "default" =
++// "默认"); the description goes into *descOut ("" when there is none).
++// Never returns a raw internal name like "ColorWario".
++static NSString *charCostumeName(const char *key, BOOL isCap, NSString **descOut) {
++    if (descOut) *descOut = @"";
++    if (!key) return @"跟随存档";
++    if (!strcmp(key, "default")) return @"默认";
++    const CharCostumeText *table = isCap ? kCharCapText : kCharClothText;
++    size_t n = isCap ? sizeof kCharCapText / sizeof *kCharCapText
++                     : sizeof kCharClothText / sizeof *kCharClothText;
++    for (size_t i = 0; i < n; i++) {
++        if (!strcmp(table[i].key, key)) {
++            if (descOut) *descOut = [NSString stringWithUTF8String:table[i].desc];
++            return [NSString stringWithUTF8String:table[i].name];
++        }
++    }
++    for (size_t i = 0; i < sizeof kCharWarioFallbackText / sizeof *kCharWarioFallbackText; i++) {
++        if (!strcmp(kCharWarioFallbackText[i].key, key)) {
++            if (descOut) *descOut = [NSString stringWithUTF8String:kCharWarioFallbackText[i].desc];
++            return [NSString stringWithUTF8String:kCharWarioFallbackText[i].name];
++        }
++    }
++    // No MSBT name: the cleaned internal name (strip the "Mario" prefix).
++    if (!strncmp(key, "Mario", 5)) return [NSString stringWithUTF8String:key + 5];
++    return [NSString stringWithUTF8String:key];
++}
++// The description for the "默认" / "跟随存档" cards.
++static NSString *charSpecialDesc(const char *key, BOOL isCap) {
++    if (!key) return isCap ? @"使用存档里的帽子" : @"使用存档里的服装";
++    if (!strcmp(key, "default")) return isCap ? @"角色的默认帽子" : @"角色的默认服装";
++    return @"";
++}
++// The emblem character: the first character of the display name.
++static NSString *charEmblemChar(NSString *name) {
++    if (name.length == 0) return @"?";
++    return [name substringToIndex:1];
++}
++// The pre-rendered preview image for an item (nil when no render exists).
++// Names in dm/ios/Sources/CharPreviews: char_<id>.png (the character in its
++// default outfit), cap_<id>_<Costume>.png (the hat alone),
++// clothes_<id>_<Costume>.png (the character wearing the outfit). The
++// "default" card shows the character in its default outfit; follow-the-save
++// (nil) has no specific item, so it has no image.
++static UIImage *charPreviewImage(int character, BOOL isCap, const char *costume) {
++    if (!costume) return nil;
++    NSString *charId = kCharIds[character];
++    NSString *name = nil;
++    if (!strcmp(costume, "default")) {
++        name = [NSString stringWithFormat:@"char_%@", charId];
++    } else {
++        name = [NSString stringWithFormat:@"%@_%@_%s", isCap ? @"cap" : @"clothes", charId, costume];
++    }
++    return [UIImage imageNamed:name inBundle:[NSBundle bundleForClass:[CharSelectEditor class]] compatibleWithTraitCollection:nil];
++}
++
 +static CharSelectEditor *g_editor;   // the open editor, if any (one at a time)
 +
++// Private methods (declared up front so the order of definitions below
++// does not matter).
++@interface CharSelectEditor ()
++- (void)buildUI;
++- (void)layoutPreview;
++- (void)updatePreviewImage;
++- (void)buildStrip:(UIScrollView *)strip isCap:(BOOL)isCap;
++- (NSString *)stripValue:(BOOL)isCap index:(int)idx;
++- (void)updateDesc;
++- (void)refresh;
++- (BOOL)costume:(NSString *)value isCap:(BOOL)isCap validFor:(int)character;
++- (void)refreshPreviewOutfit;
++- (void)loadSaved;
++- (void)save;
++- (void)applyLive;
++- (void)closeWithoutSaving;
++@end
++
 +@implementation CharSelectEditor {
-+    UIView *_panel;
++    UIView *_topBand, *_bottomBand;
 +    UIButton *_charButtons[3];
++    UIView *_previewPanel;
++    UIView *_previewDisc;
++    UIImageView *_previewImageView;
++    UILabel *_previewDiscLabel, *_previewNameLabel, *_previewOutfitLabel;
 +    UILabel *_capLabel, *_clothesLabel;
 +    UIScrollView *_capStrip, *_clothesStrip;
-+    UIButton *_doneButton, *_resetButton;
++    UILabel *_descKindLabel, *_descNameLabel, *_descTextLabel;
++    UIButton *_backButton, *_resetButton, *_selectButton;
 +    int _character;              // 0 Mario, 1 Luigi, 2 Wario
 +    NSString *_cap, *_clothes;   // nil = follow the save, @"default" = default part, else a costume name
++    BOOL _descIsCap;             // which strip the description area shows
++    NSString *_descKey;          // costume key shown in the description area (nil = follow the save)
++    CGFloat _stripH;             // costume-strip height (adaptive, set in layoutSubviews)
 +}
 +
 +- (instancetype)initWithFrame:(CGRect)frame {
 +    self = [super initWithFrame:frame];
 +    if (!self) return nil;
-+    self.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];   // the title menu shows through dimmed
++    // OPAQUE: the shop panel fills the screen; the title menu never shows through.
++    self.backgroundColor = charSelectColor(kShopPurple);
 +    _character = 0; _cap = nil; _clothes = nil;
-+    [self buildPanel];
++    _descIsCap = YES; _descKey = @"default";
++    [self buildUI];
 +    return self;
 +}
 +
 +- (void)layoutSubviews {
 +    [super layoutSubviews];
 +    CGFloat w = self.bounds.size.width, h = self.bounds.size.height;
-+    CGFloat pw = fmin(w * 0.88, 880), ph = fmin(h * 0.88, 600);
-+    _panel.frame = CGRectMake((w - pw) / 2, (h - ph) / 2, pw, ph);
-+    [self layoutPanel];
++    CGFloat bandH = 52;
++    _topBand.frame = CGRectMake(0, 0, w, bandH);
++    _bottomBand.frame = CGRectMake(0, h - bandH, w, bandH);
++    // Top band: title left, hint right.
++    UIView *title = [_topBand viewWithTag:101];
++    title.frame = CGRectMake(20, 0, 240, bandH);
++    UIView *hint = [_topBand viewWithTag:102];
++    hint.frame = CGRectMake(w - 420, 0, 400, bandH);
++    // Bottom band: 返回 left, 默认 centre, 选择 right (gold).
++    _backButton.frame = CGRectMake(20, (bandH - 40) / 2, 120, 40);
++    _selectButton.frame = CGRectMake(w - 20 - 150, (bandH - 40) / 2, 150, 40);
++    _resetButton.frame = CGRectMake((w - 120) / 2, (bandH - 40) / 2, 120, 40);
++    // Main area between the bands.
++    CGFloat my = bandH + 8, mh = h - 2 * bandH - 16;
++    CGFloat m = 16;
++    // Left column: character tabs + big preview.
++    CGFloat leftW = 280;
++    CGFloat tabH = 44, tabGap = 8;
++    CGFloat tabW = (leftW - 2 * tabGap) / 3;
++    for (int i = 0; i < 3; i++) {
++        _charButtons[i].frame = CGRectMake(m + i * (tabW + tabGap), my, tabW, tabH);
++        // The dot + name + check inside the tab.
++        UIView *dot = [_charButtons[i] viewWithTag:210 + i];
++        dot.frame = CGRectMake(12, (tabH - 16) / 2, 16, 16);
++        UILabel *name = (UILabel *)[_charButtons[i] viewWithTag:220 + i];
++        name.frame = CGRectMake(34, 0, tabW - 62, tabH);
++        UILabel *mark = (UILabel *)[_charButtons[i] viewWithTag:230 + i];
++        mark.frame = CGRectMake(tabW - 28, 0, 22, tabH);
++        mark.textAlignment = NSTextAlignmentCenter;
++    }
++    _previewPanel.frame = CGRectMake(m, my + tabH + 10, leftW, mh - tabH - 10);
++    [self layoutPreview];
++    // Right column: two strips + the description area. The strip height
++    // adapts to the screen: the description area keeps at least two lines.
++    CGFloat fixed = 18 + 2 + 18 + 2 + 8 + 8 + 14 + 2 + 26 + 2 + 36;
++    CGFloat stripH = (mh - fixed) / 2;
++    if (stripH < 72) stripH = 72;
++    if (stripH > 112) stripH = 112;
++    BOOL stripResized = (stripH != _stripH);
++    _stripH = stripH;
++    CGFloat rx = m + leftW + m, rw = w - rx - m;
++    _capLabel.frame = CGRectMake(rx, my, rw, 18);
++    _capStrip.frame = CGRectMake(rx, my + 20, rw, stripH);
++    _clothesLabel.frame = CGRectMake(rx, my + 20 + stripH + 8, rw, 18);
++    _clothesStrip.frame = CGRectMake(rx, my + 20 + stripH + 8 + 20, rw, stripH);
++    CGFloat dy = my + 20 + stripH + 8 + 20 + stripH + 8;
++    CGFloat dh = my + mh - dy;
++    _descKindLabel.frame = CGRectMake(rx, dy, rw, 14);
++    _descNameLabel.frame = CGRectMake(rx, dy + 16, rw, 26);
++    _descTextLabel.frame = CGRectMake(rx, dy + 44, rw, dh - 44);
++    // A size change resizes the cards, so rebuild the strips.
++    if (stripResized) {
++        [self buildStrip:_capStrip isCap:YES];
++        [self buildStrip:_clothesStrip isCap:NO];
++    }
++}
++
++- (void)layoutPreview {
++    CGFloat pw = _previewPanel.bounds.size.width, ph = _previewPanel.bounds.size.height;
++    if (pw <= 0 || ph <= 0) return;
++    CGFloat imgD = fminf(pw - 32, 220);   // the render is square; the disc is the fallback
++    _previewImageView.frame = CGRectMake((pw - imgD) / 2, 16, imgD, imgD);
++    CGFloat discD = 132;
++    _previewDisc.frame = CGRectMake((pw - discD) / 2, 16 + (imgD - discD) / 2, discD, discD);
++    _previewDisc.layer.cornerRadius = discD / 2;
++    _previewDiscLabel.frame = _previewDisc.bounds;
++    _previewNameLabel.frame = CGRectMake(12, 16 + imgD + 10, pw - 24, 32);
++    _previewOutfitLabel.frame = CGRectMake(12, 16 + imgD + 10 + 34, pw - 24, ph - (16 + imgD + 10 + 34) - 12);
++}
++// The big preview image: the character wearing the selected clothes (the
++// clothes render), or the default outfit when none is picked. A cap pick
++// does not change it (no single render for a cap+clothes combination).
++- (void)updatePreviewImage {
++    const char *clothes = _clothes ? _clothes.UTF8String : "default";
++    UIImage *img = charPreviewImage(_character, NO, clothes);
++    _previewImageView.image = img;
++    _previewImageView.hidden = (img == nil);
++    _previewDisc.hidden = (img != nil);
++    _previewDiscLabel.hidden = (img != nil);
 +}
 +
 +// ---- Building ----
-+- (void)buildPanel {
-+    _panel = [[UIView alloc] init];
-+    _panel.backgroundColor = [UIColor whiteColor];
-+    _panel.layer.cornerRadius = 16;
-+    _panel.layer.shadowColor = [UIColor blackColor].CGColor;
-+    _panel.layer.shadowOpacity = 0.35;
-+    _panel.layer.shadowRadius = 12;
-+    _panel.layer.shadowOffset = CGSizeMake(0, 4);
-+    [self addSubview:_panel];
++- (void)buildUI {
++    _topBand = [[UIView alloc] init];
++    _topBand.backgroundColor = charSelectColor(kShopBand);
++    [self addSubview:_topBand];
++    _bottomBand = [[UIView alloc] init];
++    _bottomBand.backgroundColor = charSelectColor(kShopBand);
++    [self addSubview:_bottomBand];
 +
 +    UILabel *title = [[UILabel alloc] init];
 +    title.text = @"角色选择";
 +    title.font = charSelectFont(28, YES);
-+    title.textColor = [UIColor colorWithWhite:0.15 alpha:1];
-+    title.textAlignment = NSTextAlignmentCenter;
++    title.textColor = [UIColor whiteColor];
 +    title.tag = 101;
-+    [_panel addSubview:title];
++    [_topBand addSubview:title];
 +
 +    UILabel *hint = [[UILabel alloc] init];
 +    hint.text = @"选角色和服装，开始游戏时生效";
 +    hint.font = charSelectFont(14, NO);
-+    hint.textColor = [UIColor colorWithWhite:0.45 alpha:1];
-+    hint.textAlignment = NSTextAlignmentCenter;
++    hint.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.75];
++    hint.textAlignment = NSTextAlignmentRight;
 +    hint.tag = 102;
-+    [_panel addSubview:hint];
++    [_topBand addSubview:hint];
 +
 +    for (int i = 0; i < 3; i++) {
 +        UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-+        b.backgroundColor = [UIColor colorWithWhite:0.96 alpha:1];
++        b.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.12];
 +        b.layer.cornerRadius = 10;
 +        b.layer.borderWidth = 2;
 +        b.layer.borderColor = [UIColor clearColor].CGColor;
@@ -740,114 +1101,122 @@ index 0000000..b31e078
 +        // The colour dot (the character's accent) + the name.
 +        UIView *dot = [[UIView alloc] init];
 +        dot.backgroundColor = charSelectColor(kCharColors[i]);
-+        dot.layer.cornerRadius = 9;
++        dot.layer.cornerRadius = 8;
 +        dot.tag = 210 + i;
 +        dot.userInteractionEnabled = NO;
 +        [b addSubview:dot];
 +        UILabel *name = [[UILabel alloc] init];
 +        name.text = kCharNames[i];
-+        name.font = charSelectFont(20, YES);
-+        name.textColor = [UIColor colorWithWhite:0.15 alpha:1];
++        name.font = charSelectFont(17, YES);
++        name.textColor = [UIColor whiteColor];
 +        name.tag = 220 + i;
 +        [b addSubview:name];
 +        UILabel *mark = [[UILabel alloc] init];
 +        mark.text = @"✓";
-+        mark.font = charSelectFont(20, YES);
-+        mark.textColor = charSelectColor(0xC9A227);
++        mark.font = charSelectFont(17, YES);
++        mark.textColor = charSelectColor(kShopGold);
 +        mark.tag = 230 + i;
 +        [b addSubview:mark];
-+        [_panel addSubview:b];
++        [self addSubview:b];
 +        _charButtons[i] = b;
 +    }
++
++    _previewPanel = [[UIView alloc] init];
++    _previewPanel.backgroundColor = [UIColor whiteColor];
++    _previewPanel.layer.cornerRadius = 16;
++    [self addSubview:_previewPanel];
++    _previewDisc = [[UIView alloc] init];
++    _previewDisc.backgroundColor = charSelectColor(kCharColors[0]);
++    [_previewPanel addSubview:_previewDisc];
++    _previewDiscLabel = [[UILabel alloc] init];
++    _previewDiscLabel.font = charSelectFont(64, YES);
++    _previewDiscLabel.textColor = [UIColor whiteColor];
++    _previewDiscLabel.textAlignment = NSTextAlignmentCenter;
++    [_previewDisc addSubview:_previewDiscLabel];
++    // The rendered preview (on top of the disc; the disc is the fallback
++    // when no render exists for the selection).
++    _previewImageView = [[UIImageView alloc] init];
++    _previewImageView.contentMode = UIViewContentModeScaleAspectFit;
++    _previewImageView.backgroundColor = [UIColor clearColor];
++    _previewImageView.userInteractionEnabled = NO;
++    [_previewPanel addSubview:_previewImageView];
++    _previewNameLabel = [[UILabel alloc] init];
++    _previewNameLabel.font = charSelectFont(24, YES);
++    _previewNameLabel.textColor = [UIColor colorWithWhite:0.15 alpha:1];
++    _previewNameLabel.textAlignment = NSTextAlignmentCenter;
++    [_previewPanel addSubview:_previewNameLabel];
++    _previewOutfitLabel = [[UILabel alloc] init];
++    _previewOutfitLabel.font = charSelectFont(15, NO);
++    _previewOutfitLabel.textColor = [UIColor colorWithWhite:0.4 alpha:1];
++    _previewOutfitLabel.textAlignment = NSTextAlignmentCenter;
++    _previewOutfitLabel.numberOfLines = 0;
++    [_previewPanel addSubview:_previewOutfitLabel];
 +
 +    _capLabel = [[UILabel alloc] init];
 +    _capLabel.text = @"帽子";
 +    _capLabel.font = charSelectFont(16, YES);
-+    _capLabel.textColor = [UIColor colorWithWhite:0.25 alpha:1];
-+    [_panel addSubview:_capLabel];
++    _capLabel.textColor = [UIColor whiteColor];
++    [self addSubview:_capLabel];
 +    _capStrip = [[UIScrollView alloc] init];
 +    _capStrip.showsHorizontalScrollIndicator = NO;
-+    [_panel addSubview:_capStrip];
++    [self addSubview:_capStrip];
 +
 +    _clothesLabel = [[UILabel alloc] init];
 +    _clothesLabel.text = @"服装";
 +    _clothesLabel.font = charSelectFont(16, YES);
-+    _clothesLabel.textColor = [UIColor colorWithWhite:0.25 alpha:1];
-+    [_panel addSubview:_clothesLabel];
++    _clothesLabel.textColor = [UIColor whiteColor];
++    [self addSubview:_clothesLabel];
 +    _clothesStrip = [[UIScrollView alloc] init];
 +    _clothesStrip.showsHorizontalScrollIndicator = NO;
-+    [_panel addSubview:_clothesStrip];
++    [self addSubview:_clothesStrip];
 +
-+    _doneButton = [UIButton buttonWithType:UIButtonTypeCustom];
-+    [_doneButton setTitle:@"完成" forState:UIControlStateNormal];
-+    _doneButton.titleLabel.font = charSelectFont(18, YES);
-+    [_doneButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-+    _doneButton.backgroundColor = charSelectColor(0xC9A227);
-+    _doneButton.layer.cornerRadius = 10;
-+    [_doneButton addTarget:self action:@selector(done:) forControlEvents:UIControlEventTouchUpInside];
-+    [_panel addSubview:_doneButton];
++    _descKindLabel = [[UILabel alloc] init];
++    _descKindLabel.font = charSelectFont(13, YES);
++    _descKindLabel.textColor = charSelectColor(kShopGold);
++    [self addSubview:_descKindLabel];
++    _descNameLabel = [[UILabel alloc] init];
++    _descNameLabel.font = charSelectFont(22, YES);
++    _descNameLabel.textColor = [UIColor whiteColor];
++    [self addSubview:_descNameLabel];
++    _descTextLabel = [[UILabel alloc] init];
++    _descTextLabel.font = charSelectFont(15, NO);
++    _descTextLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.85];
++    _descTextLabel.numberOfLines = 0;
++    [self addSubview:_descTextLabel];
++
++    _backButton = [UIButton buttonWithType:UIButtonTypeCustom];
++    [_backButton setTitle:@"返回" forState:UIControlStateNormal];
++    _backButton.titleLabel.font = charSelectFont(18, YES);
++    [_backButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
++    _backButton.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.16];
++    _backButton.layer.cornerRadius = 10;
++    [_backButton addTarget:self action:@selector(back:) forControlEvents:UIControlEventTouchUpInside];
++    [_bottomBand addSubview:_backButton];
 +
 +    _resetButton = [UIButton buttonWithType:UIButtonTypeCustom];
 +    [_resetButton setTitle:@"默认" forState:UIControlStateNormal];
 +    _resetButton.titleLabel.font = charSelectFont(18, NO);
-+    [_resetButton setTitleColor:[UIColor colorWithWhite:0.3 alpha:1] forState:UIControlStateNormal];
++    [_resetButton setTitleColor:[UIColor colorWithWhite:0.25 alpha:1] forState:UIControlStateNormal];
 +    _resetButton.backgroundColor = [UIColor colorWithWhite:0.92 alpha:1];
 +    _resetButton.layer.cornerRadius = 10;
 +    [_resetButton addTarget:self action:@selector(reset:) forControlEvents:UIControlEventTouchUpInside];
-+    [_panel addSubview:_resetButton];
-+}
++    [_bottomBand addSubview:_resetButton];
 +
-+- (void)layoutPanel {
-+    CGFloat pw = _panel.bounds.size.width, ph = _panel.bounds.size.height;
-+    CGFloat m = 20;   // margin
-+    CGFloat y = 10;
-+    UIView *title = [_panel viewWithTag:101];
-+    title.frame = CGRectMake(m, y, pw - 2 * m, 32);
-+    y += 32 + 2;
-+    UIView *hint = [_panel viewWithTag:102];
-+    hint.frame = CGRectMake(m, y, pw - 2 * m, 18);
-+    y += 18 + 6;
-+    CGFloat rowH = 46, rowGap = 10;
-+    CGFloat rowW = (pw - 2 * m - 2 * rowGap) / 3;
-+    for (int i = 0; i < 3; i++) {
-+        UIButton *b = _charButtons[i];
-+        b.frame = CGRectMake(m + i * (rowW + rowGap), y, rowW, rowH);
-+        UIView *dot = [b viewWithTag:210 + i];
-+        dot.frame = CGRectMake(14, (rowH - 18) / 2, 18, 18);
-+        UILabel *name = (UILabel *)[b viewWithTag:220 + i];
-+        name.frame = CGRectMake(42, 0, rowW - 80, rowH);
-+        UILabel *mark = (UILabel *)[b viewWithTag:230 + i];
-+        mark.frame = CGRectMake(rowW - 36, 0, 28, rowH);
-+        mark.textAlignment = NSTextAlignmentCenter;
-+    }
-+    y += rowH + 10;
-+    // The two strips share the space between here and the buttons.
-+    CGFloat bh = 44, bottomGap = 12;
-+    CGFloat avail = ph - bottomGap - bh - y;
-+    CGFloat stripH = (avail - 2 * 22 - 8) / 2;
-+    if (stripH > 84) stripH = 84;
-+    if (stripH < 52) stripH = 52;
-+    _capLabel.frame = CGRectMake(m, y, pw - 2 * m, 20);
-+    y += 22;
-+    _capStrip.frame = CGRectMake(m, y, pw - 2 * m, stripH);
-+    y += stripH + 8;
-+    _clothesLabel.frame = CGRectMake(m, y, pw - 2 * m, 20);
-+    y += 22;
-+    _clothesStrip.frame = CGRectMake(m, y, pw - 2 * m, stripH);
-+    CGFloat bw = 140;
-+    _doneButton.frame = CGRectMake(pw / 2 - bw - 8, ph - bottomGap - bh, bw, bh);
-+    _resetButton.frame = CGRectMake(pw / 2 + 8, ph - bottomGap - bh, bw, bh);
++    _selectButton = [UIButton buttonWithType:UIButtonTypeCustom];
++    [_selectButton setTitle:@"选择" forState:UIControlStateNormal];
++    _selectButton.titleLabel.font = charSelectFont(18, YES);
++    [_selectButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
++    _selectButton.backgroundColor = charSelectColor(kShopGold);
++    _selectButton.layer.cornerRadius = 10;
++    [_selectButton addTarget:self action:@selector(select:) forControlEvents:UIControlEventTouchUpInside];
++    [_bottomBand addSubview:_selectButton];
 +}
 +
 +// ---- Costume strips ----
 +// One card per entry: "默认" first, the character's costumes, "跟随存档" last.
 +// The entry value is the DM_CHAR_* string (nil = follow the save).
-+- (NSString *)displayNameForCostume:(const char *)name {
-+    if (!name) return @"跟随存档";
-+    if (!strcmp(name, "default")) return @"默认";
-+    if (!strncmp(name, "Mario", 5)) return [NSString stringWithUTF8String:name + 5];
-+    return [NSString stringWithUTF8String:name];
-+}
++// A card is a shop card: a purple emblem with the costume's first Chinese
++// character on top, the Chinese name below, a gold frame when selected.
 +- (void)buildStrip:(UIScrollView *)strip isCap:(BOOL)isCap {
 +    for (UIView *v in strip.subviews) [v removeFromSuperview];
 +    // Entries: "default", the character's costumes, nil (follow the save).
@@ -864,25 +1233,57 @@ index 0000000..b31e078
 +        else { for (size_t i = 0; i < sizeof kCharWario / sizeof *kCharWario; i++) names[n++] = kCharWario[i]; }
 +    }
 +    names[n++] = NULL;   // follow the save
-+    CGFloat x = 0, cw = 118, ch = 68, gap = 8;
++    CGFloat ch = _stripH > 0 ? _stripH - 8 : 88;
++    CGFloat cw = 104, gap = 8;
++    CGFloat x = 0;
 +    for (int i = 0; i < n; i++) {
 +        const char *entry = names[i];
 +        NSString *value = entry ? [NSString stringWithUTF8String:entry] : nil;
++        NSString *name = charCostumeName(entry, isCap, NULL);
 +        UIButton *card = [UIButton buttonWithType:UIButtonTypeCustom];
 +        card.frame = CGRectMake(x, 4, cw, ch);
-+        card.backgroundColor = [UIColor colorWithWhite:0.96 alpha:1];
-+        card.layer.cornerRadius = 8;
++        card.backgroundColor = [UIColor whiteColor];
++        card.layer.cornerRadius = 10;
 +        card.layer.borderWidth = 2;
 +        NSString *cur = isCap ? _cap : _clothes;
 +        BOOL selected = (value == nil && cur == nil) || (value != nil && cur != nil && [value isEqualToString:cur]);
-+        card.layer.borderColor = selected ? charSelectColor(0xC9A227).CGColor : [UIColor clearColor].CGColor;
-+        card.titleLabel.font = charSelectFont(14, selected);
-+        card.titleLabel.numberOfLines = 2;
-+        card.titleLabel.textAlignment = NSTextAlignmentCenter;
-+        [card setTitle:[self displayNameForCostume:entry] forState:UIControlStateNormal];
-+        [card setTitleColor:[UIColor colorWithWhite:0.2 alpha:1] forState:UIControlStateNormal];
++        card.layer.borderColor = selected ? charSelectColor(kShopGold).CGColor : [UIColor clearColor].CGColor;
 +        card.tag = isCap ? 300 + i : 400 + i;
 +        [card addTarget:self action:isCap ? @selector(pickCap:) : @selector(pickClothes:) forControlEvents:UIControlEventTouchUpInside];
++        // The emblem (the card "image"): the pre-rendered PNG when one
++        // exists, else the drawn badge (purple, first Chinese character
++        // in gold) as the fallback.
++        CGFloat emblemH = ch - 42;
++        UIImage *img = charPreviewImage(_character, isCap, entry);
++        if (img) {
++            UIImageView *iv = [[UIImageView alloc] initWithFrame:CGRectMake(6, 6, cw - 12, emblemH)];
++            iv.image = img;
++            iv.contentMode = UIViewContentModeScaleAspectFit;
++            iv.backgroundColor = [UIColor whiteColor];   // renders are transparent
++            iv.layer.cornerRadius = 8;
++            iv.userInteractionEnabled = NO;
++            [card addSubview:iv];
++        } else {
++            UIView *emblem = [[UIView alloc] initWithFrame:CGRectMake(6, 6, cw - 12, emblemH)];
++            emblem.backgroundColor = charSelectColor(kShopEmblem);
++            emblem.layer.cornerRadius = 8;
++            emblem.userInteractionEnabled = NO;
++            [card addSubview:emblem];
++            UILabel *glyph = [[UILabel alloc] initWithFrame:emblem.bounds];
++            glyph.text = charEmblemChar(name);
++            glyph.font = charSelectFont(fminf(32, emblemH - 10), YES);
++            glyph.textColor = charSelectColor(kShopGold);
++            glyph.textAlignment = NSTextAlignmentCenter;
++            [emblem addSubview:glyph];
++        }
++        // The Chinese name below the emblem.
++        UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(4, ch - 32, cw - 8, 28)];
++        label.text = name;
++        label.font = charSelectFont(13, selected);
++        label.textColor = [UIColor colorWithWhite:0.2 alpha:1];
++        label.textAlignment = NSTextAlignmentCenter;
++        label.numberOfLines = 2;
++        [card addSubview:label];
 +        [strip addSubview:card];
 +        x += cw + gap;
 +    }
@@ -906,20 +1307,44 @@ index 0000000..b31e078
 +    return names[idx] ? [NSString stringWithUTF8String:names[idx]] : nil;
 +}
 +
++// ---- Description area (the shop's item name + description) ----
++- (void)updateDesc {
++    NSString *desc = nil;
++    NSString *name = charCostumeName(_descKey ? _descKey.UTF8String : NULL, _descIsCap, &desc);
++    if (!_descKey || !strcmp(_descKey.UTF8String, "default")) {
++        // The special cards: the description is the fixed one.
++        desc = charSpecialDesc(_descKey ? _descKey.UTF8String : NULL, _descIsCap);
++    }
++    _descKindLabel.text = _descIsCap ? @"帽子" : @"服装";
++    _descNameLabel.text = name;
++    _descTextLabel.text = desc;
++}
++
 +// ---- Selection ----
 +- (void)refresh {
 +    for (int i = 0; i < 3; i++) {
 +        BOOL selected = (i == _character);
-+        _charButtons[i].layer.borderColor = selected ? charSelectColor(0xC9A227).CGColor : [UIColor clearColor].CGColor;
++        _charButtons[i].layer.borderColor = selected ? charSelectColor(kShopGold).CGColor : [UIColor clearColor].CGColor;
 +        UILabel *mark = (UILabel *)[_charButtons[i] viewWithTag:230 + i];
 +        mark.hidden = !selected;
 +    }
++    // The big preview: the render when one exists, else the disc (accent
++    // colour, first character) as the fallback. Name + outfit below.
++    _previewDisc.backgroundColor = charSelectColor(kCharColors[_character]);
++    _previewDiscLabel.text = charEmblemChar(kCharNames[_character]);
++    [self updatePreviewImage];
++    _previewNameLabel.text = kCharNames[_character];
++    NSString *capName = charCostumeName(_cap ? _cap.UTF8String : NULL, YES, NULL);
++    NSString *clothName = charCostumeName(_clothes ? _clothes.UTF8String : NULL, NO, NULL);
++    _previewOutfitLabel.text = [NSString stringWithFormat:@"%@\n%@", capName, clothName];
 +    // A pick that is not on the new character's list falls back to Default
 +    // (it cannot stay: the list no longer offers it).
 +    if (![self costume:_cap isCap:YES validFor:_character]) _cap = @"default";
 +    if (![self costume:_clothes isCap:NO validFor:_character]) _clothes = @"default";
 +    [self buildStrip:_capStrip isCap:YES];
 +    [self buildStrip:_clothesStrip isCap:NO];
++    [self updateDesc];
++    [self layoutPreview];
 +}
 +- (BOOL)costume:(NSString *)value isCap:(BOOL)isCap validFor:(int)character {
 +    if (value == nil) return YES;   // follow the save is always valid
@@ -947,18 +1372,33 @@ index 0000000..b31e078
 +- (void)pickCap:(UIButton *)sender {
 +    int idx = (int)(sender.tag - 300);
 +    _cap = [self stripValue:YES index:idx];
++    _descIsCap = YES;
++    _descKey = _cap;
 +    [self buildStrip:_capStrip isCap:YES];
++    [self updateDesc];
++    [self refreshPreviewOutfit];
 +    [self applyLive];
 +}
 +- (void)pickClothes:(UIButton *)sender {
 +    int idx = (int)(sender.tag - 400);
 +    _clothes = [self stripValue:NO index:idx];
++    _descIsCap = NO;
++    _descKey = _clothes;
 +    [self buildStrip:_clothesStrip isCap:NO];
++    [self updateDesc];
++    [self refreshPreviewOutfit];
 +    [self applyLive];
++}
++- (void)refreshPreviewOutfit {
++    NSString *capName = charCostumeName(_cap ? _cap.UTF8String : NULL, YES, NULL);
++    NSString *clothName = charCostumeName(_clothes ? _clothes.UTF8String : NULL, NO, NULL);
++    _previewOutfitLabel.text = [NSString stringWithFormat:@"%@\n%@", capName, clothName];
++    [self updatePreviewImage];   // the clothes pick changes the preview
 +}
 +- (void)reset:(UIButton *)sender {
 +    (void)sender;
 +    _character = 0; _cap = @"default"; _clothes = @"default";
++    _descIsCap = YES; _descKey = @"default";
 +    [self refresh];
 +    [self applyLive];
 +}
@@ -975,6 +1415,7 @@ index 0000000..b31e078
 +    // character changed since it was saved): fall back to Default.
 +    if (![self costume:_cap isCap:YES validFor:_character]) _cap = @"default";
 +    if (![self costume:_clothes isCap:NO validFor:_character]) _clothes = @"default";
++    _descIsCap = YES; _descKey = _cap;
 +}
 +- (void)save {
 +    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
@@ -997,9 +1438,21 @@ index 0000000..b31e078
 +    [self removeFromSuperview];
 +    g_editor = nil;
 +}
-+- (void)done:(UIButton *)sender {
++- (void)closeWithoutSaving {
++    // 返回: discard this session's picks -- restore the saved settings to
++    // the live channel, then close without saving.
++    [self loadSaved];
++    [self applyLive];
++    [self removeFromSuperview];
++    g_editor = nil;
++}
++- (void)select:(UIButton *)sender {
 +    (void)sender;
 +    [self closeEditor];
++}
++- (void)back:(UIButton *)sender {
++    (void)sender;
++    [self closeWithoutSaving];
 +}
 +@end
 +
@@ -1065,6 +1518,19 @@ index db24a34..b7655c7 100644
          h.dismiss(animated: false) { done() }
      }
      let h = DmHostingController(rootView: view)
+diff --git a/dm/ios/project-framework.yml b/dm/ios/project-framework.yml
+index b7bd19e..d413ae7 100644
+--- a/dm/ios/project-framework.yml
++++ b/dm/ios/project-framework.yml
+@@ -163,6 +163,8 @@ targets:
+         buildPhase: resources
+       - path: Sources/PadIcons
+         buildPhase: resources
++      - path: Sources/CharPreviews
++        buildPhase: resources
+     info:
+       path: Gen/framework/ShellGame-Info.plist
+       properties:
 diff --git a/dm/romfs-overlay/ObjectData/Luigi.szs b/dm/romfs-overlay/ObjectData/Luigi.szs
 new file mode 100644
 index 0000000000000000000000000000000000000000..3fff407d8a72601d4946fd49033f0d13ebb870af
