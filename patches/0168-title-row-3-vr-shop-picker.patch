@@ -1,0 +1,1747 @@
+From a3928ef731e4d99c35f0d03e0014ea56794e58b8 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Tue, 17 Nov 2026 09:43:38 +0000
+Subject: [PATCH 2/4] 0168: title row 3 back to VR, shop picker replaces the
+ UIKit picker, guide tap fix
+
+Revert the 0157 title-menu repurpose: the 0x497314 CUTS NOP, the
+0x4972f4 row-3 text cut and the 0x1d7290 confirm-switch intercept are
+removed (CUTS is empty again), and the UIKit CharSelectEditor is
+deleted (its preview PNGs follow in 0169/0170). Character selection
+moves into the in-game shop (0167 data: ItemList rows 0,1,2,
+Luigi2D.szs, MSBT labels). The model/costume redirect (hle_fs.c,
+0163/0165) and the DmCharSelect.* persistence are unchanged; the
+persistence now lives in CharSelectPersist.m, which the launcher still
+calls at startup.
+
+Also delete the 0164 shop probe (shop_probe.c, its patches.py entry,
+the hud_manual.c drain, state +0x3300): the probe never produced a
+usable [shop] line in three device runs, and the user cancelled the
+probe method outright.
+
+Guide tap fix: DmGamepad.m controlAt: no longer treats the left half
+as the floating-stick area while a web page is shown, so the offline
+guide's menu items on the left half are tappable (hitTest already
+forwards non-control touches to the page).
+
+Note: the shop-picker write-back (0166) is not in this commit; the
+confirmed row cannot be identified from static code (see the game
+note's Open section).
+---
+ dm/games/0100000000010000/README.md     |   1 +
+ dm/games/0100000000010000/char_select.c |  83 ---
+ dm/games/0100000000010000/patches.py    | 201 +----
+ dm/games/0100000000010000/shop_probe.c  | 187 -----
+ dm/host/hud_manual.c                    |  97 ---
+ dm/ios/Sources/CharSelectEditor.h       |  42 --
+ dm/ios/Sources/CharSelectEditor.m       | 927 ------------------------
+ dm/ios/Sources/CharSelectPersist.m      |  38 +
+ dm/ios/Sources/DmGameMenu.h             |   2 +-
+ dm/ios/Sources/DmGamepad.m              |   2 +-
+ dm/ios/project-framework.yml            |   2 -
+ 11 files changed, 51 insertions(+), 1531 deletions(-)
+ delete mode 100644 dm/games/0100000000010000/char_select.c
+ delete mode 100644 dm/games/0100000000010000/shop_probe.c
+ delete mode 100644 dm/ios/Sources/CharSelectEditor.h
+ delete mode 100644 dm/ios/Sources/CharSelectEditor.m
+ create mode 100644 dm/ios/Sources/CharSelectPersist.m
+
+diff --git a/dm/games/0100000000010000/README.md b/dm/games/0100000000010000/README.md
+index 582fde5..b3d9e61 100644
+--- a/dm/games/0100000000010000/README.md
++++ b/dm/games/0100000000010000/README.md
+@@ -87,6 +87,7 @@ General host and tool changes first needed here; each applies to every game:
+ 
+ ## Open
+ 
++- Character selection in the in-game shop (0166, open): the shop rows are in (0167: Mario/Luigi/Wario at ItemList.byml 0,1,2, Luigi2D.szs icon, MSBT labels) and the title-menu picker is removed (0168: row 3 is VR again, guide taps fall through while a page is shown), but buying a row does not persist the character yet. The confirmed row cannot be identified from static code: the fs-preview route is refuted by log-64 (the shop opens every row's body file while building the list and nothing new at confirm), the 0x50a5c0 accessor's +0x70 is a float, not a row index, and NrvSelectDecideEnd (0x442980) is cleanup. The list NrvDecide hook point 0x2e8dfc is verified and can set a confirm flag, but the flag alone does not name the row.
+ - The three thunder geometry shaders do not translate.
+ - The silent first minute of sound.
+ - development.md calls SDK 7.3.2 "the oldest so far"; Mario Kart 8 Deluxe (SDK 4.4.0) is older now.
+diff --git a/dm/games/0100000000010000/char_select.c b/dm/games/0100000000010000/char_select.c
+deleted file mode 100644
+index a0778c5..0000000
+--- a/dm/games/0100000000010000/char_select.c
++++ /dev/null
+@@ -1,83 +0,0 @@
+-// char_select.c -- the title-menu character/costume picker stubs (0157).
+-//
+-// Compiled to a word table like hud_runtime.c
+-// (aarch64-linux-gnu-gcc -O2 -ffreestanding -fno-builtin -fno-stack-protector
+-// -fno-jump-tables -fno-unwind-tables -fno-asynchronous-unwind-tables -c,
+-// objcopy -O binary --only-section=.text; never plain -O binary, see the
+-// 0131 .eh_frame lesson). The rewriter's FRAME_STEP trampolines call these;
+-// all game addresses are passed in as arguments, so this file holds no
+-// absolute address and no literal pool.
+-//
+-// State page slots (hud_manual.c, the host frame tick):
+-//   +0x260: u32 char-select flag. The switch stub sets it to 1 when the
+-//   player picks the title menu's "角色选择" row; the host's per-present
+-//   frame tick reads it, clears it, and opens the picker (CharSelectEditor).
+-//   +0x264: u32 diagnostic, the full action id of the last switch call.
+-//   +0x268: u32 diagnostic, sel | (row << 8) | (ret << 24) of the last call.
+-//   +0x26c: u32 diagnostic, switch-call counter (the tick logs when it changes).
+-//   All in the free zone +0x250..+0x300 (the HUD masks end at +0x250,
+-//   the HUD table starts at +0x300).
+-//
+-// The diagnostics exist because #72 proved the stub can run and still be
+-// wrong: its trampoline passed the table PAGE (0xec8000) instead of the
+-// table (0xec8270/0xec8288), so the stub read string data as the action
+-// table, never saw action 6, and always returned 0 -- the row-3 tap went
+-// to VR and log-57 had zero [char] lines. The tick logs every switch
+-// invocation from these slots, so the next device run proves what the
+-// hook sees (sel, row, action, ret) instead of leaving it to inference.
+-//
+-// Why the "角色选择" row is the VR row, not a 7th row (verified 2026-11-16):
+-// the title menu's List is built for exactly 7 actions (0-6) -- the ctor
+-// (0x1d6610, called once from 0x495504 with w5 = 7) allocates the pane
+-// array as count * 8 = 56 bytes (7 entries, indices 0-6), and the layout
+-// (Menu.bflyt) has exactly 7 row panes (ParList00-06). Table A has 6
+-// entries [0,1,2,6,3,5]; Table B starts right after it (0xec8288),
+-// so there is no Table A[6] -- writing 7 there would break the pause menu's
+-// Continue row. There is no 8th action, no 8th pane and no 8th layout row,
+-// so a 7th menu row cannot be added through the table. The VR row (title
+-// row 3, action 6, pane ParList06) is repurposed instead: VR on iPhone is
+-// barely usable, the pause menu keeps its own VR row (Table B[2] = 6),
+-// and the stub below tells the two apart by the table selector
+-// ([list+0x58]: 1 = title Table A, 0 = pause Table B).
+-#include <stdint.h>
+-
+-#define CHAR_SELECT_FLAG_OFF 0x260
+-#define CHAR_SELECT_DIAG_ACTION_OFF 0x264
+-#define CHAR_SELECT_DIAG_MISC_OFF 0x268
+-#define CHAR_SELECT_COUNT_OFF 0x26c
+-
+-// The confirm-switch cut (0x1d7290): the switch at 0x1d7290 is the real
+-// confirm dispatcher -- it reads [obj+0x58] (table selector) and
+-// [obj+0x1c] (selected row), computes action = table[row] and jump-tables
+-// to the action handler; its action-6 case (0x1d7334) is the only path to
+-// the VR transition (0x1d7740). Decide (0x1d7800) was the first version's
+-// hook site and was wrong: it has no BL caller and never runs the VR
+-// action (it only special-cases action 0), which is why #71 showed the VR
+-// screen and no [char] log line. Recompute the action id the way the
+-// switch does -- [obj+0x58] selects the table (0 = pause Table B,
+-// nonzero = title Table A), [obj+0x1c] is the selected row -- and, for
+-// action 6 on the title menu (the repurposed VR row), set the host flag
+-// so the picker opens. Other actions, and the pause menu's VR, are left
+-// alone (the trampoline falls through to the switch). Returns 1 when the
+-// flag was set, 0 otherwise; the trampoline returns to the caller on 1
+-// (skipping the VR action) and falls through to the switch on 0.
+-int char_select_decide_vr(void *menu, uint8_t *state, const int32_t *tableA, const int32_t *tableB) {
+-    uint8_t sel = *(volatile uint8_t *)((char *)menu + 0x58);
+-    int32_t row = *(volatile int32_t *)((char *)menu + 0x1c);
+-    const int32_t *table = (sel == 0) ? tableB : tableA;
+-    int32_t action = table[row];
+-    int ret = (sel != 0 && action == 6) ? 1 : 0;
+-    if (ret) {
+-        *(volatile uint32_t *)(state + CHAR_SELECT_FLAG_OFF) = 1;
+-    }
+-    // Diagnostic (see the state-page comment above): record every switch
+-    // invocation so the host tick can log it. Written unconditionally,
+-    // not only when the flag is set -- a Confirm that computes the wrong
+-    // action is exactly what the log needs to show.
+-    *(volatile uint32_t *)(state + CHAR_SELECT_DIAG_ACTION_OFF) = (uint32_t)action;
+-    *(volatile uint32_t *)(state + CHAR_SELECT_DIAG_MISC_OFF) =
+-        (uint32_t)sel | ((uint32_t)(row & 0xff) << 8) | ((uint32_t)ret << 24);
+-    *(volatile uint32_t *)(state + CHAR_SELECT_COUNT_OFF) =
+-        *(volatile uint32_t *)(state + CHAR_SELECT_COUNT_OFF) + 1;
+-    return ret;
+-}
+diff --git a/dm/games/0100000000010000/patches.py b/dm/games/0100000000010000/patches.py
+index 58a8d34..30a5e5c 100644
+--- a/dm/games/0100000000010000/patches.py
++++ b/dm/games/0100000000010000/patches.py
+@@ -7,14 +7,13 @@ from nso_asm import ADDI, ADRP, B, CBNZ, LDP_POST, STP_PRE
+ 
+ BUILD_141 = 'b424be150a8e7d78701cbe7a439d9ebf'   # main 1.4.1 (game.tsv v393216)
+ 
+-# CUTS: one registered cut (0157). The VR row is forced visible: its
+-# 2P-activation gate (tbz w8, #0, hide) is removed, so the repurposed
+-# "角色选择" row is always visible. No count cut and no table cut: the
+-# title menu keeps 6 rows and Table A is unchanged (see char_select.c --
+-# a 7th row cannot be added through the table).
+-CUTS = {BUILD_141: [
+-    (0x497314, 'a8000036', '1f2003d5', 'Title menu setup: the VR row is always shown -- its 2P-activation gate (tbz w8, #0, hide) is removed, so the repurposed "角色选择" row is always visible (char_select)'),
+-]}
++# CUTS: none. The 0157 cut (0x497314 tbz -> nop) is removed in 0168:
++# the title menu's row 3 is VR again, with its original 2P-activation
++# gate, and character selection moves into the in-game shop (0167 data;
++# the 0166 confirm hook is not yet in this profile -- the confirmed row
++# cannot be identified from static code, see the game note). A build
++# that keeps Nintendo's code registers an empty CUTS list.
++CUTS = {BUILD_141: []}
+ 
+ # hud_runtime, compiled from hud_runtime.c (0137 in-game editor runtime, 0147
+ # layout-aware matcher + restore to the .bflyt base, 0150 local-matrix write,
+@@ -217,196 +216,16 @@ def _hud_runtime_frame_step(ctx):
+     emit(B(here(), 0x909da4))                  # back to the hook site + 4
+     fs_put(0x909da0, [B(0x909da0, rstart)], 'Forced recompute 0x909d4c +0x150: the in-game HUD editor runtime, re-applied after the game\'s post-Calculate refresh (hud_runtime.c)')
+ 
+-# char_select, compiled from char_select.c (0157: the title-menu character
+-# picker) with aarch64-linux-gnu-gcc -O2 -ffreestanding -fno-builtin
+-# -fno-stack-protector -fno-jump-tables -fno-unwind-tables
+-# -fno-asynchronous-unwind-tables -c, and objcopy -O binary
+-# --only-section=.text (never plain -O binary: the 0131 .eh_frame lesson).
+-# One function: char_select_decide_vr(menu, state, tableA, tableB) -- see
+-# char_select.c for the why (the VR row is repurposed; a 7th row cannot be
+-# added through the table).
+-CHAR_SELECT_WORDS = (
+-    "39416005b9401c0472001ca5540001a1b864d862528000005280000353181c84b90264222a0500842a030084b9026824b9426c2211000442b9026c22d65f03c0b864d8427100185f540000e112bfe000528000260b0000c32a0603e0b902602617ffffef528000035280000017ffffec"
+-)
+-
+-# (0157) The title-menu "角色选择" row (the repurposed VR row, title row 3,
+-# action 6, pane ParList06) and the confirm intercept that opens the picker.
+-# Two cuts, both in the title setup / confirm paths; the HUD runtime above
+-# is untouched. The first version hooked Decide's merge point (0x1d78f8);
+-# that was wrong: Decide (0x1d7800) has no BL caller and never runs the
+-# VR action -- the confirm is dispatched by the switch at 0x1d7290,
+-# called from Update (0x1d7548) and from 0x1d7184, whose action-6 case
+-# (0x1d7334) is the only path to the VR transition (0x1d7740). The
+-# intercept moved to the switch entry (fix report
+-# REPORT-CHAR-SELECT-VR-STILL.md in the staging dir).
+-#   * 0x4972f4 (title setup 0x497220, after rows 0-2 are set): the row-3
+-#     text becomes the hardcoded UTF-16 "角色选择" via List::setText.
+-#     The text is a raw UTF-16 pointer (the layout setter 0x6314e0 scans
+-#     it as UTF-16, 0x6a6180), so no MSBT label is needed. setText(row 3)
+-#     reads Table A[3] = 6 and writes panes[6] (ParList06), which exists.
+-#     The trampoline also clears [List+0x59] afterwards: the setup tail
+-#     calls the show path (0x1d6d00), which re-applies the VR label to
+-#     panes[6] whenever [List+0x59] != 0 (it is 1 from the List ctor,
+-#     0x1d6610) and would overwrite the new text. With +0x59 cleared the
+-#     show path returns at once and the row keeps "角色选择" (rows 0-2
+-#     prove setText alone displays a row's text -- they never go through
+-#     show). The CUTS NOP at 0x497314 still forces the show path to run
+-#     (so the row is not hidden); the clear only stops it re-writing.
+-#   * 0x1d7290 (the confirm switch entry): the stub recomputes the
+-#     action id from the same fields the switch reads ([x0+0x58] table
+-#     selector, [x0+0x1c] row) and, for action 6 on the title menu
+-#     (Table A), sets the host flag (state +0x260) so the picker opens
+-#     and the trampoline returns to the caller, skipping the VR action
+-#     entirely; the pause menu's VR (Table B) and actions 0-5 fall
+-#     through to the re-executed ldrb and the switch runs normally.
+-#     The trampoline passes the FULL table addresses (ADRP + ADDI):
+-#     the tables are not page-aligned, and the #72 version passed only
+-#     the page (0xec8000), so the stub read string data as the action
+-#     table and never returned 1. The stub also writes diagnostics to
+-#     state +0x264/+0x268/+0x26c on every call (action, sel/row/ret,
+-#     call counter) so the host tick can log each switch invocation.
+-# The VR row is forced visible by the CUTS entry above (the 2P-activation
+-# gate at 0x497314 is NOPed): the "角色选择" row must always show.
+-def _char_select_frame_step(ctx):
+-    here, emit, fs_site, fs_put, FS_STATE_OFF = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state
+-    char_code = here()
+-    hx = ''.join(CHAR_SELECT_WORDS)
+-    for i in range(0, len(hx), 8):
+-        emit(int(hx[i:i + 8], 16))
+-    # The confirm-switch intercept at 0x1d7290: `ldrb w11, [x0, #0x58]`.
+-    # x0 (the menu/List) and x30 (the return address into Update 0x1d754c
+-    # or 0x1d7188) are saved across the bl: the stub clobbers x0 (w0
+-    # becomes the row) and the bl clobbers x30. The stub is a leaf and
+-    # touches no callee-saved register, so nothing else needs saving.
+-    # The replaced ldrb is NOT PC-relative, so it is re-executed verbatim.
+-    # cbnz tests the stub's return value (w0), not the flags -- the stub
+-    # leaves the flags arbitrary.
+-    fs_site(0x1d7290, '0b604139')
+-    sstart = here()
+-    emit(STP_PRE(0, 30, 31, -16))              # stp x0, x30, [sp, #-16]! (live: the menu/List, the return address)
+-    emit(ADRP(1, here(), FS_STATE_OFF))         # x1 = state page
+-    # The tables are NOT page-aligned (Table A 0xec8270, Table B 0xec8288),
+-    # so ADRP alone gives the page (0xec8000) -- the #72 trampoline passed
+-    # the page as the table, the stub read string data as the action table
+-    # and never returned 1 (row 3 went to VR, log-57 had zero [char]).
+-    # ADDI the low 12 bits, like the setup trampoline does for its string
+-    # and like the game's own switch does (adrp; add).
+-    emit(ADRP(2, here(), 0xec8270))            # x2 = Table A page (title)
+-    emit(ADDI(2, 2, 0x270))                    # x2 = 0xec8270 (Table A)
+-    emit(ADRP(3, here(), 0xec8288))            # x3 = Table B page (pause)
+-    emit(ADDI(3, 3, 0x288))                    # x3 = 0xec8288 (Table B)
+-    emit(B(here(), char_code) | 0x80000000)     # bl char_select_decide_vr
+-    emit(LDP_POST(0, 30, 31, 16))              # ldp x0, x30, [sp], #16
+-    ret_at = sstart + 44
+-    emit(CBNZ(0, here(), ret_at))               # cbnz w0, ret (stub set the flag: skip the VR action)
+-    emit(0x3941600b)                            # ldrb w11, [x0, #0x58] (the replaced instruction)
+-    emit(B(here(), 0x1d7294))                  # back to the hook site + 4
+-    emit(0xd65f03c0)                            # ret (to the switch's caller)
+-    fs_put(0x1d7290, [B(0x1d7290, sstart)], 'Confirm switch entry: title VR row (action 6, Table A) opens the character picker, VR skipped (char_select)')
+-    # The row-3 text: UTF-16LE "角色选择" + NUL, emitted as data words.
+-    row3_str = here()
+-    emit(0x827289d2)                            # bytes D2 89 72 82 (角 色)
+-    emit(0x62e99009)                            # bytes 09 90 E9 62 (选 择)
+-    emit(0x00000000)                            # NUL + padding
+-    fs_site(0x4972f4, '680e40f9')
+-    rstart = here()
+-    emit(ADRP(2, here(), row3_str))             # x2 = page of the UTF-16 string
+-    emit(ADDI(2, 2, row3_str & 0xFFF))          # x2 = the UTF-16 string address
+-    emit(0xaa1403e0)                             # mov x0, x20 (the list)
+-    emit(0x52800061)                             # mov w1, #3 (row 3, the VR row)
+-    emit(B(here(), 0x1d6b70) | 0x80000000)       # bl List::setText
+-    emit(0x3901669f)                             # strb wzr, [x20, #0x59] (clear the List's "needs show" flag, so the setup tail's show path does not re-apply the VR label over the new text; x20 is callee-saved, setText preserves it)
+-    emit(0xf9400e68)                             # ldr x8, [x19, #0x18] (the replaced instruction; ldr is not PC-relative)
+-    emit(B(here(), 0x4972f8))                    # back to the hook site + 4
+-    fs_put(0x4972f4, [B(0x4972f4, rstart)], 'Title menu setup: row 3 (VR) text becomes "角色选择" (char_select)')
+-
+-# shop_probe, compiled from shop_probe.c (0164: the in-game shop character
+-# picker probe) with aarch64-linux-gnu-gcc -O2 -ffreestanding -fno-builtin
+-# -fno-stack-protector -fno-jump-tables -fno-unwind-tables
+-# -fno-asynchronous-unwind-tables -c, and objcopy -O binary
+-# --only-section=.text (never plain -O binary: the 0131 .eh_frame lesson).
+-# One function: shop_probe(shop_sub, state) -- see shop_probe.c for the why
+-# (the ItemName field offset is still open; the probe dumps, at shop-confirm
+-# time, the pointers and byte windows the ItemName string -- or the Object B
+-# pointer that leads to it -- can be read out of).
+-SHOP_PROBE_WORDS = (
+-    "f100001ffa40182454000de0a9bd7bfd910003fda90153f3aa0103f3b9730021aa0003f4528a084072aa69006b00003f5400"
+-    "00a0b9330260b933067fb9330a7fb9330e7fb973066035000b80a9025bf5f9400e95b4000bb5f94012a6910082b6b4000c46"
+-    "f94000c1b4000c81aa1603e0d63f0020b4000cc0bd407000aa0003e11e2020185400008ad2800007d280000614000007f940"
+-    "3406b4000a46f94000c6b4000a06f9409cc6aa0603e7f9198a74d2866e08f9198e75aa1403e4f9199276aa1503e2f9199661"
+-    "8b080265f9199a67aa0003e3f9199e7f91020007b933427fb933467ff919a67ff919aa7fb9335a7fb9335e7ff919b27ff919"
+-    "b67fd503201f52800001b40000603940006112001c2191000463380014a1eb07007f54ffff21d2867e05aa0603e38b050260"
+-    "910200c552800001b40000663940006112001c219100046338001401eb05007f54ffff21d2868e03910402818b030263d503"
+-    "201f3840148012001c0038001460eb04003f54ffff81d286ae00910802a38b00026152800000b40000753940004012001c00"
+-    "9100044238001420eb02007f54ffff21b9730a6052808c01a9425bf511000400b9330a60b9330661a94153f3a8c37bfdd65f"
+-    "03c0d65f03c0d2800000d2800006d2800007d2800001d280001617ffffb4d280000717ffffb2d2800000d2800007d2800001"
+-    "17ffffaed2800007d2800001d2800000d280000617ffffa9d2800006d2800007d280000117ffffa5"
+-)
+-
+-# (0164) The shop probe: one FRAME_STEP cut at the router confirm branch
+-# 0x442664 (NrvHelloNewItem's real handler 0x442560, confirm branch
+-# ~0x442664-0x44266c: after the 0x4f4f90 == 1 check, 0x4f76b0 and 0x30b4c0,
+-# the router sets the nerve to NrvSelectDecideEnd). At that point x19 is
+-# the ShopStateInShop sub-object, [x19+0x18] is the list object and
+-# [x19+0x18]+0x20 is the argument 0x50a5c0 takes; the player's "confirm
+-# selection" decision has just been made. The trampoline saves the live
+-# registers (x0 = the 0x30b4c0 result, x30 = the return address, x19 = the
+-# shop sub-object; x1 is about to be overwritten by the replaced adrp),
+-# calls shop_probe(x19, state page), restores, re-executes the replaced
+-# adrp+addi (x1 = 0x12bc9a8, NrvSelectDecideEnd -- the adrp is PC-relative,
+-# so it is re-synthesised with ADRP+ADDI from the trampoline's own PC, not
+-# copied verbatim) and branches back to 0x44266c (the b #0x442890). The
+-# game's own confirm flow is untouched: the stub returns void, writes only
+-# the probe buffer (state +0x3300), and never suppresses the buy. The host
+-# (hud_manual.c, dm_shop_probe_tick, once per present) drains the buffer
+-# into "[shop] ..." log lines and resets it, so the stub can fire again
+-# on the next confirm.
+-def _shop_probe_frame_step(ctx):
+-    here, emit, fs_site, fs_put, FS_STATE_OFF = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state
+-    probe_code = here()
+-    hx = ''.join(SHOP_PROBE_WORDS)
+-    for i in range(0, len(hx), 8):
+-        emit(int(hx[i:i + 8], 16))
+-    # The router confirm branch at 0x442664: `adrp x1, #0x12bc000`.
+-    # x0 (the 0x30b4c0 result) and x30 (the return address into the
+-    # router's caller) are saved across the bl: the stub clobbers x0 and
+-    # the bl clobbers x30. x19 (the shop sub-object) is passed to the stub
+-    # and saved too; x1 is about to be overwritten by the replaced adrp.
+-    # The replaced adrp+addi are NOT PC-relative-safe to re-execute
+-    # verbatim (adrp computes from the PC), so they are re-synthesised:
+-    # ADRP from the trampoline's PC to the 0x12bc000 page, ADDI 0x9a8.
+-    # The branch back is to the hook site + 8 (0x44266c), skipping both
+-    # replaced instructions; the flags do not matter (the branch is
+-    # unconditional and the stub leaves no flag dependency behind).
+-    fs_site(0x442664, 'c17300d0')
+-    sstart = here()
+-    emit(STP_PRE(0, 30, 31, -16))              # stp x0, x30, [sp, #-16]! (live: the 0x30b4c0 result, the return address)
+-    emit(STP_PRE(19, 1, 31, -16))              # stp x19, x1, [sp, #-16]! (live: the shop sub-object; x1 is about to be overwritten)
+-    emit(0xaa1303e0)                            # mov x0, x19 (the shop sub-object -> probe arg 0)
+-    emit(ADRP(1, here(), FS_STATE_OFF))         # x1 = state page (probe arg 1; the stub adds SHOP_PROBE_OFF 0x3300 itself)
+-    emit(B(here(), probe_code) | 0x80000000)     # bl shop_probe
+-    emit(LDP_POST(19, 1, 31, 16))               # ldp x19, x1, [sp], #16
+-    emit(LDP_POST(0, 30, 31, 16))               # ldp x0, x30, [sp], #16
+-    emit(ADRP(1, here(), 0x12bc9a8))            # x1 = 0x12bc000 page (the replaced adrp, re-synthesised)
+-    emit(ADDI(1, 1, 0x9a8))                     # x1 = 0x12bc9a8 (the replaced addi; NrvSelectDecideEnd)
+-    emit(B(here(), 0x44266c))                   # back to the hook site + 8
+-    fs_put(0x442664, [B(0x442664, sstart)], 'Shop confirm branch: the shop probe (shop_probe.c) dumps the shop structure at confirm time, game flow untouched')
+-
+ def _frame_step_141(ctx):
+     _hud_runtime_frame_step(ctx)
+-    _char_select_frame_step(ctx)
+-    _shop_probe_frame_step(ctx)
+ 
+ FRAME_STEP = {BUILD_141: _frame_step_141}
+ 
+ BINDING = [
+-    {'what': "Character picker on the title menu, v1 (char_select.c, 0157: the VR row -- title row 3, action 6, pane ParList06 -- is repurposed as the '角色选择' row. A 7th row cannot be added through the table: the List ctor (0x1d6610, called once from 0x495504 with w5 = 7) allocates the pane array as count * 8 = 56 bytes (7 entries, actions 0-6), the layout has exactly 7 row panes (ParList00-06), and Table A has 6 entries [0,1,2,6,3,5] -- Table B starts right after it (0xec8288), so there is no Table A[6], so writing 7 there would break the pause menu's Continue row. The VR row is repurposed instead: VR on iPhone is barely usable, the pause menu keeps its own VR row (Table B[2] = 6), and the switch stub tells the two apart by the table selector ([list+0x58]: 1 = title Table A, 0 = pause Table B). One CUTS entry NOPs the VR row's 2P-activation gate (0x497314 tbz -> nop) so the row always shows. Two FRAME_STEP cuts: (a) title setup 0x4972f4 sets row 3's text to the hardcoded UTF-16 '角色选择' via List::setText -- the text is a raw UTF-16 pointer (the layout setter 0x6314e0 scans it as UTF-16, 0x6a6180), so no MSBT label is needed, and setText(row 3) reads Table A[3] = 6 and writes panes[6] (ParList06), which exists; (b) the confirm switch entry 0x1d7290 (the switch is the real confirm dispatcher -- Decide 0x1d7800 has no BL caller and never runs the VR action; the switch's action-6 case 0x1d7334 is the only path to the VR transition) recomputes the action id from the same fields the switch reads ([x0+0x58] selector, [x0+0x1c] row) and, for action 6 on the title menu, sets the host flag (state +0x260) so the picker opens and returns to the caller, skipping the VR action entirely; the pause menu's VR and actions 0-5 fall through to the switch normally. The setup trampoline also clears [List+0x59] after setting the text, so the setup tail's show path (0x1d6d00) does not re-apply the VR label over it (the first version's text was overwritten this way). The host flag is polled once per present (dm_char_select_frame_tick, uw.c) and opens CharSelectEditor. The model/costume redirect lives in the host filesystem layer (dm_char_redirect in hle_fs.c): the game never names the player model in code, so there is no game-binary hook for the model; DM_CHAR_SELECT (mario/luigi/wario) + DM_CHAR_CAP / DM_CHAR_CLOTHES (costume name, 'default', or unset = follow the save) rewrite rom:/ObjectData/Mario*.szs to the selected character's versions (Luigi.szs, WarioColorWarioHead.szs, ...) from the romfs-overlay, only when the overlay has the target, falling back to the character's default part so an unadapted costume never turns the player back into Mario and never fails the open. The picker UI (CharSelectEditor, ObjC) reuses the game's own parts: title-menu SelectMenuParts rows for the characters, a Closet-style horizontal strip for the costumes, and the game's own font (dm/font/standard.ttf). Persistence is NSUserDefaults DmCharSelect.* (character + cap + clothes), applied into DM_CHAR_* at launch by the launcher (like DmHudPad.*) and live via setenv (like DM_HUD_*). Models ship in dm/romfs-overlay/ObjectData/ as Luigi*.szs / Wario*.szs (95 files, ~39 MB: Luigi defaults + 3 adapted costumes, Wario defaults + 10 adapted costume sets); Mario uses the base RomFS files. Peach/Toad/Pauline are not in this round (no ready models) and are not listed.", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
+-     'why': "The title menu's List is built for exactly 7 actions and the table has 6 entries, so a new row cannot be added through the table -- the VR row is the only repurposable one, and the stub discriminates title from pause by the table selector so the pause menu's VR is untouched. The row text needs no MSBT work because the layout setter reads a raw UTF-16 pointer. The model has no game-binary hook (the name comes from data through the CRC32-hashed resource system), so the redirect lives in the host filesystem layer where every open's full guest path is visible, and it only rewrites to a file the overlay actually has, so an unadapted costume falls back to the character's default instead of reverting to Mario or failing the open. The picker reuses the game's own UI parts (SelectMenuParts rows, Closet strip, game font) so it looks like the game, not an iOS overlay.",
+-     'blocked': 'device test: the row must read 角色选择 (the show-path overwrite is fixed by the +0x59 clear, proven by disassembly; if it still shows the VR label, the text-set moves to the List Appear hook); the picker must open on picking the row (the switch hook replaces the dead Decide hook -- if it does not open, the next step is a probe log in the switch trampoline); Luigi/Wario must load with the right body/head/cap on device (Wario FSKL is 50% larger than Mario, needs device confirmation)'},
++    {'what': "Character picker in the in-game shop (0167/0168): three character rows at the top of SystemData/ItemList.szs (BYML 0,1,2: Mario, Luigi, Wario; ItemType Clothes, Price 0, no StoreName, so they are the first three filtered rows in every shop), with an overlay ObjectData/Luigi2D.szs shop icon (built like the overlay Wario2D.szs) and MSBT name labels for Luigi/Wario in ItemCloth.msbt (Mario's labels already exist). The title menu's row 3 is VR again: the 0157 repurpose is reverted (the 0x497314 CUTS NOP, the 0x4972f4 row-3 text cut and the 0x1d7290 confirm-switch intercept are removed, the UIKit CharSelectEditor and its 133 preview PNGs are deleted, and the picker persistence lives on in CharSelectPersist.m, which applies the saved DmCharSelect.* into DM_CHAR_* at launch). The model/costume redirect lives in the host filesystem layer (dm_char_redirect in hle_fs.c): the game never names the player model in code, so there is no game-binary hook for the model; DM_CHAR_SELECT (mario/luigi/wario) + DM_CHAR_CAP / DM_CHAR_CLOTHES (costume name, 'default', or unset = follow the save) rewrite rom:/ObjectData/Mario*.szs and content:/ObjectData/Mario*.szs to the selected character's versions (Luigi.szs, WarioColorWarioHead.szs, ...) from the romfs-overlay, only when the overlay has the target, with the 0163/0165 family guard (a non-empty core maps only to a same-core file, otherwise the original is kept, so an unadapted costume never turns the player back into Mario and never fails the open). Models ship in dm/romfs-overlay/ObjectData/ as Luigi*.szs / Wario*.szs (95 files, ~39 MB: Luigi defaults + 3 adapted costumes, Wario defaults + 10 adapted costume sets); Mario uses the base RomFS files. Peach/Toad/Pauline are not in this round (no ready models) and are not listed. The guide tap fix rides with this: DmGamepad.m no longer treats the left half as the floating-stick area while a web page is shown, so guide menu items on the left half are tappable.", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
++     'why': "The title menu's List is built for exactly 7 actions and Table A has 6 entries, so a new row cannot be added through the table (the 0157 analysis is kept in the game note); the shop list is the only in-game list that already shows every costume, and its rows are data (ItemList.byml), so adding character rows needs no game-binary hook. The model has no game-binary hook (the name comes from data through the CRC32-hashed resource system), so the redirect lives in the host filesystem layer where every open's full guest path is visible, and it only rewrites to a file the overlay actually has. The shop icon is a BFRES whose FMDL is renamed to Mario2D, the same construction as the overlay Wario2D.szs, because the shop loads ObjectData/<ItemName>2D.szs for the row icon.",
++     'blocked': "write-back (0166) is the open item and blocks shipping this as a working picker: buying a character row must persist DM_CHAR_SELECT, but the confirmed row cannot be identified from static code. The fs-preview route is refuted by log-64: the shop opens every row's body file while building the list (74 bodies, in order, before any confirm) and opens nothing new at confirm time, so the last file open is the last row built, not the selected row. The 0x50a5c0 selected-item accessor's +0x70 is a float (fcmp s0, #0.0), not a row index, and NrvSelectDecideEnd (0x442980) is cleanup, not the buy. The list NrvDecide hook point 0x2e8dfc (mov x22, x0) is verified byte-for-byte and can set a confirm flag, but the flag alone does not name the row. Device test once the write-back lands: the shop shows the three rows with the right names and icons, buying one switches the character in-game and it stays switched across a level load and on the title screen, the guide's left-half items are tappable, and row 3 on the title menu is VR again. Also device test: Wario FSKL is 50 percent larger than Mario, needs device confirmation; an unadapted costume body redirect (Mario.szs to Luigi.szs) is unproven on device."},
+     {'what': "HUD editor runtime, v17 (hud_runtime.c, 0151: three cuts -- entry +0x20 at 0x9094b4, +0x13c at 0x9095d0, and the forced-recompute cut at 0x909da0 inside 0x909d4c; applies ONLY the editor manual deltas from the DM_HUD_* environment variables via hud_manual.c, state page +0x200: 18 floats dx/dy/k for elements 0 compass, 1 lives, 2 coins, 3 moons, 4 hints (unused), 5 regional coins, manual mask +0x248, hidden mask +0x24C; dx clamped +-640, dy +-360, k clamped [0.6, 1.8]; no auto-edge term -- the edge anchor lives in the 0136/0143 .bflyt overlay, so the edge is never applied twice. 0150 writes the pane LOCAL matrix (+0xa0) as well as +0x30/+0x48 and +0x70: Pane::Calculate recomposes +0x70 from the +0xa0 matrix every frame, so a +0x70 write alone is wiped on the next Calculate (the #65 drag failure -- 0147 never wrote the matrix, the e_mod recompute check then mistook the wipe for a game recompose and polluted the stored original, and every later write became a no-op). The runtime stores the original local matrix per entry (e_lm0, entry +128, 12 floats; a NULL +0xa0 skips only the matrix write) and re-derives the matrix write from it with the ABSOLUTE target (tdx/tdy/tk); the restore writes the matrix back to e_lm0 too; the e_mod recompute check only follows e_mod when the live local matrix still holds the shift (a stale-matrix recompose leaves e_mod alone and the write re-applies). Table entry 128 -> 176 bytes, HUD_EDGE_SLOTS_PER_ELEM 16 -> 11 (66 entries, state +0x300..+0x3060, short of the diagnostic probe buffer at +0x3300; the 0147 matcher takes one 'All' per layout instance, so eleven slots per element is still several times the realistic maximum). 0151 S1: the per-frame layout driver (0xa1cb80) restores a counter All pane's local to base and recomposes +0x70 from it AFTER the +0x13c hook and BEFORE Draw, via the forced recompute 0x9036cc -> 0x909d4c (only caller the driver at 0xa1cdf8, force=1), bypassing both Calculate cuts -- the #66 wipe (only the compass moved); the third cut at 0x909da0 (after 0x909d4c's own recompute, before its children loop) re-applies the shift there. 0151 S2: the bit-7 guard moved to after the matcher -- a hidden pane's Calculate clears bit 7, so the old guard skipped it forever and hide->show was dead (#66); a matched pane with a table entry is never skipped now, while a never-calculated pane with no entry is still skipped on its first frame. 0151 S3: an All with a 'PicView' child matches compass (MapMiniPlayer's red needle; MapPlayer's PicView sits under Icon00, so the full-screen map does not match). 0147 layout-aware matcher: only a layout's 'All' container is ever matched (the display side), identified by its direct children -- compass: 'PicMap' child (MapMini) or 'PicView' child (MapMiniPlayer); lives: 'Life' child (CounterLife/Kids/Up); moons: 'Shine' child with a 'TxtShine' child (CounterShine); coins/regional: 'Add' child, told apart by the 'Capture' sibling's tx under the same RootPane (0 = CounterCoin, 130 = CounterCollectCoin; another tx falls back to All tx, nearest of -740/-615; no Capture sibling matches nothing). The old name matcher is gone: 'PicStrap' (BootLoading strip), 'Counter' (moon-tower container), 'TxtGuide01' (hints) and the capture content panes ('TxtCounterSh'/'TxtCounter'/'TxtIconSh'/'TxtIcon' under Capture00-03) are never matched -- moving content panes emptied the 128x128 capture texture (R1, log-51: a manual value moved the glyphs out of the texture and restoring never repainted it), and the name matches hit the wrong layouts (R2). Hints and the white bar have no matcher entry and stay hidden in the overlay. Restore: a mask-0 element takes no table entry and writes nothing; a pane with an existing entry has its local (+0x30/+0x48) and its local matrix (+0xa0) written back to e_orig / e_lm0 (its first-seen local, the overlay's default edge position) and is marked dirty (flags bit 4) so the game recomposes +0x70 from the restored matrix; +0x70 itself is never restored to e_mod; once restored and visible the entry is released. Each element takes 1 slot (its All container). Hide is a TRUE hide (flags bit 0 at +0x58 cleared), only on matched All containers. 0137/0142 kept: +0x70 is written directly at the +0x13c cut from the stored original global (e_mod) and the local as fallback; the global write uses the ABSOLUTE target (tdx/tdy/tk, stored in e_orig slots [1]/[2]/[4]) while the local uses the parent-compensated delta; a dirty flag so a moved container carries its children, an orig/mod table so a fixed offset never drifts. The 0118 auto-edge code (hud_edge.c, _hud_edge_frame_step, HUD_EDGE_WORDS) and the diagnostic probe (HUD_PROBE_WORDS, hud_probe.c) are deleted from this profile -- the probe stays a diagnostic tool only, never shipped", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
+      'why': "Pane::Calculate and the pane layout are this build's nn::ui2d code, found by the HUDLOG diagnostic run (log-17) and confirmed by disassembly of DmIOS. The manual settings come from the HUD editor through the same environment-variable channel the launcher already uses for its other settings (DM_SCREEN_ASPECT), so the game reads nothing new: the host copies them to state page +0x200 once per present. The .bflyt ground truth (REPORT-HUD-REDO.md B, all 215 layouts parsed) is why the matcher is layout-aware: the coins and regional-coins content panes share names across two layouts, the capture texture mechanism means only the All container may move, and 'Counter'/'PicStrap' name matches hit the moon tower and the BootLoading strip. The old name matcher moved content panes and emptied the capture texture (log-50/51: coins and regional coins vanished after a manual value, and restoring the default never repainted the texture). The runtime keeps no user-adjustable state in the game beyond the orig/mod table, and its only tree walks are the bounded child-name checks and the bounded flag-only mark-dirty, so the 0113 crash class (a name/match walk reading a pane through a bad pointer) is structurally absent",
+      'blocked': 'the stubs have no function-matched form yet'},
+-    {'what': "Shop probe, diagnostic only (shop_probe.c, 0164: one FRAME_STEP cut at the router confirm branch 0x442664, NrvHelloNewItem's real handler 0x442560 -- the confirm branch at ~0x442664-0x44266c, after the 0x4f4f90 == 1 check, 0x4f76b0 and 0x30b4c0, where the router sets the nerve to NrvSelectDecideEnd. At that point x19 is the ShopStateInShop sub-object, [x19+0x18] is the list object and [x19+0x18]+0x20 is the argument 0x50a5c0 takes. The trampoline saves the live registers (x0 = the 0x30b4c0 result, x30 = the return address, x19 = the shop sub-object), calls shop_probe(x19, state page), restores, re-synthesises the replaced adrp+addi (x1 = 0x12bc9a8) and branches back to 0x44266c. The stub dumps, per shop confirm, into the probe buffer (state +0x3300): x19, list, list+0x20, A = vtable[0](list+0x20) (the selected list-item UI object), x22 = 0x50a5c0(list+0x20) (replicated inline: NULL when *(A+0x70) < 0, else *(vtable(*(A+0x68)) + 0x138)), 0x80 bytes of A, 0x80 bytes of x22, 0x100 bytes of the shop sub-object and 0x200 bytes of the list object. Object B's holder offset is still unpinned statically, so its pointer is not read directly: it must live in the x19/list windows, and the log reader identifies it there by shape (an object whose +0x18 is a small count and whose +0x20 points at a 0x20-strided array whose entries' +0x00 include A). Every pointer is NULL-guarded; a NULL yields a zero field / zero-filled window, never a fault. The stub returns void, writes only the probe buffer, and never suppresses the buy; the host (hud_manual.c, dm_shop_probe_tick, once per present) drains the buffer into '[shop] ...' log lines and resets it. Delete after use; never ship.", 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
+-     'why': "Static tracing cannot resolve the ItemName field offset: the 0x50a5c0/x22 route ends in a UI-layer item-data object whose typeinfos are runtime-constructed in BSS (their names are not recoverable from the file), the UI object's +0x150 is an animation name (proved, not ItemName), and ItemName lives in the BYML/source layer, read by hash, so no static xref path exists. One device run with this logging cut reads the shop structure out of the log, then the hook offset is fixed and the probe is deleted.",
+-     'blocked': 'device run: open any shop, select any item, confirm, send the log; the ItemName string (or the Object B pointer) is read out of the [shop] lines, then the v1 hook offset is fixed'},
+ ]
+diff --git a/dm/games/0100000000010000/shop_probe.c b/dm/games/0100000000010000/shop_probe.c
+deleted file mode 100644
+index f21f59a..0000000
+--- a/dm/games/0100000000010000/shop_probe.c
++++ /dev/null
+@@ -1,187 +0,0 @@
+-// shop_probe.c -- diagnostic probe (0164). Adds logging only; changes no game behavior.
+-//
+-// The user authorised one probe build after static tracing hit a wall:
+-// the ItemName field offset is still open (REPORT-CHAR-INGAME-S6-ITEMNAME.md).
+-// The 0x50a5c0/x22 route does not lead to ItemName (x22 is a UI-layer
+-// item-data object; its typeinfos are runtime-constructed in BSS), the UI
+-// object's +0x150 is an animation name (not ItemName, proved), and ItemName
+-// lives in the BYML/source layer, read by hash -- so no static xref path
+-// exists. This probe dumps, at shop-confirm time, everything reachable
+-// from the confirm branch so the ItemName string (or the Object B pointer
+-// that leads to it) can be read out of the device log.
+-//
+-// Hook site: the router confirm branch at 0x442664 (NrvHelloNewItem's real
+-// handler 0x442560; NSO vaddr). At that point x19 is the ShopStateInShop
+-// sub-object, [x19+0x18] is the list object, and [x19+0x18]+0x20 is the
+-// argument 0x50a5c0 takes. The trampoline (patches.py) saves the live
+-// registers, calls this stub with (x19, state page), restores, re-executes
+-// the replaced adrp+addi (x1 = 0x12bc9a8, NrvSelectDecideEnd) and returns
+-// to 0x44266c. The game's own confirm flow is untouched: the stub returns
+-// void, writes only the probe buffer, and never suppresses the buy.
+-//
+-// What is dumped (see the host drain in hud_manual.c, dm_shop_probe_tick):
+-//   x19, list = [x19+0x18], list_arg = list+0x20,
+-//   A = vtable[0](list_arg) (the selected list-item UI object),
+-//   x22 = 0x50a5c0(list_arg) (replicated inline: NULL when *(A+0x70) < 0,
+-//     else *(vtable(*(A+0x68)) + 0x138)),
+-//   0x80 bytes of A, 0x80 bytes of x22 (pointer values resolve offline
+-//     against the NSO's string table -- that is how a name field is found),
+-//   0x100 bytes of the shop sub-object (x19) and 0x200 bytes of the list
+-//     object. Object B's holder offset is still unpinned statically, so
+-//     its pointer is NOT read directly: it must live in one of those two
+-//     windows (it is stored in the shop state or the list object), and
+-//     the log reader identifies it there by shape (an object whose +0x18
+-//     is a small count and whose +0x20 points at a 0x20-strided array
+-//     whose entries' +0x00 include A). The objB/src fields in the dump
+-//     are therefore zero, documented, and not read.
+-// Every pointer is NULL-guarded before it is dereferenced; a NULL anywhere
+-// yields a zero field / zero-filled window, never a fault. The stub fires
+-// once per shop confirm; if the host has not drained the previous dump
+-// (len != 0) the call returns without writing, so a dump is never torn.
+-//
+-// Compiled with: aarch64-linux-gnu-gcc -O2 -ffreestanding -fno-builtin
+-//   -fno-stack-protector -fno-jump-tables -fno-unwind-tables
+-//   -fno-asynchronous-unwind-tables -c,
+-//   objcopy -O binary --only-section=.text (never plain -O binary: the
+-//   0131 .eh_frame lesson). The function takes everything through its
+-//   arguments -- no static data, no literal pool, no external calls -- so
+-//   the emitted words are position-independent and relocation-free and can
+-//   be dropped into the rewriter's patch area verbatim:
+-//   x0 = the shop sub-object (x19 at the hook site), x1 = the state page.
+-//   Delete after use; never ship.
+-
+-typedef unsigned int u32;
+-typedef unsigned long long u64;
+-typedef unsigned long uintptr_t;
+-
+-// The probe buffer (state + 0x3300, 3328 bytes: the frame-step state page
+-// is 0x4000 bytes and the hud_edge table ends at +0x3060, so +0x3300 is
+-// past it; the HUD probe buffer lives at the same offset, but its stub is
+-// not in this build and its drain keys on its own magic "PRBE", so the two
+-// never interact). Header 16 bytes, dump 0x460 bytes: 0x470 total.
+-#define SHOP_PROBE_OFF 0x3300
+-#define SHOP_PROBE_MAGIC 0x53485042u   // "SHPB"
+-#define SHOP_PROBE_DUMP_LEN 0x460
+-// Header offsets (relative to probe_buf).
+-#define SP_MAGIC 0
+-#define SP_LEN 4
+-#define SP_FIRE 8
+-#define SP_RESERVED 12
+-// Dump offsets (relative to probe_buf + 0x10).
+-#define SP_D_X19 0x00
+-#define SP_D_LIST 0x08
+-#define SP_D_LIST_ARG 0x10
+-#define SP_D_A 0x18
+-#define SP_D_X22 0x20
+-#define SP_D_OBJB 0x28
+-#define SP_D_OBJB_COUNT 0x30
+-#define SP_D_OBJB_ARRAY 0x38
+-#define SP_D_SRC 0x40
+-#define SP_D_SRC_COUNT 0x48
+-#define SP_D_SRC_ARRAY 0x50
+-#define SP_D_RESERVED 0x58
+-#define SP_D_A_BYTES 0x60        // 0x80 bytes
+-#define SP_D_X22_BYTES 0xe0      // 0x80 bytes
+-#define SP_D_X19_BYTES 0x160     // 0x100 bytes
+-#define SP_D_LIST_BYTES 0x260    // 0x200 bytes
+-#define SP_D_A_LEN 0x80
+-#define SP_D_X22_LEN 0x80
+-#define SP_D_X19_LEN 0x100
+-#define SP_D_LIST_LEN 0x200
+-
+-// Store a u64 / u32 into the probe buffer (volatile: one access, exactly
+-// as written -- no vectorising, no combining; the buffer is shared with
+-// the host, which sets nothing here but drains the dump).
+-static inline __attribute__((always_inline)) void sp_put_u64(volatile char *base, int off, u64 v) {
+-    *(volatile u64 *)(base + off) = v;
+-}
+-static inline __attribute__((always_inline)) void sp_put_u32(volatile char *base, int off, u32 v) {
+-    *(volatile u32 *)(base + off) = v;
+-}
+-
+-// Copy n bytes from game memory into the probe buffer, one byte at a time
+-// (volatile on both sides: no vectorising, no widening, no reading past
+-// the window). A NULL source fills with zeros.
+-static inline __attribute__((always_inline)) void sp_copy_bytes(volatile char *dst, const void *src, int n) {
+-    const volatile unsigned char *s = (const volatile unsigned char *)src;
+-    for (int i = 0; i < n; i++) dst[i] = src ? s[i] : 0;
+-}
+-
+-// A = vtable[0](list_arg): the selected list-item UI object. This is the
+-// first step 0x50a5c0 takes (ldr x8,[x0]; ldr x8,[x8]; blr x8). Every
+-// pointer is guarded; a NULL anywhere yields NULL, never a fault.
+-static inline __attribute__((always_inline)) void *sp_get_a(void *list_arg) {
+-    if (!list_arg) return 0;
+-    void *vt = (void *)*(volatile void **)list_arg;
+-    if (!vt) return 0;
+-    typedef void *(*get_t)(void *);
+-    get_t f = *(volatile get_t *)vt;
+-    if (!f) return 0;
+-    return f(list_arg);
+-}
+-
+-// x22 = 0x50a5c0(list_arg), replicated inline (no call into the game, so
+-// no calling-convention risk): NULL when *(A+0x70) < 0 (the float gate),
+-// else *(vtable(*(A+0x68)) + 0x138) -- vtable entry #39 of the sub-object
+-// at *(A+0x68). Verified against the 0x50a5c0 disassembly
+-// (REPORT-CHAR-INGAME-S6-ITEMNAME.md §1.1).
+-static inline __attribute__((always_inline)) void *sp_get_x22(void *a) {
+-    if (!a) return 0;
+-    float g = *(volatile float *)((char *)a + 0x70);
+-    if (!(g >= 0.0f)) return 0;   // gate: < 0 (or NaN) -> NULL, as fcmp + b.ge
+-    void *sub = (void *)*(volatile void **)((char *)a + 0x68);
+-    if (!sub) return 0;
+-    void *subt = (void *)*(volatile void **)sub;
+-    if (!subt) return 0;
+-    return (void *)*(volatile void **)((char *)subt + 0x138);
+-}
+-
+-void shop_probe(void *shop_sub, unsigned char *state) {
+-    if (!shop_sub || !state) return;
+-    volatile char *buf = (volatile char *)state + SHOP_PROBE_OFF;
+-    volatile u32 *hdr = (volatile u32 *)buf;
+-    // Initialise the header the first time (the state page starts zeroed).
+-    if (hdr[SP_MAGIC / 4] != SHOP_PROBE_MAGIC) {
+-        hdr[SP_MAGIC / 4] = SHOP_PROBE_MAGIC;
+-        hdr[SP_LEN / 4] = 0;
+-        hdr[SP_FIRE / 4] = 0;
+-        hdr[SP_RESERVED / 4] = 0;
+-    }
+-    // The host has not drained the previous dump yet: return without
+-    // writing, so a dump is never torn or overwritten mid-read.
+-    if (hdr[SP_LEN / 4] != 0) return;
+-    volatile char *d = buf + 0x10;
+-
+-    void *x19 = shop_sub;
+-    void *list = (void *)*(volatile void **)((char *)x19 + 0x18);
+-    void *list_arg = list ? (char *)list + 0x20 : 0;
+-    void *a = sp_get_a(list_arg);
+-    void *x22 = sp_get_x22(a);
+-
+-    // Pointer block. Object B and the source container are zero: their
+-    // holder offsets are unpinned (see the header comment) -- the reader
+-    // finds Object B in the x19/list windows below by shape.
+-    sp_put_u64(d, SP_D_X19, (u64)(uintptr_t)x19);
+-    sp_put_u64(d, SP_D_LIST, (u64)(uintptr_t)list);
+-    sp_put_u64(d, SP_D_LIST_ARG, (u64)(uintptr_t)list_arg);
+-    sp_put_u64(d, SP_D_A, (u64)(uintptr_t)a);
+-    sp_put_u64(d, SP_D_X22, (u64)(uintptr_t)x22);
+-    sp_put_u64(d, SP_D_OBJB, 0);
+-    sp_put_u32(d, SP_D_OBJB_COUNT, 0);
+-    sp_put_u32(d, SP_D_OBJB_COUNT + 4, 0);
+-    sp_put_u64(d, SP_D_OBJB_ARRAY, 0);
+-    sp_put_u64(d, SP_D_SRC, 0);
+-    sp_put_u32(d, SP_D_SRC_COUNT, 0);
+-    sp_put_u32(d, SP_D_SRC_COUNT + 4, 0);
+-    sp_put_u64(d, SP_D_SRC_ARRAY, 0);
+-    sp_put_u64(d, SP_D_RESERVED, 0);
+-    // Byte windows (NULL sources fill with zeros).
+-    sp_copy_bytes(d + SP_D_A_BYTES, a, SP_D_A_LEN);
+-    sp_copy_bytes(d + SP_D_X22_BYTES, x22, SP_D_X22_LEN);
+-    sp_copy_bytes(d + SP_D_X19_BYTES, x19, SP_D_X19_LEN);
+-    sp_copy_bytes(d + SP_D_LIST_BYTES, list, SP_D_LIST_LEN);
+-    // Publish: fire count first, length last -- the host only reads the
+-    // dump once len is non-zero, so it can never see a partial dump.
+-    hdr[SP_FIRE / 4] = hdr[SP_FIRE / 4] + 1;
+-    hdr[SP_LEN / 4] = SHOP_PROBE_DUMP_LEN;
+-}
+diff --git a/dm/host/hud_manual.c b/dm/host/hud_manual.c
+index f79bda9..920201f 100644
+--- a/dm/host/hud_manual.c
++++ b/dm/host/hud_manual.c
+@@ -248,107 +248,10 @@ static void dm_hud_probe_tick(void) {
+     hdr[2] = 0;   // reset the record count; the stub appends from 0 again
+ }
+ 
+-// ---------- Character selection (0157) ----------
+-// The guest switch stub (char_select.c, the confirm-switch cut at 0x1d7290)
+-// sets state +0x260 when the player picks the title menu's "角色选择" row
+-// (the repurposed VR row, action 6, Table A). This runs once per present
+-// (from dm_hud_manual_frame_tick, which uw.c calls every present) and
+-// opens the picker. The flag is cleared here so the picker opens once per
+-// pick. dm_char_select_open_editor is CharSelectEditor.m (it dispatches to
+-// the main thread; UIKit must run there). The slot is in the free zone
+-// +0x250..+0x300 (the HUD masks end at +0x250, the HUD table starts at
+-// +0x300). The stub also writes diagnostics to +0x264/+0x268/+0x26c on
+-// every switch call (action, sel/row/ret, call counter); the tick logs
+-// each invocation once so the device run proves what the hook sees.
+-#define CHAR_SELECT_FLAG_OFF 0x260
+-#define CHAR_SELECT_DIAG_ACTION_OFF 0x264
+-#define CHAR_SELECT_DIAG_MISC_OFF 0x268
+-#define CHAR_SELECT_COUNT_OFF 0x26c
+-void dm_char_select_open_editor(void);   // CharSelectEditor.m
+-static uint32_t g_char_select_last_count;   // last switch-call counter logged
+-static void dm_char_select_frame_tick(uint8_t *st) {
+-    // Diagnostic (#72 fix): log every switch invocation the stub saw.
+-    // Independent of the flag -- a Confirm that computes the wrong
+-    // action (e.g. the guide row) is exactly what the log needs to show.
+-    volatile uint32_t *count = (volatile uint32_t *)(st + CHAR_SELECT_COUNT_OFF);
+-    if (*count != g_char_select_last_count) {
+-        g_char_select_last_count = *count;
+-        uint32_t action = *(volatile uint32_t *)(st + CHAR_SELECT_DIAG_ACTION_OFF);
+-        uint32_t misc = *(volatile uint32_t *)(st + CHAR_SELECT_DIAG_MISC_OFF);
+-        LOG("[char] switch #%u sel=%u row=%u action=%d ret=%u",
+-            *count, misc & 0xff, (misc >> 8) & 0xff, (int32_t)action, (misc >> 24) & 0xff);
+-    }
+-    volatile uint32_t *flag = (volatile uint32_t *)(st + CHAR_SELECT_FLAG_OFF);
+-    if (*flag != 1) return;
+-    *flag = 0;
+-    LOG("[char] title menu: character picker requested (state +0x260)");
+-    dm_char_select_open_editor();
+-}
+-
+-// ---------- Shop probe (0164, diagnostic only) ----------
+-// The guest stub (shop_probe.c, the confirm-branch cut at 0x442664) writes
+-// one dump per shop confirm into the frame-step state page at +0x3300
+-// (the HUD probe buffer region; the HUD probe stub is not in this build,
+-// so the region is free -- this drain keys on its own magic "SHPB", and
+-// dm_hud_probe_tick keys on "PRBE", so the two never interact).
+-// Layout: +0x00 u32 magic "SHPB", +0x04 u32 len (dump bytes, 0 = empty),
+-// +0x08 u32 fire count, +0x0C u32 reserved; +0x10 the dump (0x460 bytes):
+-//   +0x00 u64 x19 (shop sub-object), +0x08 u64 list ([x19+0x18]),
+-//   +0x10 u64 list_arg (list+0x20), +0x18 u64 A (selected UI object),
+-//   +0x20 u64 x22 (0x50a5c0 return), +0x28 u64 objB (0: holder unpinned),
+-//   +0x30 u32 objB_count, +0x38 u64 objB_array, +0x40 u64 src,
+-//   +0x48 u32 src_count, +0x50 u64 src_array, +0x58 u64 reserved,
+-//   +0x60 A bytes 0x00-0x7F, +0xE0 x22 bytes 0x00-0x7F,
+-//   +0x160 x19 bytes 0x00-0xFF, +0x260 list bytes 0x00-0x1FF.
+-// The host logs the dump once per present and resets len, so the stub can
+-// fire again on the next confirm. The hex lines carry a region label
+-// (ptrs/A/x22/x19/list) so the reader knows which window a byte came
+-// from; pointer values resolve offline against the NSO's string table.
+-// Delete after use; never ship.
+-#define SHOP_PROBE_OFF 0x3300
+-#define SHOP_PROBE_MAGIC 0x53485042u   // "SHPB"
+-#define SHOP_PROBE_LEN 0x460
+-static void dm_shop_probe_tick(void) {
+-    uint8_t *st = dm_fps_state;
+-    if (!st) return;
+-    uint8_t *pb = st + SHOP_PROBE_OFF;
+-    uint32_t *hdr = (uint32_t *)pb;
+-    if (hdr[0] != SHOP_PROBE_MAGIC) return;   // the stub has not fired yet
+-    uint32_t len = hdr[1];
+-    if (len == 0) return;   // nothing to drain
+-    if (len > SHOP_PROBE_LEN) len = SHOP_PROBE_LEN;
+-    uint32_t fire = hdr[2];
+-    uint8_t *d = pb + 0x10;
+-    uint64_t x19 = *(uint64_t *)(d + 0x00);
+-    uint64_t list = *(uint64_t *)(d + 0x08);
+-    uint64_t list_arg = *(uint64_t *)(d + 0x10);
+-    uint64_t a = *(uint64_t *)(d + 0x18);
+-    uint64_t x22 = *(uint64_t *)(d + 0x20);
+-    LOG("[shop] probe #%u x19=0x%llx list=0x%llx list+0x20=0x%llx A=0x%llx x22=0x%llx objB=0 src=0",
+-        fire, (unsigned long long)x19, (unsigned long long)list,
+-        (unsigned long long)list_arg, (unsigned long long)a, (unsigned long long)x22);
+-    for (uint32_t off = 0; off < len; off += 64) {
+-        uint32_t n = len - off;
+-        if (n > 64) n = 64;
+-        const char *region = off < 0x60 ? "ptrs" : off < 0xe0 ? "A" : off < 0x160 ? "x22" : off < 0x260 ? "x19" : "list";
+-        char hex[129];
+-        for (uint32_t k = 0; k < n; k++) {
+-            unsigned char b = d[off + k];
+-            hex[2 * k] = "0123456789abcdef"[b >> 4];
+-            hex[2 * k + 1] = "0123456789abcdef"[b & 0xf];
+-        }
+-        hex[2 * n] = '\0';
+-        LOG("[shop] hex %s off=0x%03x bytes=%u hex=%s", region, off, n, hex);
+-    }
+-    hdr[1] = 0;   // reset: the stub may fire again on the next confirm
+-}
+-
+ void dm_hud_manual_frame_tick(void) {
+     uint8_t *st = dm_fps_state;
+     if (!st) return;
+-    dm_char_select_frame_tick(st);   // (0157) the title menu's "角色选择" row: open the picker when the guest set state +0x260
+     dm_hud_probe_tick();   // drain the 0129 probe buffer every present (it is a no-op unless DM_HUD_PROBE=1)
+-    dm_shop_probe_tick();   // (0164) drain the shop probe buffer every present (it is a no-op until the stub fires)
+     float dx[DM_HUD_N], dy[DM_HUD_N], k[DM_HUD_N];
+     uint32_t manual = 0, hidden = 0;
+     for (int i = 0; i < DM_HUD_N; i++) {
+diff --git a/dm/ios/Sources/CharSelectEditor.h b/dm/ios/Sources/CharSelectEditor.h
+deleted file mode 100644
+index e9c8e3e..0000000
+--- a/dm/ios/Sources/CharSelectEditor.h
++++ /dev/null
+@@ -1,42 +0,0 @@
+-// CharSelectEditor.h -- the title-menu character/costume picker (0157).
+-//
+-// The picker opens over the title menu when the player picks the
+-// "角色选择" row (the repurposed VR row): the guest Decide stub sets the
+-// host flag (state +0x260) and the host frame tick calls
+-// dm_char_select_open_editor. Three characters (Mario, Luigi, Wario) and
+-// their costumes, all at once. Peach / Toad / Pauline are not in this
+-// round (no ready models) and are not listed.
+-//
+-// Style (redone for V1.3.29 to look like the in-game Crazy Cap shop):
+-// an opaque deep-purple full-screen panel (the title menu never shows
+-// through), a big character preview on the left (accent disc + name +
+-// outfit summary), two horizontal costume strips on the right (caps,
+-// then clothes -- shop cards with a purple emblem + the Chinese name,
+-// gold frame when selected), the selected costume's Chinese name +
+-// description below the strips, and a bottom bar (返回 / 默认 / 选择).
+-// Costume names + descriptions are the game's own Chinese text
+-// (LocalizedData/CNzh, ItemCap.msbt / ItemCloth.msbt). The card "image"
+-// is a drawn emblem, not a game texture: the <Name>2D.szs files are 3D
+-// models, not flat portraits, so there is no costume portrait PNG to
+-// extract (see CharSelectEditor.m). Text uses the game's own font
+-// (dm/font/standard.ttf, registered from DM_FONT_DIR).
+-#pragma once
+-
+-#ifdef __cplusplus
+-extern "C" {
+-#endif
+-void dm_char_select_open_editor(void);   // hud_manual.c: the frame tick opens the picker when the guest set state +0x260
+-void dm_char_select_apply_saved(void);   // Launcher.swift: before the game starts, the saved DmCharSelect.* settings go into the DM_CHAR_* environment
+-#ifdef __cplusplus
+-}
+-#endif
+-
+-#import <UIKit/UIKit.h>
+-
+-// The editor itself: a full-screen opaque shop-style panel on the key
+-// window. Created by dm_char_select_open_editor, removed by 选择 (save)
+-// or 返回 (discard).
+-@interface CharSelectEditor : UIView
+-- (void)openEditor;   // read the saved settings, apply them live, show the panel
+-- (void)closeEditor;  // 选择: save the settings and remove the editor
+-@end
+diff --git a/dm/ios/Sources/CharSelectEditor.m b/dm/ios/Sources/CharSelectEditor.m
+deleted file mode 100644
+index aee5f9c..0000000
+--- a/dm/ios/Sources/CharSelectEditor.m
++++ /dev/null
+@@ -1,927 +0,0 @@
+-// CharSelectEditor.m -- the title-menu character/costume picker (0157).
+-//
+-// The picker opens over the title menu when the player picks the
+-// "角色选择" row (the repurposed VR row). Three characters (Mario, Luigi,
+-// Wario) and their costumes, all at once. Peach / Toad / Pauline are not
+-// in this round (no ready models) and are not listed.
+-//
+-// Style (redone for V1.3.29 to look like the in-game Crazy Cap shop -- the
+-// user asked for it directly, "界面做成这种！"):
+-//   * OPAQUE: the whole editor is a solid deep-purple panel (the shop's
+-//     purple); the title menu does NOT show through behind it. The old
+-//     white centred panel over a dimmed menu (which the user called ugly
+-//     because it was see-through) is gone.
+-//   * LEFT: a big character preview -- a large accent-coloured disc with
+-//     the character's first Chinese character, the character name, and
+-//     the current outfit (cap + clothes) as a summary. Three character
+-//     tabs above it.
+-//   * RIGHT: two horizontal costume strips (caps, then clothes). Each card
+-//     is a shop-style card: a purple emblem with the costume's first
+-//     Chinese character on top (the "image"), the Chinese name below, a
+-//     gold frame when selected. "默认" first, "跟随存档" last.
+-//   * BELOW the strips: the selected costume's Chinese name + description
+-//     (the shop's item name + description area).
+-//   * BOTTOM BAR (like the shop's L 选择 / B 放弃 / A 确定): 返回 (close
+-//     without saving), 默认 (reset), 选择 (gold: save + apply + close).
+-//   * Text uses the game's own font (dm/font/standard.ttf, registered
+-//     from DM_FONT_DIR) instead of the iOS system font the other editors
+-//     use; it falls back to the system font when the file is missing.
+-//   * Costume names + descriptions are the game's own Chinese text
+-//     (LocalizedData/CNzh, ItemCap.msbt / ItemCloth.msbt); a costume with
+-//     no MSBT name falls back to the cleaned internal name (never a raw
+-//     internal name like "ColorWario" on a card).
+-//
+-// Images: the shop shows a live 3D render of each costume's <Name>2D.szs
+-// model on its cards. Those files are 3D models (FMDL + an embedded BNTX
+-// holding small dot-pattern textures), not flat portraits -- there is no
+-// costume portrait PNG inside them to extract, and the shop layout's
+-// __Combined.bntx atlases hold only UI chrome (CmBase, NyShopLogo,
+-// NyFrameItem, NyListBeak). So the renders are made OFFLINE instead: the
+-// game's own BFRES models are rendered to transparent PNGs on the host
+-// (Blender + the ranidspace BFRES importer; REPORT-CHAR-PREVIEW.md) and
+-// bundled here as dm/ios/Sources/CharPreviews/*.png, like the PadIcons.
+-// A card shows its render when one exists; the drawn emblem (the costume's
+-// first Chinese character in gold on purple) is only the fallback for an
+-// item with no render (the MarioInvisible cap has no cap file at all, so
+-// no render exists for it). The big preview shows the character wearing
+-// the selected clothes (the clothes render), or the default outfit;
+-// a cap pick does not change it -- a cap+clothes combination has no
+-// single render, and the cap itself is shown on its card.
+-//
+-// Persistence: NSUserDefaults DmCharSelect.character ("mario" | "luigi" |
+-// "wario"), DmCharSelect.cap and DmCharSelect.clothes (a costume name, or
+-// "default" for the character's own default part, or no key = follow the
+-// save). The live channel is setenv/unsetenv DM_CHAR_SELECT /
+-// DM_CHAR_CAP / DM_CHAR_CLOTHES (the host fs redirect re-reads getenv on
+-// every open, so a pick takes effect at the next spawn). "选择" saves;
+-// the launcher applies the saved settings before the game starts
+-// (dm_char_select_apply_saved, like DmHudPad.*).
+-//
+-// Costume lists (from the costume system: a costume is a family of
+-// ObjectData/<Name>*.szs; a character only lists the costumes it has
+-// adapted versions of, because an unadapted costume loads that
+-// costume's Mario body and the player silently becomes Mario again):
+-//   Mario: all 55 caps + 55 clothes (the "Mario" entry itself is the
+-//     "默认" card, so it is not listed twice).
+-//   Luigi: clothes Default + MarioColorLuigi / MarioColorWaluigi /
+-//     MarioColorWario; caps Default only (the Luigi mod ships no adapted
+-//     cap, so Luigi's cap is Mario's red cap).
+-//   Wario: clothes + caps Default + MarioColorWario / MarioColorLuigi /
+-//     MarioColorWaluigi / MarioColorClassic / MarioColorGold / Mario64 /
+-//     MarioHigh / MarioPilot / MarioPrimitiveMan / MarioCaptain (Captain
+-//     is cap+head only; as clothes it gives the Captain head with the
+-//     default body).
+-//
+-// The text is Chinese: the user asked for the settings panel in Chinese
+-// (the rest of the repository is English).
+-#import "CharSelectEditor.h"
+-#import <Foundation/Foundation.h>
+-#import <QuartzCore/QuartzCore.h>
+-#import <CoreText/CoreText.h>
+-#import <stdio.h>
+-#import <stdlib.h>
+-#import <string.h>
+-
+-// ---- Costume tables (the full name is the DM_CHAR_* value) ----
+-static const char *const kCharCapMario[] = {
+-    "Mario64", "Mario64Metal", "MarioAloha", "MarioArmor", "MarioArmorWestern",
+-    "MarioBandman", "MarioBatter", "MarioCaptain", "MarioClown",
+-    "MarioColorClassic", "MarioColorGold", "MarioColorLuigi", "MarioColorWaluigi",
+-    "MarioColorWario", "MarioConductor", "MarioCook", "MarioDiddyKong",
+-    "MarioDoctor", "MarioDot3d", "MarioExplorer", "MarioFootball", "MarioGolf",
+-    "MarioGunman", "MarioHappi", "MarioHariet", "MarioInvisible", "MarioKing",
+-    "MarioKoopa", "MarioMaker", "MarioMechanic", "MarioNew3DS", "MarioPainter",
+-    "MarioPeach", "MarioPilot", "MarioPirate", "MarioPoncho", "MarioPrimitiveMan",
+-    "MarioRacer", "MarioRango", "MarioSailor", "MarioSanta", "MarioSatellite",
+-    "MarioScientist", "MarioShopman", "MarioSnowSuit", "MarioSpaceSuit",
+-    "MarioSpewart", "MarioSuit", "MarioSunshine", "MarioSwimwear", "MarioTailCoat",
+-    "MarioTopper", "MarioTuxedo", "MarioZombie",
+-};
+-static const char *const kCharClothesMario[] = {
+-    "Mario64", "Mario64Metal", "MarioAloha", "MarioArmor", "MarioArmorWestern",
+-    "MarioBandman", "MarioBatter", "MarioClown",
+-    "MarioColorClassic", "MarioColorGold", "MarioColorLuigi", "MarioColorWaluigi",
+-    "MarioColorWario", "MarioConductor", "MarioCook", "MarioDiddyKong",
+-    "MarioDoctor", "MarioExplorer", "MarioFootball", "MarioGolf",
+-    "MarioGunman", "MarioHappi", "MarioHariet", "MarioKing",
+-    "MarioKoopa", "MarioMaker", "MarioMechanic", "MarioNew3DS", "MarioPainter",
+-    "MarioPeach", "MarioPilot", "MarioPirate", "MarioPoncho", "MarioPrimitiveMan",
+-    "MarioRacer", "MarioRango", "MarioSailor", "MarioSanta", "MarioSatellite",
+-    "MarioScientist", "MarioShopman", "MarioSnowSuit", "MarioSpaceSuit",
+-    "MarioSpewart", "MarioSuit", "MarioSunshine", "MarioSwimwear", "MarioTailCoat",
+-    "MarioTopper", "MarioTuxedo", "MarioZombie",
+-    "MarioHakama", "MarioBone", "MarioUnderwear",
+-};
+-static const char *const kCharClothesLuigi[] = {
+-    "MarioColorLuigi", "MarioColorWaluigi", "MarioColorWario",
+-};
+-static const char *const kCharWario[] = {
+-    "MarioColorWario", "MarioColorLuigi", "MarioColorWaluigi", "MarioColorClassic",
+-    "MarioColorGold", "Mario64", "MarioHigh", "MarioPilot", "MarioPrimitiveMan",
+-    "MarioCaptain",
+-};
+-
+-// Characters: 0 Mario, 1 Luigi, 2 Wario.
+-static NSString *const kCharIds[3] = {@"mario", @"luigi", @"wario"};
+-static NSString *const kCharNames[3] = {@"马里奥", @"路易吉", @"瓦里奥"};
+-static const uint32_t kCharColors[3] = {0xE52521, 0x43B047, 0xFBD000};   // Mario red, Luigi green, Wario yellow
+-
+-// ---- The shop's purple (the Crazy Cap shop: deep purple panel, darker
+-// top/bottom bands, gold selection) ----
+-static const uint32_t kShopPurple = 0x3B1A5E;   // panel
+-static const uint32_t kShopBand   = 0x2A0E45;   // top/bottom band
+-static const uint32_t kShopEmblem = 0x5B2A86;   // card emblem
+-static const uint32_t kShopGold   = 0xC9A227;   // selection frame / primary button
+-
+-// ---- Costume display text (the game's own MSBT, LocalizedData/CNzh) ----
+-// Generated from ItemCap.msbt / ItemCloth.msbt (SystemMessage.szs).
+-// { internal name, Chinese name, description (_Explain) }.
+-typedef struct { const char *key; const char *name; const char *desc; } CharCostumeText;
+-static const CharCostumeText kCharCapText[] = {
+-    { "Mario64", "６４帽", "造型令人怀念的报童帽。" },
+-    { "Mario64Metal", "金属马力欧帽", "造型令人怀念的金属风报童帽。" },
+-    { "MarioAloha", "阿罗哈帽", "有放松效果的凉快编织帽。 " },
+-    { "MarioArmor", "武者帽", "作为工艺品也别有风格的精美武士风帽子。" },
+-    { "MarioArmorWestern", "装甲帽", "看上去很坚硬的板甲头盔。" },
+-    { "MarioBandman", "乐手帽", "在传统的庆典上负责活跃气氛的演奏者所穿戴的帽子。" },
+-    { "MarioBatter", "棒球帽", "右打者用的安全帽，整顶都是透亮的热情红。" },
+-    { "MarioCaptain", "船长帽", "充满威严的奥德赛号船长帽。" },
+-    { "MarioClown", "小丑帽", "从搞笑到杂耍样样精通的小丑帽。" },
+-    { "MarioColorClassic", "经典帽子", "令人怀旧的经典帽子。" },
+-    { "MarioColorGold", "金色帽子", "彻底追求金色的帽子。" },
+-    { "MarioColorLuigi", "路易吉帽", "鲜绿色的经典报童帽。" },
+-    { "MarioColorWaluigi", "瓦路易吉帽", "装饰有颠倒Ｌ字母的帽子。 " },
+-    { "MarioColorWario", "瓦力欧帽", "装饰有独具特色Ｗ字母的帽子。" },
+-    { "MarioConductor", "指挥家帽", "让人瞬间变身成指挥家的假发。" },
+-    { "MarioCook", "厨师帽", "波尔波诺的绅士淑女们喜爱的民族帽。" },
+-    { "MarioDiddyKong", "迪迪帽", "重现长帽檐这一特征的红色帽子。" },
+-    { "MarioDoctor", "医生帽", "擅用特制胶囊的名医额镜。" },
+-    { "MarioDot3d", "8-bit马力欧帽", "能够重拾初心的神奇帽子。" },
+-    { "MarioExplorer", "探险家帽", "戴上这顶帽子，在大自然深处也能安心。" },
+-    { "MarioFootball", "美式橄榄球帽", "线条用色很酷的复刻版安全帽。" },
+-    { "MarioGolf", "高尔夫球帽", "鲜艳的条纹很抢眼的帽子。" },
+-    { "MarioGunman", "牛仔枪手帽", "令人联想到开垦的复古帽子。" },
+-    { "MarioHappi", "法被帽", "设计简洁的卷头巾。" },
+-    { "MarioHariet", "哈利艾特帽", "能让人联想到布鲁达尔兹中的唯一女性哈利艾特的帽子。" },
+-    { "MarioInvisible", "透明帽", "在最终环形山获得的稀世帽子。" },
+-    { "MarioKing", "国王帽", "在兔子环形山获得的华丽帽子。" },
+-    { "MarioKoopa", "新郎酷霸王帽", "酷霸王特别订做的独特帽子的复制品。" },
+-    { "MarioMaker", "建筑工帽", "适合一般工程到点检作业，用途广泛的工作帽。" },
+-    { "MarioMechanic", "机械师帽", "最适合作业时戴的机械师帽子。" },
+-    { "MarioNew3DS", "时髦帽子", "将经典红帽改造得很时髦。" },
+-    { "MarioPainter", "画工帽", "画家就要戴这款帽子。" },
+-    { "MarioPeach", "新娘桃花公主帽", "重现了桃花公主头纱的复制品。大受欢迎。" },
+-    { "MarioPilot", "飞行员帽", "许多飞机师爱用的遮耳帽。" },
+-    { "MarioPirate", "海盗帽", "让人想出海闯荡的帽子。" },
+-    { "MarioPoncho", "彭丘帽", "阿炽尼亚地区的传统民族帽。" },
+-    { "MarioPrimitiveMan", "原始人帽", "深受欢迎的帽子，设计灵感取自啪嗒枯骨怪的头。" },
+-    { "MarioRacer", "赛手帽", "能使开车时情绪高昂的安全帽。" },
+-    { "MarioRango", "朗格帽", "能让人联想到布鲁达尔兹的技术员朗格的帽子。" },
+-    { "MarioSailor", "水手帽", "以两条天蓝色条纹为特色的帽子。" },
+-    { "MarioSanta", "圣诞老人帽", "一戴上就连小朋友都会非常开心的经典帽款。" },
+-    { "MarioSatellite", "卫星游戏帽", "在某项服务里使用过的安全帽。" },
+-    { "MarioScientist", "博士帽", "具科学家风格的奇怪帽子。" },
+-    { "MarioShopman", "克雷吉佳普店员帽", "克雷吉佳普公司独创的帽子。" },
+-    { "MarioSnowSuit", "防寒帽", "彻底抵御严寒的羽绒兜帽。" },
+-    { "MarioSpaceSuit", "宇航帽", "似乎能承受各种环境的帽子。" },
+-    { "MarioSpewart", "斯普瓦特帽", "能让人联想到布鲁达尔兹的艺术家斯普瓦特的帽子。" },
+-    { "MarioSuit", "西帽", "大受欢迎的设计，也能搭配成休闲风格。 " },
+-    { "MarioSunshine", "太阳之光帽", "能让人回忆起常夏之岛的太阳镜。" },
+-    { "MarioSwimwear", "泳镜", "即使不游泳也想戴戴看的时尚单品。" },
+-    { "MarioTailCoat", "绅士帽", "克雷吉佳普 戴布伦店热卖中的高雅帽子。" },
+-    { "MarioTopper", "托帕帽", "能让人联想到布鲁达尔兹的队长托帕的帽子。" },
+-    { "MarioTuxedo", "新郎马力欧帽", "适合人生中最美妙舞台的白色大礼帽。" },
+-    { "MarioZombie", "僵尸帽", "反复进行多次仿旧加工的头饰。" },
+-};
+-static const CharCostumeText kCharClothText[] = {
+-    { "Mario64", "６４服", "造型令人怀念的服装。" },
+-    { "Mario64Metal", "金属马力欧服", "造型令人怀念的金属风６４服。" },
+-    { "MarioAloha", "阿罗哈服", "如果要住度假村，当然要穿这款衣服。" },
+-    { "MarioArmor", "武者服", "作为工艺品也别有风格的精美武士风服饰。" },
+-    { "MarioArmorWestern", "装甲服", "看上去很耐打的板甲。" },
+-    { "MarioBandman", "乐手服", "在传统的庆典上负责活跃气氛的演奏者所穿戴的衣服。" },
+-    { "MarioBatter", "棒球服", "让人想试穿的细条纹队服。" },
+-    { "MarioClown", "小丑服", "从搞笑到杂耍样样精通的小丑装。" },
+-    { "MarioColorClassic", "经典衣服", "至今仍深受喜爱，色调简单的服装。" },
+-    { "MarioColorGold", "金色衣服", "彻底追求金色的服装。" },
+-    { "MarioColorLuigi", "路易吉服", "鲜绿色的经典服饰。" },
+-    { "MarioColorWaluigi", "瓦路易吉服", "用来搭配颠倒Ｌ字母帽子的衣服。" },
+-    { "MarioColorWario", "瓦力欧服", "用来搭配Ｗ字母帽子的衣服。" },
+-    { "MarioConductor", "指挥家服", "让人瞬间变身成指挥家的人气服装。" },
+-    { "MarioCook", "厨师服", "围着红色围巾的波尔波诺经典造型。" },
+-    { "MarioDiddyKong", "迪迪服", "衣服上的长尾巴引人注目。" },
+-    { "MarioDoctor", "医生服", "擅用特制胶囊的名医白袍。" },
+-    { "MarioExplorer", "探险家服", "穿上这款衣服，在大自然深处也能安心。" },
+-    { "MarioFootball", "美式橄榄球服", "条纹用色很酷的队服。" },
+-    { "MarioGolf", "高尔夫球服", "鲜艳的条纹很抢眼的衣服。" },
+-    { "MarioGunman", "牛仔枪手服", "令人联想到开垦的复古衣服。" },
+-    { "MarioHappi", "法被服", "设计成在祭典上方便活动的传统服饰。" },
+-    { "MarioHariet", "哈利艾特服", "能让人联想到布鲁达尔兹中的唯一女性哈利艾特的衣服。" },
+-    { "MarioKing", "国王服", "在兔子环形山获得的华丽服装。" },
+-    { "MarioKoopa", "新郎酷霸王服", "酷霸王特别订做的硬派服装的复制品。" },
+-    { "MarioMaker", "建筑工服", "适合一般工程到点检作业，用途广泛的工作服。" },
+-    { "MarioMechanic", "机械师服", "最适合作业时穿的机械师套装。" },
+-    { "MarioNew3DS", "时髦衣服", "由３种图案组合而成的时尚风格。" },
+-    { "MarioPainter", "画工服", "画家就要穿这款衣服。" },
+-    { "MarioPeach", "新娘桃花公主服", "知名婚纱的精美复制品。" },
+-    { "MarioPilot", "飞行员服", "许多飞机师爱用的飞行夹克。" },
+-    { "MarioPirate", "海盗服", "让人想出海闯荡的服装。" },
+-    { "MarioPoncho", "彭丘服", "阿炽尼亚地区的传统民族服饰。" },
+-    { "MarioPrimitiveMan", "原始人服", "最便于活动，从古流传至今的服装。" },
+-    { "MarioRacer", "赛手服", "能使开车时情绪高昂的套装。" },
+-    { "MarioRango", "朗格服", "能让人联想到布鲁达尔兹的技术员朗格的衣服。" },
+-    { "MarioSailor", "水手服", "以天蓝色条纹为特色的衣服。" },
+-    { "MarioSanta", "圣诞老人服", "一穿上去就会受小朋友喜爱的经典服装。" },
+-    { "MarioSatellite", "卫星游戏服", "在某项服务里使用过的纪念服装。" },
+-    { "MarioScientist", "博士服", "具科学家风格的轻便白袍。" },
+-    { "MarioShopman", "克雷吉佳普店员服", "克雷吉佳普公司独创的服装。" },
+-    { "MarioSnowSuit", "防寒服", "彻底抵御严寒的羽绒外套。" },
+-    { "MarioSpaceSuit", "宇航服", "似乎能承受各种环境的服装。" },
+-    { "MarioSpewart", "斯普瓦特服", "能让人联想到布鲁达尔兹的艺术家斯普瓦特的衣服。" },
+-    { "MarioSuit", "西服", "用途广泛，大受欢迎的设计。 " },
+-    { "MarioSunshine", "太阳之光服", "能让人回忆起常夏之岛的阿罗哈衫。" },
+-    { "MarioSwimwear", "泳衣", "衣服上装饰的游泳圈其实浮不起来。" },
+-    { "MarioTailCoat", "绅士服", "克雷吉佳普戴布伦店热卖中的时髦服装。" },
+-    { "MarioTopper", "托帕服", "能让人联想到布鲁达尔兹的队长托帕的衣服。" },
+-    { "MarioTuxedo", "新郎马力欧服", "适合人生中最美妙舞台的最高级燕尾服。" },
+-    { "MarioZombie", "僵尸服", "缝补起来就会魅力减半的仿旧服装。" },
+-    { "MarioHakama", "和服", "风格沉稳，Ｍ字母设计大受欢迎的服装。" },
+-    { "MarioBone", "枯骨服", "难以说明清楚，非常离奇的奇怪服装。" },
+-    { "MarioUnderwear", "短裤", "蘑菇斑点色彩鲜艳，穿起来很舒服的短裤。" },
+-};
+-// Wario-only entries with no MSBT name: MarioHigh has no Chinese name in the
+-// game (an unused costume); MarioCaptain as clothes is the Captain head, so
+-// it reuses the cap name. These are looked up after the two tables above.
+-static const CharCostumeText kCharWarioFallbackText[] = {
+-    { "MarioHigh", "High", "" },
+-    { "MarioCaptain", "船长帽", "充满威严的奥德赛号船长帽。" },
+-};
+-
+-// ---- The game's font (dm/font/standard.ttf, registered from DM_FONT_DIR) ----
+-static NSString *charSelectFontName(void) {
+-    static NSString *name = nil;
+-    static dispatch_once_t once;
+-    dispatch_once(&once, ^{
+-        const char *dir = getenv("DM_FONT_DIR");
+-        NSString *path = nil;
+-        if (dir) path = [[NSString stringWithUTF8String:dir] stringByAppendingPathComponent:@"standard.ttf"];
+-        if (path && [[NSFileManager defaultManager] fileExistsAtPath:path]) {
+-            NSURL *url = [NSURL fileURLWithPath:path];
+-            CFArrayRef descs = CTFontManagerCreateFontDescriptorsFromURL((CFURLRef)url);
+-            if (descs && CFArrayGetCount(descs) > 0) {
+-                CTFontDescriptorRef desc = CFArrayGetValueAtIndex(descs, 0);
+-                CFStringRef ps = CTFontDescriptorCopyAttribute(desc, kCTFontNameAttribute);
+-                if (ps) { name = [(__bridge NSString *)ps copy]; CFRelease(ps); }
+-                CFRelease(descs);
+-            }
+-            if (name) {
+-                CFErrorRef err = NULL;
+-                if (!CTFontManagerRegisterFontsForURL((CFURLRef)url, kCTFontManagerScopeProcess, &err)) {
+-                    if (err) CFRelease(err);
+-                    name = nil;
+-                }
+-            }
+-        }
+-    });
+-    return name;
+-}
+-static UIFont *charSelectFont(CGFloat size, BOOL bold) {
+-    NSString *name = charSelectFontName();
+-    if (name) {
+-        UIFont *f = [UIFont fontWithName:name size:size];
+-        if (f) return f;
+-    }
+-    return bold ? [UIFont boldSystemFontOfSize:size] : [UIFont systemFontOfSize:size];
+-}
+-static UIColor *charSelectColor(uint32_t rgb) {
+-    return [UIColor colorWithRed:((rgb >> 16) & 0xFF) / 255.0 green:((rgb >> 8) & 0xFF) / 255.0 blue:(rgb & 0xFF) / 255.0 alpha:1];
+-}
+-
+-// ---- Saved settings ----
+-static NSString *charSelectKey(NSString *what) { return [NSString stringWithFormat:@"DmCharSelect.%@", what]; }
+-// A costume value: nil = follow the save (no key, no env var),
+-// @"default" = the character's own default part, otherwise a costume name.
+-static NSString *charSelectLoadCostume(NSString *what) {
+-    return [[NSUserDefaults standardUserDefaults] stringForKey:charSelectKey(what)];
+-}
+-static void charSelectSaveCostume(NSString *what, NSString *value) {
+-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+-    if (value) [d setObject:value forKey:charSelectKey(what)];
+-    else [d removeObjectForKey:charSelectKey(what)];
+-}
+-
+-// ---- Live channel (the host fs redirect re-reads getenv on every open) ----
+-static void charSelectApplyLive(NSString *character, NSString *cap, NSString *clothes) {
+-    setenv("DM_CHAR_SELECT", character.UTF8String, 1);
+-    if (cap) setenv("DM_CHAR_CAP", cap.UTF8String, 1); else unsetenv("DM_CHAR_CAP");
+-    if (clothes) setenv("DM_CHAR_CLOTHES", clothes.UTF8String, 1); else unsetenv("DM_CHAR_CLOTHES");
+-}
+-
+-// ---- Costume display text: MSBT name + description, or a cleaned fallback ----
+-// Returns the Chinese name for a costume key (nil = "跟随存档", "default" =
+-// "默认"); the description goes into *descOut ("" when there is none).
+-// Never returns a raw internal name like "ColorWario".
+-static NSString *charCostumeName(const char *key, BOOL isCap, NSString **descOut) {
+-    if (descOut) *descOut = @"";
+-    if (!key) return @"跟随存档";
+-    if (!strcmp(key, "default")) return @"默认";
+-    const CharCostumeText *table = isCap ? kCharCapText : kCharClothText;
+-    size_t n = isCap ? sizeof kCharCapText / sizeof *kCharCapText
+-                     : sizeof kCharClothText / sizeof *kCharClothText;
+-    for (size_t i = 0; i < n; i++) {
+-        if (!strcmp(table[i].key, key)) {
+-            if (descOut) *descOut = [NSString stringWithUTF8String:table[i].desc];
+-            return [NSString stringWithUTF8String:table[i].name];
+-        }
+-    }
+-    for (size_t i = 0; i < sizeof kCharWarioFallbackText / sizeof *kCharWarioFallbackText; i++) {
+-        if (!strcmp(kCharWarioFallbackText[i].key, key)) {
+-            if (descOut) *descOut = [NSString stringWithUTF8String:kCharWarioFallbackText[i].desc];
+-            return [NSString stringWithUTF8String:kCharWarioFallbackText[i].name];
+-        }
+-    }
+-    // No MSBT name: the cleaned internal name (strip the "Mario" prefix).
+-    if (!strncmp(key, "Mario", 5)) return [NSString stringWithUTF8String:key + 5];
+-    return [NSString stringWithUTF8String:key];
+-}
+-// The description for the "默认" / "跟随存档" cards.
+-static NSString *charSpecialDesc(const char *key, BOOL isCap) {
+-    if (!key) return isCap ? @"使用存档里的帽子" : @"使用存档里的服装";
+-    if (!strcmp(key, "default")) return isCap ? @"角色的默认帽子" : @"角色的默认服装";
+-    return @"";
+-}
+-// The emblem character: the first character of the display name.
+-static NSString *charEmblemChar(NSString *name) {
+-    if (name.length == 0) return @"?";
+-    return [name substringToIndex:1];
+-}
+-// The pre-rendered preview image for an item (nil when no render exists).
+-// Names in dm/ios/Sources/CharPreviews: char_<id>.png (the character in its
+-// default outfit), cap_<id>_<Costume>.png (the hat alone),
+-// clothes_<id>_<Costume>.png (the character wearing the outfit). The
+-// "default" card shows the character in its default outfit; follow-the-save
+-// (nil) has no specific item, so it has no image.
+-static UIImage *charPreviewImage(int character, BOOL isCap, const char *costume) {
+-    if (!costume) return nil;
+-    NSString *charId = kCharIds[character];
+-    NSString *name = nil;
+-    if (!strcmp(costume, "default")) {
+-        name = [NSString stringWithFormat:@"char_%@", charId];
+-    } else {
+-        name = [NSString stringWithFormat:@"%@_%@_%s", isCap ? @"cap" : @"clothes", charId, costume];
+-    }
+-    return [UIImage imageNamed:name inBundle:[NSBundle bundleForClass:[CharSelectEditor class]] compatibleWithTraitCollection:nil];
+-}
+-
+-static CharSelectEditor *g_editor;   // the open editor, if any (one at a time)
+-
+-// Private methods (declared up front so the order of definitions below
+-// does not matter).
+-@interface CharSelectEditor ()
+-- (void)buildUI;
+-- (void)layoutPreview;
+-- (void)updatePreviewImage;
+-- (void)buildStrip:(UIScrollView *)strip isCap:(BOOL)isCap;
+-- (NSString *)stripValue:(BOOL)isCap index:(int)idx;
+-- (void)updateDesc;
+-- (void)refresh;
+-- (BOOL)costume:(NSString *)value isCap:(BOOL)isCap validFor:(int)character;
+-- (void)refreshPreviewOutfit;
+-- (void)loadSaved;
+-- (void)save;
+-- (void)applyLive;
+-- (void)closeWithoutSaving;
+-@end
+-
+-@implementation CharSelectEditor {
+-    UIView *_topBand, *_bottomBand;
+-    UIButton *_charButtons[3];
+-    UIView *_previewPanel;
+-    UIView *_previewDisc;
+-    UIImageView *_previewImageView;
+-    UILabel *_previewDiscLabel, *_previewNameLabel, *_previewOutfitLabel;
+-    UILabel *_capLabel, *_clothesLabel;
+-    UIScrollView *_capStrip, *_clothesStrip;
+-    UILabel *_descKindLabel, *_descNameLabel, *_descTextLabel;
+-    UIButton *_backButton, *_resetButton, *_selectButton;
+-    int _character;              // 0 Mario, 1 Luigi, 2 Wario
+-    NSString *_cap, *_clothes;   // nil = follow the save, @"default" = default part, else a costume name
+-    BOOL _descIsCap;             // which strip the description area shows
+-    NSString *_descKey;          // costume key shown in the description area (nil = follow the save)
+-    CGFloat _stripH;             // costume-strip height (adaptive, set in layoutSubviews)
+-}
+-
+-- (instancetype)initWithFrame:(CGRect)frame {
+-    self = [super initWithFrame:frame];
+-    if (!self) return nil;
+-    // OPAQUE: the shop panel fills the screen; the title menu never shows through.
+-    self.backgroundColor = charSelectColor(kShopPurple);
+-    _character = 0; _cap = nil; _clothes = nil;
+-    _descIsCap = YES; _descKey = @"default";
+-    [self buildUI];
+-    return self;
+-}
+-
+-- (void)layoutSubviews {
+-    [super layoutSubviews];
+-    CGFloat w = self.bounds.size.width, h = self.bounds.size.height;
+-    CGFloat bandH = 52;
+-    _topBand.frame = CGRectMake(0, 0, w, bandH);
+-    _bottomBand.frame = CGRectMake(0, h - bandH, w, bandH);
+-    // Top band: title left, hint right.
+-    UIView *title = [_topBand viewWithTag:101];
+-    title.frame = CGRectMake(20, 0, 240, bandH);
+-    UIView *hint = [_topBand viewWithTag:102];
+-    hint.frame = CGRectMake(w - 420, 0, 400, bandH);
+-    // Bottom band: 返回 left, 默认 centre, 选择 right (gold).
+-    _backButton.frame = CGRectMake(20, (bandH - 40) / 2, 120, 40);
+-    _selectButton.frame = CGRectMake(w - 20 - 150, (bandH - 40) / 2, 150, 40);
+-    _resetButton.frame = CGRectMake((w - 120) / 2, (bandH - 40) / 2, 120, 40);
+-    // Main area between the bands.
+-    CGFloat my = bandH + 8, mh = h - 2 * bandH - 16;
+-    CGFloat m = 16;
+-    // Left column: character tabs + big preview.
+-    CGFloat leftW = 280;
+-    CGFloat tabH = 44, tabGap = 8;
+-    CGFloat tabW = (leftW - 2 * tabGap) / 3;
+-    for (int i = 0; i < 3; i++) {
+-        _charButtons[i].frame = CGRectMake(m + i * (tabW + tabGap), my, tabW, tabH);
+-        // The dot + name + check inside the tab.
+-        UIView *dot = [_charButtons[i] viewWithTag:210 + i];
+-        dot.frame = CGRectMake(12, (tabH - 16) / 2, 16, 16);
+-        UILabel *name = (UILabel *)[_charButtons[i] viewWithTag:220 + i];
+-        name.frame = CGRectMake(34, 0, tabW - 62, tabH);
+-        UILabel *mark = (UILabel *)[_charButtons[i] viewWithTag:230 + i];
+-        mark.frame = CGRectMake(tabW - 28, 0, 22, tabH);
+-        mark.textAlignment = NSTextAlignmentCenter;
+-    }
+-    _previewPanel.frame = CGRectMake(m, my + tabH + 10, leftW, mh - tabH - 10);
+-    [self layoutPreview];
+-    // Right column: two strips + the description area. The strip height
+-    // adapts to the screen: the description area keeps at least two lines.
+-    CGFloat fixed = 18 + 2 + 18 + 2 + 8 + 8 + 14 + 2 + 26 + 2 + 36;
+-    CGFloat stripH = (mh - fixed) / 2;
+-    if (stripH < 72) stripH = 72;
+-    if (stripH > 112) stripH = 112;
+-    BOOL stripResized = (stripH != _stripH);
+-    _stripH = stripH;
+-    CGFloat rx = m + leftW + m, rw = w - rx - m;
+-    _capLabel.frame = CGRectMake(rx, my, rw, 18);
+-    _capStrip.frame = CGRectMake(rx, my + 20, rw, stripH);
+-    _clothesLabel.frame = CGRectMake(rx, my + 20 + stripH + 8, rw, 18);
+-    _clothesStrip.frame = CGRectMake(rx, my + 20 + stripH + 8 + 20, rw, stripH);
+-    CGFloat dy = my + 20 + stripH + 8 + 20 + stripH + 8;
+-    CGFloat dh = my + mh - dy;
+-    _descKindLabel.frame = CGRectMake(rx, dy, rw, 14);
+-    _descNameLabel.frame = CGRectMake(rx, dy + 16, rw, 26);
+-    _descTextLabel.frame = CGRectMake(rx, dy + 44, rw, dh - 44);
+-    // A size change resizes the cards, so rebuild the strips.
+-    if (stripResized) {
+-        [self buildStrip:_capStrip isCap:YES];
+-        [self buildStrip:_clothesStrip isCap:NO];
+-    }
+-}
+-
+-- (void)layoutPreview {
+-    CGFloat pw = _previewPanel.bounds.size.width, ph = _previewPanel.bounds.size.height;
+-    if (pw <= 0 || ph <= 0) return;
+-    CGFloat imgD = fminf(pw - 32, 220);   // the render is square; the disc is the fallback
+-    _previewImageView.frame = CGRectMake((pw - imgD) / 2, 16, imgD, imgD);
+-    CGFloat discD = 132;
+-    _previewDisc.frame = CGRectMake((pw - discD) / 2, 16 + (imgD - discD) / 2, discD, discD);
+-    _previewDisc.layer.cornerRadius = discD / 2;
+-    _previewDiscLabel.frame = _previewDisc.bounds;
+-    _previewNameLabel.frame = CGRectMake(12, 16 + imgD + 10, pw - 24, 32);
+-    _previewOutfitLabel.frame = CGRectMake(12, 16 + imgD + 10 + 34, pw - 24, ph - (16 + imgD + 10 + 34) - 12);
+-}
+-// The big preview image: the character wearing the selected clothes (the
+-// clothes render), or the default outfit when none is picked. A cap pick
+-// does not change it (no single render for a cap+clothes combination).
+-- (void)updatePreviewImage {
+-    const char *clothes = _clothes ? _clothes.UTF8String : "default";
+-    UIImage *img = charPreviewImage(_character, NO, clothes);
+-    _previewImageView.image = img;
+-    _previewImageView.hidden = (img == nil);
+-    _previewDisc.hidden = (img != nil);
+-    _previewDiscLabel.hidden = (img != nil);
+-}
+-
+-// ---- Building ----
+-- (void)buildUI {
+-    _topBand = [[UIView alloc] init];
+-    _topBand.backgroundColor = charSelectColor(kShopBand);
+-    [self addSubview:_topBand];
+-    _bottomBand = [[UIView alloc] init];
+-    _bottomBand.backgroundColor = charSelectColor(kShopBand);
+-    [self addSubview:_bottomBand];
+-
+-    UILabel *title = [[UILabel alloc] init];
+-    title.text = @"角色选择";
+-    title.font = charSelectFont(28, YES);
+-    title.textColor = [UIColor whiteColor];
+-    title.tag = 101;
+-    [_topBand addSubview:title];
+-
+-    UILabel *hint = [[UILabel alloc] init];
+-    hint.text = @"选角色和服装，开始游戏时生效";
+-    hint.font = charSelectFont(14, NO);
+-    hint.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.75];
+-    hint.textAlignment = NSTextAlignmentRight;
+-    hint.tag = 102;
+-    [_topBand addSubview:hint];
+-
+-    for (int i = 0; i < 3; i++) {
+-        UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+-        b.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.12];
+-        b.layer.cornerRadius = 10;
+-        b.layer.borderWidth = 2;
+-        b.layer.borderColor = [UIColor clearColor].CGColor;
+-        b.tag = 200 + i;
+-        [b addTarget:self action:@selector(pickCharacter:) forControlEvents:UIControlEventTouchUpInside];
+-        // The colour dot (the character's accent) + the name.
+-        UIView *dot = [[UIView alloc] init];
+-        dot.backgroundColor = charSelectColor(kCharColors[i]);
+-        dot.layer.cornerRadius = 8;
+-        dot.tag = 210 + i;
+-        dot.userInteractionEnabled = NO;
+-        [b addSubview:dot];
+-        UILabel *name = [[UILabel alloc] init];
+-        name.text = kCharNames[i];
+-        name.font = charSelectFont(17, YES);
+-        name.textColor = [UIColor whiteColor];
+-        name.tag = 220 + i;
+-        [b addSubview:name];
+-        UILabel *mark = [[UILabel alloc] init];
+-        mark.text = @"✓";
+-        mark.font = charSelectFont(17, YES);
+-        mark.textColor = charSelectColor(kShopGold);
+-        mark.tag = 230 + i;
+-        [b addSubview:mark];
+-        [self addSubview:b];
+-        _charButtons[i] = b;
+-    }
+-
+-    _previewPanel = [[UIView alloc] init];
+-    _previewPanel.backgroundColor = [UIColor whiteColor];
+-    _previewPanel.layer.cornerRadius = 16;
+-    [self addSubview:_previewPanel];
+-    _previewDisc = [[UIView alloc] init];
+-    _previewDisc.backgroundColor = charSelectColor(kCharColors[0]);
+-    [_previewPanel addSubview:_previewDisc];
+-    _previewDiscLabel = [[UILabel alloc] init];
+-    _previewDiscLabel.font = charSelectFont(64, YES);
+-    _previewDiscLabel.textColor = [UIColor whiteColor];
+-    _previewDiscLabel.textAlignment = NSTextAlignmentCenter;
+-    [_previewDisc addSubview:_previewDiscLabel];
+-    // The rendered preview (on top of the disc; the disc is the fallback
+-    // when no render exists for the selection).
+-    _previewImageView = [[UIImageView alloc] init];
+-    _previewImageView.contentMode = UIViewContentModeScaleAspectFit;
+-    _previewImageView.backgroundColor = [UIColor clearColor];
+-    _previewImageView.userInteractionEnabled = NO;
+-    [_previewPanel addSubview:_previewImageView];
+-    _previewNameLabel = [[UILabel alloc] init];
+-    _previewNameLabel.font = charSelectFont(24, YES);
+-    _previewNameLabel.textColor = [UIColor colorWithWhite:0.15 alpha:1];
+-    _previewNameLabel.textAlignment = NSTextAlignmentCenter;
+-    [_previewPanel addSubview:_previewNameLabel];
+-    _previewOutfitLabel = [[UILabel alloc] init];
+-    _previewOutfitLabel.font = charSelectFont(15, NO);
+-    _previewOutfitLabel.textColor = [UIColor colorWithWhite:0.4 alpha:1];
+-    _previewOutfitLabel.textAlignment = NSTextAlignmentCenter;
+-    _previewOutfitLabel.numberOfLines = 0;
+-    [_previewPanel addSubview:_previewOutfitLabel];
+-
+-    _capLabel = [[UILabel alloc] init];
+-    _capLabel.text = @"帽子";
+-    _capLabel.font = charSelectFont(16, YES);
+-    _capLabel.textColor = [UIColor whiteColor];
+-    [self addSubview:_capLabel];
+-    _capStrip = [[UIScrollView alloc] init];
+-    _capStrip.showsHorizontalScrollIndicator = NO;
+-    [self addSubview:_capStrip];
+-
+-    _clothesLabel = [[UILabel alloc] init];
+-    _clothesLabel.text = @"服装";
+-    _clothesLabel.font = charSelectFont(16, YES);
+-    _clothesLabel.textColor = [UIColor whiteColor];
+-    [self addSubview:_clothesLabel];
+-    _clothesStrip = [[UIScrollView alloc] init];
+-    _clothesStrip.showsHorizontalScrollIndicator = NO;
+-    [self addSubview:_clothesStrip];
+-
+-    _descKindLabel = [[UILabel alloc] init];
+-    _descKindLabel.font = charSelectFont(13, YES);
+-    _descKindLabel.textColor = charSelectColor(kShopGold);
+-    [self addSubview:_descKindLabel];
+-    _descNameLabel = [[UILabel alloc] init];
+-    _descNameLabel.font = charSelectFont(22, YES);
+-    _descNameLabel.textColor = [UIColor whiteColor];
+-    [self addSubview:_descNameLabel];
+-    _descTextLabel = [[UILabel alloc] init];
+-    _descTextLabel.font = charSelectFont(15, NO);
+-    _descTextLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.85];
+-    _descTextLabel.numberOfLines = 0;
+-    [self addSubview:_descTextLabel];
+-
+-    _backButton = [UIButton buttonWithType:UIButtonTypeCustom];
+-    [_backButton setTitle:@"返回" forState:UIControlStateNormal];
+-    _backButton.titleLabel.font = charSelectFont(18, YES);
+-    [_backButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+-    _backButton.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.16];
+-    _backButton.layer.cornerRadius = 10;
+-    [_backButton addTarget:self action:@selector(back:) forControlEvents:UIControlEventTouchUpInside];
+-    [_bottomBand addSubview:_backButton];
+-
+-    _resetButton = [UIButton buttonWithType:UIButtonTypeCustom];
+-    [_resetButton setTitle:@"默认" forState:UIControlStateNormal];
+-    _resetButton.titleLabel.font = charSelectFont(18, NO);
+-    [_resetButton setTitleColor:[UIColor colorWithWhite:0.25 alpha:1] forState:UIControlStateNormal];
+-    _resetButton.backgroundColor = [UIColor colorWithWhite:0.92 alpha:1];
+-    _resetButton.layer.cornerRadius = 10;
+-    [_resetButton addTarget:self action:@selector(reset:) forControlEvents:UIControlEventTouchUpInside];
+-    [_bottomBand addSubview:_resetButton];
+-
+-    _selectButton = [UIButton buttonWithType:UIButtonTypeCustom];
+-    [_selectButton setTitle:@"选择" forState:UIControlStateNormal];
+-    _selectButton.titleLabel.font = charSelectFont(18, YES);
+-    [_selectButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+-    _selectButton.backgroundColor = charSelectColor(kShopGold);
+-    _selectButton.layer.cornerRadius = 10;
+-    [_selectButton addTarget:self action:@selector(select:) forControlEvents:UIControlEventTouchUpInside];
+-    [_bottomBand addSubview:_selectButton];
+-}
+-
+-// ---- Costume strips ----
+-// One card per entry: "默认" first, the character's costumes, "跟随存档" last.
+-// The entry value is the DM_CHAR_* string (nil = follow the save).
+-// A card is a shop card: a purple emblem with the costume's first Chinese
+-// character on top, the Chinese name below, a gold frame when selected.
+-- (void)buildStrip:(UIScrollView *)strip isCap:(BOOL)isCap {
+-    for (UIView *v in strip.subviews) [v removeFromSuperview];
+-    // Entries: "default", the character's costumes, nil (follow the save).
+-    const char *names[64];
+-    int n = 0;
+-    names[n++] = "default";
+-    if (isCap) {
+-        if (_character == 0) { for (size_t i = 0; i < sizeof kCharCapMario / sizeof *kCharCapMario; i++) names[n++] = kCharCapMario[i]; }
+-        else if (_character == 2) { for (size_t i = 0; i < sizeof kCharWario / sizeof *kCharWario; i++) names[n++] = kCharWario[i]; }
+-        // Luigi: no adapted caps (Default only).
+-    } else {
+-        if (_character == 0) { for (size_t i = 0; i < sizeof kCharClothesMario / sizeof *kCharClothesMario; i++) names[n++] = kCharClothesMario[i]; }
+-        else if (_character == 1) { for (size_t i = 0; i < sizeof kCharClothesLuigi / sizeof *kCharClothesLuigi; i++) names[n++] = kCharClothesLuigi[i]; }
+-        else { for (size_t i = 0; i < sizeof kCharWario / sizeof *kCharWario; i++) names[n++] = kCharWario[i]; }
+-    }
+-    names[n++] = NULL;   // follow the save
+-    CGFloat ch = _stripH > 0 ? _stripH - 8 : 88;
+-    CGFloat cw = 104, gap = 8;
+-    CGFloat x = 0;
+-    for (int i = 0; i < n; i++) {
+-        const char *entry = names[i];
+-        NSString *value = entry ? [NSString stringWithUTF8String:entry] : nil;
+-        NSString *name = charCostumeName(entry, isCap, NULL);
+-        UIButton *card = [UIButton buttonWithType:UIButtonTypeCustom];
+-        card.frame = CGRectMake(x, 4, cw, ch);
+-        card.backgroundColor = [UIColor whiteColor];
+-        card.layer.cornerRadius = 10;
+-        card.layer.borderWidth = 2;
+-        NSString *cur = isCap ? _cap : _clothes;
+-        BOOL selected = (value == nil && cur == nil) || (value != nil && cur != nil && [value isEqualToString:cur]);
+-        card.layer.borderColor = selected ? charSelectColor(kShopGold).CGColor : [UIColor clearColor].CGColor;
+-        card.tag = isCap ? 300 + i : 400 + i;
+-        [card addTarget:self action:isCap ? @selector(pickCap:) : @selector(pickClothes:) forControlEvents:UIControlEventTouchUpInside];
+-        // The emblem (the card "image"): the pre-rendered PNG when one
+-        // exists, else the drawn badge (purple, first Chinese character
+-        // in gold) as the fallback.
+-        CGFloat emblemH = ch - 42;
+-        UIImage *img = charPreviewImage(_character, isCap, entry);
+-        if (img) {
+-            UIImageView *iv = [[UIImageView alloc] initWithFrame:CGRectMake(6, 6, cw - 12, emblemH)];
+-            iv.image = img;
+-            iv.contentMode = UIViewContentModeScaleAspectFit;
+-            iv.backgroundColor = [UIColor whiteColor];   // renders are transparent
+-            iv.layer.cornerRadius = 8;
+-            iv.userInteractionEnabled = NO;
+-            [card addSubview:iv];
+-        } else {
+-            UIView *emblem = [[UIView alloc] initWithFrame:CGRectMake(6, 6, cw - 12, emblemH)];
+-            emblem.backgroundColor = charSelectColor(kShopEmblem);
+-            emblem.layer.cornerRadius = 8;
+-            emblem.userInteractionEnabled = NO;
+-            [card addSubview:emblem];
+-            UILabel *glyph = [[UILabel alloc] initWithFrame:emblem.bounds];
+-            glyph.text = charEmblemChar(name);
+-            glyph.font = charSelectFont(fminf(32, emblemH - 10), YES);
+-            glyph.textColor = charSelectColor(kShopGold);
+-            glyph.textAlignment = NSTextAlignmentCenter;
+-            [emblem addSubview:glyph];
+-        }
+-        // The Chinese name below the emblem.
+-        UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(4, ch - 32, cw - 8, 28)];
+-        label.text = name;
+-        label.font = charSelectFont(13, selected);
+-        label.textColor = [UIColor colorWithWhite:0.2 alpha:1];
+-        label.textAlignment = NSTextAlignmentCenter;
+-        label.numberOfLines = 2;
+-        [card addSubview:label];
+-        [strip addSubview:card];
+-        x += cw + gap;
+-    }
+-    strip.contentSize = CGSizeMake(x, ch + 8);
+-}
+-- (NSString *)stripValue:(BOOL)isCap index:(int)idx {
+-    // Rebuild the entry list exactly as buildStrip did, and return idx's value.
+-    const char *names[64];
+-    int n = 0;
+-    names[n++] = "default";
+-    if (isCap) {
+-        if (_character == 0) { for (size_t i = 0; i < sizeof kCharCapMario / sizeof *kCharCapMario; i++) names[n++] = kCharCapMario[i]; }
+-        else if (_character == 2) { for (size_t i = 0; i < sizeof kCharWario / sizeof *kCharWario; i++) names[n++] = kCharWario[i]; }
+-    } else {
+-        if (_character == 0) { for (size_t i = 0; i < sizeof kCharClothesMario / sizeof *kCharClothesMario; i++) names[n++] = kCharClothesMario[i]; }
+-        else if (_character == 1) { for (size_t i = 0; i < sizeof kCharClothesLuigi / sizeof *kCharClothesLuigi; i++) names[n++] = kCharClothesLuigi[i]; }
+-        else { for (size_t i = 0; i < sizeof kCharWario / sizeof *kCharWario; i++) names[n++] = kCharWario[i]; }
+-    }
+-    names[n++] = NULL;
+-    if (idx < 0 || idx >= n) return nil;
+-    return names[idx] ? [NSString stringWithUTF8String:names[idx]] : nil;
+-}
+-
+-// ---- Description area (the shop's item name + description) ----
+-- (void)updateDesc {
+-    NSString *desc = nil;
+-    NSString *name = charCostumeName(_descKey ? _descKey.UTF8String : NULL, _descIsCap, &desc);
+-    if (!_descKey || !strcmp(_descKey.UTF8String, "default")) {
+-        // The special cards: the description is the fixed one.
+-        desc = charSpecialDesc(_descKey ? _descKey.UTF8String : NULL, _descIsCap);
+-    }
+-    _descKindLabel.text = _descIsCap ? @"帽子" : @"服装";
+-    _descNameLabel.text = name;
+-    _descTextLabel.text = desc;
+-}
+-
+-// ---- Selection ----
+-- (void)refresh {
+-    for (int i = 0; i < 3; i++) {
+-        BOOL selected = (i == _character);
+-        _charButtons[i].layer.borderColor = selected ? charSelectColor(kShopGold).CGColor : [UIColor clearColor].CGColor;
+-        UILabel *mark = (UILabel *)[_charButtons[i] viewWithTag:230 + i];
+-        mark.hidden = !selected;
+-    }
+-    // The big preview: the render when one exists, else the disc (accent
+-    // colour, first character) as the fallback. Name + outfit below.
+-    _previewDisc.backgroundColor = charSelectColor(kCharColors[_character]);
+-    _previewDiscLabel.text = charEmblemChar(kCharNames[_character]);
+-    [self updatePreviewImage];
+-    _previewNameLabel.text = kCharNames[_character];
+-    NSString *capName = charCostumeName(_cap ? _cap.UTF8String : NULL, YES, NULL);
+-    NSString *clothName = charCostumeName(_clothes ? _clothes.UTF8String : NULL, NO, NULL);
+-    _previewOutfitLabel.text = [NSString stringWithFormat:@"%@\n%@", capName, clothName];
+-    // A pick that is not on the new character's list falls back to Default
+-    // (it cannot stay: the list no longer offers it).
+-    if (![self costume:_cap isCap:YES validFor:_character]) _cap = @"default";
+-    if (![self costume:_clothes isCap:NO validFor:_character]) _clothes = @"default";
+-    [self buildStrip:_capStrip isCap:YES];
+-    [self buildStrip:_clothesStrip isCap:NO];
+-    [self updateDesc];
+-    [self layoutPreview];
+-}
+-- (BOOL)costume:(NSString *)value isCap:(BOOL)isCap validFor:(int)character {
+-    if (value == nil) return YES;   // follow the save is always valid
+-    if ([value isEqualToString:@"default"]) return YES;
+-    // Check the value is in this character's list.
+-    const char *list[64]; int n = 0;
+-    if (isCap) {
+-        if (character == 0) { for (size_t i = 0; i < sizeof kCharCapMario / sizeof *kCharCapMario; i++) list[n++] = kCharCapMario[i]; }
+-        else if (character == 2) { for (size_t i = 0; i < sizeof kCharWario / sizeof *kCharWario; i++) list[n++] = kCharWario[i]; }
+-    } else {
+-        if (character == 0) { for (size_t i = 0; i < sizeof kCharClothesMario / sizeof *kCharClothesMario; i++) list[n++] = kCharClothesMario[i]; }
+-        else if (character == 1) { for (size_t i = 0; i < sizeof kCharClothesLuigi / sizeof *kCharClothesLuigi; i++) list[n++] = kCharClothesLuigi[i]; }
+-        else { for (size_t i = 0; i < sizeof kCharWario / sizeof *kCharWario; i++) list[n++] = kCharWario[i]; }
+-    }
+-    for (int i = 0; i < n; i++) if (!strcmp(list[i], value.UTF8String)) return YES;
+-    return NO;
+-}
+-- (void)pickCharacter:(UIButton *)sender {
+-    int idx = (int)(sender.tag - 200);
+-    if (idx < 0 || idx > 2) return;
+-    _character = idx;
+-    [self refresh];
+-    [self applyLive];
+-}
+-- (void)pickCap:(UIButton *)sender {
+-    int idx = (int)(sender.tag - 300);
+-    _cap = [self stripValue:YES index:idx];
+-    _descIsCap = YES;
+-    _descKey = _cap;
+-    [self buildStrip:_capStrip isCap:YES];
+-    [self updateDesc];
+-    [self refreshPreviewOutfit];
+-    [self applyLive];
+-}
+-- (void)pickClothes:(UIButton *)sender {
+-    int idx = (int)(sender.tag - 400);
+-    _clothes = [self stripValue:NO index:idx];
+-    _descIsCap = NO;
+-    _descKey = _clothes;
+-    [self buildStrip:_clothesStrip isCap:NO];
+-    [self updateDesc];
+-    [self refreshPreviewOutfit];
+-    [self applyLive];
+-}
+-- (void)refreshPreviewOutfit {
+-    NSString *capName = charCostumeName(_cap ? _cap.UTF8String : NULL, YES, NULL);
+-    NSString *clothName = charCostumeName(_clothes ? _clothes.UTF8String : NULL, NO, NULL);
+-    _previewOutfitLabel.text = [NSString stringWithFormat:@"%@\n%@", capName, clothName];
+-    [self updatePreviewImage];   // the clothes pick changes the preview
+-}
+-- (void)reset:(UIButton *)sender {
+-    (void)sender;
+-    _character = 0; _cap = @"default"; _clothes = @"default";
+-    _descIsCap = YES; _descKey = @"default";
+-    [self refresh];
+-    [self applyLive];
+-}
+-
+-// ---- Saved settings / live channel ----
+-- (void)loadSaved {
+-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+-    NSString *ch = [d stringForKey:charSelectKey(@"character")];
+-    _character = 0;
+-    for (int i = 0; i < 3; i++) if ([kCharIds[i] isEqualToString:ch]) { _character = i; break; }
+-    _cap = charSelectLoadCostume(@"cap");
+-    _clothes = charSelectLoadCostume(@"clothes");
+-    // Clamp a saved costume that is not on this character's list (e.g. the
+-    // character changed since it was saved): fall back to Default.
+-    if (![self costume:_cap isCap:YES validFor:_character]) _cap = @"default";
+-    if (![self costume:_clothes isCap:NO validFor:_character]) _clothes = @"default";
+-    _descIsCap = YES; _descKey = _cap;
+-}
+-- (void)save {
+-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+-    [d setObject:kCharIds[_character] forKey:charSelectKey(@"character")];
+-    charSelectSaveCostume(@"cap", _cap);
+-    charSelectSaveCostume(@"clothes", _clothes);
+-    fputs("char editor: saved DmCharSelect.* (角色选择已保存)\n", stderr);
+-}
+-- (void)applyLive {
+-    charSelectApplyLive(kCharIds[_character], _cap, _clothes);
+-}
+-- (void)openEditor {
+-    [self loadSaved];
+-    [self applyLive];
+-    [self refresh];
+-}
+-- (void)closeEditor {
+-    [self save];
+-    [self applyLive];
+-    [self removeFromSuperview];
+-    g_editor = nil;
+-}
+-- (void)closeWithoutSaving {
+-    // 返回: discard this session's picks -- restore the saved settings to
+-    // the live channel, then close without saving.
+-    [self loadSaved];
+-    [self applyLive];
+-    [self removeFromSuperview];
+-    g_editor = nil;
+-}
+-- (void)select:(UIButton *)sender {
+-    (void)sender;
+-    [self closeEditor];
+-}
+-- (void)back:(UIButton *)sender {
+-    (void)sender;
+-    [self closeWithoutSaving];
+-}
+-@end
+-
+-void dm_char_select_open_editor(void) {
+-    dispatch_async(dispatch_get_main_queue(), ^{
+-        if (g_editor) return;
+-        UIWindow *window = nil;
+-        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+-            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+-            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+-                if (w.isKeyWindow) { window = w; break; }
+-            }
+-            if (window) break;
+-        }
+-        if (!window) window = [UIApplication sharedApplication].keyWindow;
+-        if (!window) { fputs("[char] no key window for the character picker\n", stderr); return; }
+-        CharSelectEditor *editor = [[CharSelectEditor alloc] initWithFrame:window.bounds];
+-        g_editor = editor;
+-        [window addSubview:editor];
+-        [editor openEditor];
+-        fputs("[char] character picker opened\n", stderr);
+-    });
+-}
+-
+-void dm_char_select_apply_saved(void) {
+-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+-    NSString *ch = [d stringForKey:charSelectKey(@"character")];
+-    if (!ch) ch = @"mario";
+-    NSString *cap = charSelectLoadCostume(@"cap");
+-    NSString *clothes = charSelectLoadCostume(@"clothes");
+-    charSelectApplyLive(ch, cap, clothes);
+-}
+diff --git a/dm/ios/Sources/CharSelectPersist.m b/dm/ios/Sources/CharSelectPersist.m
+new file mode 100644
+index 0000000..4469884
+--- /dev/null
++++ b/dm/ios/Sources/CharSelectPersist.m
+@@ -0,0 +1,38 @@
++// CharSelectPersist.m -- the character selection persistence (0168).
++//
++// Moved here from CharSelectEditor.m when the title-menu picker was
++// removed (0168): the in-game shop picker replaces it, and the shop
++// write-back (0166, not yet implemented) writes through this same
++// channel. The launcher calls dm_char_select_apply_saved at startup;
++// the live channel is setenv/unsetenv DM_CHAR_SELECT / DM_CHAR_CAP /
++// DM_CHAR_CLOTHES (the host fs redirect re-reads getenv on every open).
++//
++// Persistence: NSUserDefaults DmCharSelect.character ("mario" | "luigi" |
++// "wario"), DmCharSelect.cap and DmCharSelect.clothes (a costume name,
++// "default", or unset = follow the save).
++#import <Foundation/Foundation.h>
++#import <stdlib.h>
++
++// ---- Saved settings ----
++static NSString *charSelectKey(NSString *what) { return [NSString stringWithFormat:@"DmCharSelect.%@", what]; }
++// A costume value: nil = follow the save (no key, no env var),
++// @"default" = the character's own default part, otherwise a costume name.
++static NSString *charSelectLoadCostume(NSString *what) {
++    return [[NSUserDefaults standardUserDefaults] stringForKey:charSelectKey(what)];
++}
++
++// ---- Live channel (the host fs redirect re-reads getenv on every open) ----
++static void charSelectApplyLive(NSString *character, NSString *cap, NSString *clothes) {
++    setenv("DM_CHAR_SELECT", character.UTF8String, 1);
++    if (cap) setenv("DM_CHAR_CAP", cap.UTF8String, 1); else unsetenv("DM_CHAR_CAP");
++    if (clothes) setenv("DM_CHAR_CLOTHES", clothes.UTF8String, 1); else unsetenv("DM_CHAR_CLOTHES");
++}
++
++void dm_char_select_apply_saved(void) {
++    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
++    NSString *ch = [d stringForKey:charSelectKey(@"character")];
++    if (!ch) ch = @"mario";
++    NSString *cap = charSelectLoadCostume(@"cap");
++    NSString *clothes = charSelectLoadCostume(@"clothes");
++    charSelectApplyLive(ch, cap, clothes);
++}
+diff --git a/dm/ios/Sources/DmGameMenu.h b/dm/ios/Sources/DmGameMenu.h
+index 238ddae..892f0ed 100644
+--- a/dm/ios/Sources/DmGameMenu.h
++++ b/dm/ios/Sources/DmGameMenu.h
+@@ -13,7 +13,7 @@ void dm_pad_layout_set(int layout);   // releases every touch first, and is save
+ void dm_gamepad_open_pad_settings(void);   // DmGamepad.m: the in-game menu's "按键设置" (button settings) opens the button editor
+ void dm_hud_pad_open_editor(void);   // HudPadEditor.m: the in-game menu's "HUD 设置" opens the pad-style HUD editor
+ void dm_hud_pad_apply_saved(void);   // HudPadEditor.m: the saved DmHudPad.* settings go into the DM_HUD_* environment before the game starts
+-void dm_char_select_apply_saved(void);   // CharSelectEditor.m (0157): the saved DmCharSelect.* settings go into the DM_CHAR_* environment before the game starts
++void dm_char_select_apply_saved(void);   // CharSelectPersist.m (0168): the saved DmCharSelect.* settings go into the DM_CHAR_* environment before the game starts
+ void dm_gamepad_touch_feedback(bool on);   // DM_TOUCH_HAPTICS
+ bool dm_setting_live(const char *env, const char *value);
+ void *dm_quit_menu(void);   // front_ios.m: the menu's last item, Quit <game>, which opens the quit prompt (a retained UIMenu, shown inline)   // front_ios.m: value NULL asks whether the running game takes env at once; otherwise applies it
+diff --git a/dm/ios/Sources/DmGamepad.m b/dm/ios/Sources/DmGamepad.m
+index 1ac3ebb..14a7508 100644
+--- a/dm/ios/Sources/DmGamepad.m
++++ b/dm/ios/Sources/DmGamepad.m
+@@ -589,7 +589,7 @@ int front_web_touch(void);
+     if (_padOff || (_layout.separated && !CGRectContainsPoint(_layout.controls, p))) return NO;
+     if (_tap) return NO;
+     if ([self extraButtonAt:p]) return YES;   // jump and photo
+-    if (!_stick[0] && p.x < CGRectGetMidX(_layout.controls)) return YES;   // the left half is the floating stick's area
++    if (!front_web_touch() && !_stick[0] && p.x < CGRectGetMidX(_layout.controls)) return YES;   // the left half is the floating stick's area -- except while a web page is shown, so its menu items stay tappable (0168)
+     if (dm_pad_hit(self.geo, _full, _layout.separated, _tap, !_stick[0], p).kind != DM_PAD_HIT_NONE) return YES;   // the geometry touchesBegan hits with (DmPadGeometry.h)
+     return _full && !_stick[1] && [self inRightArea:p];
+ }
+diff --git a/dm/ios/project-framework.yml b/dm/ios/project-framework.yml
+index d413ae7..b7bd19e 100644
+--- a/dm/ios/project-framework.yml
++++ b/dm/ios/project-framework.yml
+@@ -163,8 +163,6 @@ targets:
+         buildPhase: resources
+       - path: Sources/PadIcons
+         buildPhase: resources
+-      - path: Sources/CharPreviews
+-        buildPhase: resources
+     info:
+       path: Gen/framework/ShellGame-Info.plist
+       properties:
+-- 
+2.43.0
+
