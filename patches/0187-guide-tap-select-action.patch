@@ -1,0 +1,36 @@
+From 96af910e9130934c03ac660eb0cdce10d1e06e4f Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Wed, 18 Nov 2026 13:26:59 +0800
+Subject: [PATCH] 0187: guide action thumbnails selectable by tap -- the guide
+ selects a thumbnail via onfocus (basicMov/captureMov), but its TouchEventFunc
+ preventDefaults every touch when window.nx exists, so a tap never focuses the
+ link in this WebView and the video stays black. When a tap lands on an
+ action/capture thumbnail and the focus does not take (activeElement is not
+ the tapped link), invoke basicMov/captureMov directly so the tap always shows
+ its video. No double-fire: when focus does take, onfocus already ran and the
+ direct call is skipped.
+
+---
+ dm/host/web_apple.m | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/dm/host/web_apple.m b/dm/host/web_apple.m
+index 0a03403..4002d63 100644
+--- a/dm/host/web_apple.m
++++ b/dm/host/web_apple.m
+@@ -239,6 +239,12 @@ static NSString *const SHIM = @R"JS(
+     if (!c || c.closest('[data-dm-pad]')) return;
+     e.preventDefault();
+     if (c.focus) c.focus();
++    // The action guide selects a thumbnail via onfocus (basicMov/captureMov), but its TouchEventFunc preventDefaults every touch when window.nx exists, so a tap never focuses the link in this WebView and the video stays black. If the focus did not take (activeElement is not the tapped link), invoke the selection directly so a tap on a thumbnail always shows its video.
++    var m = c.id && c.id.match(/^(action|capture)(\d+)$/);
++    if (m && document.activeElement !== c) {
++      var fn = m[1] === 'action' ? window.basicMov : window.captureMov;
++      if (typeof fn === 'function') { try { fn(+m[2]); } catch (err) {} }
++    }
+     pressA(c, false);
+     post({k: 'log', d: 'tap -> A on ' + (c.id || c.tagName)});
+   }, true);
+-- 
+2.43.0
+
