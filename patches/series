@@ -122,15 +122,10 @@
 0162-preview-pngs-mario-clothes-luigi-wario.patch
 0163-char-high-redirect-guard.patch
 0165-char-family-redirect-guard.patch
-0167-shop-character-rows-luigi-icon.patch
 0168-title-row-3-vr-shop-picker.patch
 0169-delete-mario-cap-preview-pngs.patch
 0170-delete-remaining-preview-pngs.patch
-0171-liquid-glass-settings.patch
-0173-launcher-mario-bg.patch
 0174-guide-shim-playreport-tap.patch
 0175-docs-0174-web-shim.patch
-0176-launcher-redesign-diablo-style.patch
-0177-diagnostic-drop-luigi2d.patch
-0178-launcher-redmap-render.patch
-0179-launcher-memory-u64.patch
+0180-in-game-menu-glass-icons.patch
+0181-launcher-liquid-glass.patch
