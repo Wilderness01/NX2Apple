@@ -1,0 +1,36 @@
+From b54e77b03a4cc6cb1f8650475b653e08c2584373 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Wed, 18 Nov 2026 16:23:49 +0800
+Subject: [PATCH] 0195 guide: call basicMov/captureMov unconditionally on
+ thumbnail tap
+
+0187 only invoked the selection when focus did NOT take
+(activeElement !== c), but .focus() sets activeElement synchronously,
+so the fallback was skipped and the onfocus handler does not reliably
+fire for programmatic .focus() in this WebView (V1.3.39: tap reaches
+the handler yet the detail stays blank). Invoke the selection on
+every thumbnail tap and log the call/error instead of swallowing it.
+---
+ dm/host/web_apple.m | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/dm/host/web_apple.m b/dm/host/web_apple.m
+index 4002d63..3b5d20a 100644
+--- a/dm/host/web_apple.m
++++ b/dm/host/web_apple.m
+@@ -239,11 +239,12 @@ static NSString *const SHIM = @R"JS(
+     if (!c || c.closest('[data-dm-pad]')) return;
+     e.preventDefault();
+     if (c.focus) c.focus();
+-    // The action guide selects a thumbnail via onfocus (basicMov/captureMov), but its TouchEventFunc preventDefaults every touch when window.nx exists, so a tap never focuses the link in this WebView and the video stays black. If the focus did not take (activeElement is not the tapped link), invoke the selection directly so a tap on a thumbnail always shows its video.
++    // The action guide selects a thumbnail via onfocus (basicMov/captureMov), but its TouchEventFunc preventDefaults every touch when window.nx exists, so a tap never focuses the link in this WebView and the video stays black. 0187 called the selection only when focus did NOT take (activeElement !== c) -- but .focus() sets activeElement synchronously, so that fallback was skipped whenever focus() "succeeded", and the onfocus handler does not reliably fire for a programmatic .focus() in this WebView (V1.3.39: the tap reaches here, yet the detail stays blank). So invoke the selection unconditionally on every thumbnail tap: focus behaviour no longer decides whether the video plays. If onfocus also fires, the same function runs twice for the same number, which is harmless (same background/title/description; the cursor SE plays once). Log the call and any error instead of swallowing it, so the device log proves whether it ran.
+     var m = c.id && c.id.match(/^(action|capture)(\d+)$/);
+-    if (m && document.activeElement !== c) {
++    if (m) {
+       var fn = m[1] === 'action' ? window.basicMov : window.captureMov;
+-      if (typeof fn === 'function') { try { fn(+m[2]); } catch (err) {} }
++      if (typeof fn === 'function') { try { fn(+m[2]); post({k: 'log', d: 'guide select ' + m[1] + m[2]}); } catch (err) { post({k: 'log', d: 'guide select ' + m[1] + m[2] + ' error: ' + (err && err.message)}); } }
++      else { post({k: 'log', d: 'guide select ' + m[1] + m[2] + ' not a function'}); }
+     }
+     pressA(c, false);
+     post({k: 'log', d: 'tap -> A on ' + (c.id || c.tagName)});
