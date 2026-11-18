@@ -1,0 +1,90 @@
+From 31597cd2dc2cc7236fda81df37df6bbc9e608300 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Wed, 18 Nov 2026 18:17:49 +0800
+Subject: [PATCH] 0197: launcher title centred by default, bar pinned to bottom
+
+---
+ dm/ios/Sources/Launcher.swift | 30 +++++++++++++++++++-----------
+ 1 file changed, 19 insertions(+), 11 deletions(-)
+
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index 6931ba3..7990a2e 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -3,9 +3,7 @@
+ // dm/env.txt; main.m lists them in DM_ENV_FILE_KEYS) is shown but kept. All settings share one screen, grouped by section (rows: LauncherRow.swift). Choices that differ from the game's default are kept
+ // in UserDefaults; Reset to tested defaults shows the defaults, and Play then forgets them. DM_LAUNCHER=0 in Documents/env.txt starts the game at once with the saved choices; DM_SAVED_CHOICES=0 ignores them (and keeps them)
+ //
+-// Layout (0194, V1.3.40; 0196, V1.3.41): the poster fills the screen; the title and Play sit top-left; the settings and the character picker live in ONE glass panel on the right (the "box"), switched by the narrow
+-// icon-only bar at the bottom centre. Nothing opens full-screen any more (this supersedes 0185's fullScreenCover). The box is closed by default, so the poster stays clean on entry: tapping a bottom icon opens its tab,
+-// tapping the active icon again closes the box. The box and the bar share one
++// Layout (0194, V1.3.40; 0196, V1.3.41; 0197, V1.3.42): the poster fills the screen. No tab open: the title and Play sit centred on the poster, nothing else. A bottom icon opens its tab: the title moves top-left and the settings / character picker live in ONE glass panel on the right (the "box"); tapping the active icon again closes the box. The icon bar sits at the very bottom of the screen, narrow and centred, icons only. Nothing opens full-screen any more (this supersedes 0185's fullScreenCover). The box and the bar share one
+ // glass-intensity setting (UserDefaults DmGlassOpacity, 0-100, default 70), a slider in the Game tab. The character picker sits in the box too: hero + outfit deck + six character cards.
+ import SwiftUI
+ import UIKit
+@@ -763,9 +761,14 @@ private struct LauncherView: View {
+             LinearGradient(colors: [.black.opacity(0.5), .clear], startPoint: .top, endPoint: .bottom).ignoresSafeArea()
+             LinearGradient(colors: [.clear, .black.opacity(0.6)], startPoint: .top, endPoint: .bottom).ignoresSafeArea()
+             VStack(spacing: 0) {
+-                HStack(alignment: .top, spacing: 0) {
+-                    // Top-left: the game name, start, author (0182; user: title at the top-left, not the bottom)
+-                    VStack(alignment: .leading, spacing: 10 * s) {
++                // 0197: the stack fills the screen, so the bar is pinned to the very bottom and the top row's layout is stable whether the box is open or not.
++                HStack(alignment: selectedTab == nil ? .center : .top, spacing: 0) {
++                    // 0197: no tab open -> the title is centred (spacers both sides, centred text); a tab open -> title top-left, box on the right.
++                    if selectedTab == nil {
++                        Spacer()
++                    }
++                    // The game name, start, author (0182): top-left once a tab is open, centred on the poster while no tab is open (0197).
++                    VStack(alignment: selectedTab == nil ? .center : .leading, spacing: 10 * s) {
+                         Text("SUPER MARIO")
+                             .font(.system(size: 40 * s, weight: .black))
+                             .foregroundStyle(.white)
+@@ -778,9 +781,9 @@ private struct LauncherView: View {
+                             .font(.system(size: 15 * s)).foregroundStyle(.white.opacity(0.75))
+                         playButton(s)
+                     }
+-                    .padding(.leading, 28 * s)
+-                    .padding(.top, 28 * s)
+-                    .frame(width: 330 * s, alignment: .leading)
++                    .padding(.leading, selectedTab == nil ? 0 : 28 * s)
++                    .padding(.top, selectedTab == nil ? 0 : 28 * s)
++                    .frame(width: 330 * s, alignment: selectedTab == nil ? .center : .leading)
+                     // Right: the glass box (0194) — the active tab's content, header on top. Only when a tab is open (0196); closed by default.
+                     if let tab = selectedTab {
+                         VStack(alignment: .leading, spacing: 0) {
+@@ -797,9 +800,12 @@ private struct LauncherView: View {
+                         .padding(.top, 20 * s)
+                         .padding(.trailing, 25 * s)
+                         .padding(.bottom, 8 * s)
++                    } else {
++                        Spacer()
+                     }
+                 }
+-                // Bottom: the icon bar (0194) — narrow, centred, icons only, the active one red. Tapping an icon swaps the box's content.
++                .frame(maxWidth: .infinity, maxHeight: .infinity)
++                // Bottom: the icon bar (0194) — narrow, centred, icons only, the active one red, pinned to the very bottom (0197). Tapping an icon opens its tab; tapping the active one again closes the box.
+                 HStack(spacing: 0) {
+                     ForEach(LauncherCategory.allCases) { c in
+                         // 0196: tapping the active icon again closes the box; any other icon opens (or swaps to) its tab.
+@@ -809,14 +815,16 @@ private struct LauncherView: View {
+                                 .foregroundStyle(c == selectedTab ? Color(red: 0.9, green: 0.05, blue: 0.1) : Color(white: 0.4))
+                                 .frame(maxWidth: .infinity)
+                                 .padding(.vertical, 10 * s)
++                                .contentShape(Rectangle())
+                         }
+                         .buttonStyle(.plain)
+                     }
+                 }
+                 .frame(width: min(550 * s, geo.size.width * 0.62))
+                 .dmGlassCard(cornerRadius: 20, opacity: glassOpacity, light: true)
+-                .padding(.bottom, 12 * s)
++                .padding(.bottom, 8 * s)
+             }
++            .frame(maxWidth: .infinity, maxHeight: .infinity)
+         }
+         }
+         .preferredColorScheme(.dark)
+-- 
+2.43.0
+
