@@ -1,0 +1,26 @@
+From 29f3ef0c7892e692ef05e76286ed3454834ded63 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Wed, 18 Nov 2026 18:23:39 +0800
+Subject: [PATCH] 0198: guide SHIM provides window.wsnd stub (2nd tap threw)
+
+---
+ dm/host/web_apple.m | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/dm/host/web_apple.m b/dm/host/web_apple.m
+index 3b5d20a..95d607f 100644
+--- a/dm/host/web_apple.m
++++ b/dm/host/web_apple.m
+@@ -61,6 +61,9 @@ static NSString *const SHIM = @R"JS(
+   };
+   window.nx = stub(nx, '');
+ 
++  // wsnd (0198): the Switch browser's sound API (load, play). The guide calls wsnd.play unguarded on every selection after the first (basicMov/captureMov: action1SE/capture1SE), so without this the second tap throws ReferenceError and nothing updates -- the video, title and description all stay on the previous action. iOS has no such service; a logged no-op stub, same shape as playReport above. Sounds are muted by the host anyway (cfg.muted).
++  if (!window.wsnd) window.wsnd = stub({}, 'wsnd.');
++
+   // Sounds follow the host's audio: muted, every connection to the speakers goes through a gain of 0 (the sounds still play and end, for pages that wait for them)
+   if (cfg.muted && window.AudioNode) {
+     var connect = AudioNode.prototype.connect, quiet = new WeakMap();
+-- 
+2.43.0
+

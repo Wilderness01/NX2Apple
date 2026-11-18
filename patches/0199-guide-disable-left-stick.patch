@@ -1,0 +1,42 @@
+From feddc3f6182b73a2b9545a209ac959c2f5bca56f Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Wed, 18 Nov 2026 18:46:25 +0800
+Subject: [PATCH] 0199: disable the left stick while a web page is shown
+
+---
+ dm/ios/Sources/DmGamepad.m | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/dm/ios/Sources/DmGamepad.m b/dm/ios/Sources/DmGamepad.m
+index 14a7508..b6484e8 100644
+--- a/dm/ios/Sources/DmGamepad.m
++++ b/dm/ios/Sources/DmGamepad.m
+@@ -590,7 +590,7 @@ int front_web_touch(void);
+     if (_tap) return NO;
+     if ([self extraButtonAt:p]) return YES;   // jump and photo
+     if (!front_web_touch() && !_stick[0] && p.x < CGRectGetMidX(_layout.controls)) return YES;   // the left half is the floating stick's area -- except while a web page is shown, so its menu items stay tappable (0168)
+-    if (dm_pad_hit(self.geo, _full, _layout.separated, _tap, !_stick[0], p).kind != DM_PAD_HIT_NONE) return YES;   // the geometry touchesBegan hits with (DmPadGeometry.h)
++    if (dm_pad_hit(self.geo, _full, _layout.separated, _tap, !_stick[0] && !front_web_touch(), p).kind != DM_PAD_HIT_NONE) return YES;   // the geometry touchesBegan hits with (DmPadGeometry.h); the left stick is not a control while a web page is shown (0199), so a tap near where it rests reaches the page instead of waking it
+     return _full && !_stick[1] && [self inRightArea:p];
+ }
+ - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
+@@ -609,14 +609,14 @@ int front_web_touch(void);
+             if (extra == 1) { [_owner setObject:@(C_BTN | (uint64_t)B_B << 8) forKey:t]; continue; }
+             if (extra == 2) { [_owner setObject:@(C_BTN | (uint64_t)B_DOWN << 8) forKey:t]; continue; }
+         }
+-        DmPadHit hit = dm_pad_hit(self.geo, _full, _layout.separated, _tap, !_stick[0], p);   // the same geometry the controls are drawn with (the menu button took its own touches, menuTakes)
++        DmPadHit hit = dm_pad_hit(self.geo, _full, _layout.separated, _tap, !_stick[0] && !front_web_touch(), p);   // the same geometry the controls are drawn with (the menu button took its own touches, menuTakes); the left stick is not a control while a web page is shown (0199)
+         BOOL lineOff = hit.kind == DM_PAD_HIT_KEY && (lockedKey(hit.key) == B_ZR || lockedKey(hit.key) == B_R || lockedKey(hit.key) == B_LS || lockedKey(hit.key) == B_RS || [self keyUserHidden:lockedKey(hit.key)]);   // ZR, R, L3 and R3 are hidden and disabled; a key the player hid in the button settings is too (0146)
+         if (hit.kind == DM_PAD_HIT_KEY && !lineOff) { [_owner setObject:@(C_BTN | (uint64_t)lockedKey(hit.key) << 8) forKey:t]; continue; }
+         if (_tap) { game |= [self gameBegin:t]; continue; }
+         int kind = hit.kind == DM_PAD_HIT_FACE ? C_FACE : hit.kind == DM_PAD_HIT_DPAD ? C_DPAD : hit.kind == DM_PAD_HIT_STICK ? C_STICK : C_NONE, idx = 0;
+         if (hit.kind == DM_PAD_HIT_DPAD) kind = C_NONE;   // the D-pad is hidden and disabled
+         if (kind == C_STICK) _lCentre = p;   // the fixed stick is gone: the floating stick starts where the finger lands
+-        if (kind == C_NONE && !_stick[0] && p.x < CGRectGetMidX(_layout.controls)) { _lCentre = p; kind = C_STICK; idx = 0; }   // the left half is the floating stick's area (any point but a visible button)
++        if (kind == C_NONE && !front_web_touch() && !_stick[0] && p.x < CGRectGetMidX(_layout.controls)) { _lCentre = p; kind = C_STICK; idx = 0; }   // the left half is the floating stick's area (any point but a visible button) -- except while a web page is shown, so its menu items stay tappable (0199)
+         if (kind == C_NONE && _full && !_stick[1] && [self inRightArea:p]) { kind = C_STICK; idx = 1; _rCentre = p; [self hideHint]; }   // the right stick: centred where the touch lands (the hint's job is done)
+         if (kind == C_FACE) { [_owner setObject:@(C_FACE) forKey:t]; [_faceOf setObject:@([self faceAt:p]) forKey:t]; }
+         else if (kind == C_DPAD) [_owner setObject:@(C_DPAD) forKey:t];
+-- 
+2.43.0
+
