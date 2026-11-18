@@ -1,0 +1,52 @@
+From b0e62f9201627653ca36a64a677d5301bd7d4739 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Wed, 18 Nov 2026 13:26:26 +0800
+Subject: [PATCH] 0186: shop specialties back in the regional shops -- keep
+ StoreName on all 81 kingdom rows (each kingdom NPC sells its own specialties
+ again, no longer empty), strip ClearWorld/MoonNum (unlocked), Price 0 on all
+ 147 rows (free). 147 rows, no rows added. The 66 common rows stay at the
+ common-goods NPC. A row can only belong to one NPC, so all 81 cannot appear
+ at every single shop at once via data; all 81 are buyable across the regional
+ shops.
+
+---
+ dm/romfs-overlay/SystemData/ItemList.szs | Bin 24123 -> 24843 bytes
+ 1 file changed, 0 insertions(+), 0 deletions(-)
+
+diff --git a/dm/romfs-overlay/SystemData/ItemList.szs b/dm/romfs-overlay/SystemData/ItemList.szs
+index 1b9d9adaf38d0903c8b9768c89387c074ef74e3d..80809c22d2d7bb152fc36f2e8db97e2be007afd1 100644
+GIT binary patch
+delta 1820
+zcmZ9MT}YEr7{|{d%bc3ln@TOxu$1V+V$=D(cTSOzOcN=RK0wHDguw{=0E0dd@?!d0
+zco8(JiwGmbU1%*T5&B>k5u*&e=tIhjE)2aeFi-zy=j>w7;QaYL=g0Y<cQ0(uBet7U
+zHpkIZ7fXa_cMAQHht1YHL&#O>Y#($C8OuH)<oW~O|LzpRCPlpv;kKt!i~IWAc8E?y
+zkRXDXCos~5@L)+lVuWBCu|VL+5TX%F1`r{FC}NqQFjI&_Sn@LBAwdiwHUjn{ju2c!
+zj1kNtQv0$%PQ*!q0mKBs93m?lP=)9s7)HDz_>IWh1n?nx2<{->5-cI|Hv^gwy#x;s
+z9|%?u#Ri}aafM(MF=Lztt=%F-36|_Y^b>>;UkTE4gm7cYPDGF(f|w^Ta`A?+q#rRt
+zFpXFsaOB|)VaWg@L=d&QogbTfb^wPF69lsekq;<DG!pm`L4q)1hF}GeUjXnSx(Egk
+zV+64RtEIuPnq3}SiWPJf+1KGNfscHhVokbs$7e|!n7=WfR+{YhmnNS-mhb^}{;Kvg
+zQvWFPG3Ng<zpG63d-eH)W%_>FK;L=h?=t^}`32_l+{yi>Tlc4`{xjOsNY6jS{4?f%
+zFmEqc{dmXm^UiYJPaEj#VE#JukD33({3`QB6}o?o>Tj-4_tQwv-^+Z6`FG6!(cY%d
+zZ>`k*w1GZvrRq=kZsslKBh1e+pHZdz8&tomO7+u7&wrfx8_Yjp{<HRV>ikf(uBRDw
+z#nq}_YpaF%3(VhR{yp=H3BN)0Z>v%LG}7byYV`fu`<cJR{0ruPGM`zi`ti3M?=P#>
+z{j`DmPB7ok{223Jn74V7`}cTszen}AYEL75ze~*DXFkgOlJ=%PzunaRw1K{QQ{A8N
+nXPLjv{7dG4F`wm4?st2OQt(R*nU?9x89(REO&cF<dX)ViidE9R
+
+delta 1182
+zcmXYtTS!z<6o&VJ(2QB?IHi^3U_Dg$pyd5Jj$@?>iepe=pyY#)!8{m9nF?J9GBUT6
+z4;DQXMMxS>B4jj3bb$y7As?hHBn*P2f-<Dj|Ff2`KfaH(UFXcXJmY#Y?Mgq=dOF*f
+zaMb9Z6RvEm@)_r!6AfQWAM{0n#yIP0Kd)vQ<8t~?xs8uze&+OMug9PX=%S1OG0GC)
+zPJm<q4U|q`m@*A4QsOokvkS+m10s|mV2ZK;n2nH~zyV4JFhGd{^OQBf-<t>v0qvB2
+zV4N}s{Gp^L856*9+JH-xQDBzx3rI_blmac3^T2(|8(@Xv^BPl#<1_<(lsmvH$~Pb>
+zr5Bc)V$5M2ryICUc@8X75`4yF<2X$~7i9#9QI-JrCP)_0K<NaADbv6rC2ljm5ROv^
+zL?}bR6lDQ0sip{@C>5Uw$LRnDC{bXZvIh9mAR(Zg(hrPN=IqwocQ(AwYwPm@wx`Bz
+zZ{+!HY`@38&dacoT95sU-j2@7&#-4}JoZ?=^i_0Awa3P^f9QNify@sT$o-3G?wdk$
+z-&gHzh0=9}a=!=7{bSmn(A@7Wl6j~|=BKppY0sm%KfYM@l@v>#)V_u0`_H1e-&G>L
+zw?y{0X<tWk{!)8YdrztCYc7@jSG1pLub{a<vrPU!Tqb=1&G(<wUe@`Ra+x12m;2pl
+zzW+lszt2bQ<O=Cvh1~B%^Zo8>zejVwJ0SDofb<FNn`qvDD?L~#nNul`JC5e#hO}R3
+z|3>rY><-HPqe1C@G#~d=`@7ElRWfg^lKbb-{5g-&-2X-AX(5@{gyjAi?NRLy+KJVi
+TdnanEQ{(NJ%QMkh{~-B4p4?;I
+
+-- 
+2.43.0
+

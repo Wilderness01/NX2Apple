@@ -1,0 +1,47 @@
+From 49aa31971c6946daa8d50b7b41b7dcb73e1dc7bd Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Wed, 18 Nov 2026 13:20:42 +0800
+Subject: [PATCH] =?UTF-8?q?0185:=20launcher=20text=20size=20+=20full-scree?=
+ =?UTF-8?q?n=20settings=20=E2=80=94=20fix=20the=20adaptive=20scale=20(geo.?=
+ =?UTF-8?q?size=20is=20in=20points,=20not=20pixels:=20divide=20by=20932,?=
+ =?UTF-8?q?=20not=202796;=20the=20old=20divisor=20shrank=20all=20text=20to?=
+ =?UTF-8?q?=20a=20third)=20and=20present=20each=20settings=20page=20with?=
+ =?UTF-8?q?=20fullScreenCover=20instead=20of=20sheet=20(a=20sheet=20shows?=
+ =?UTF-8?q?=20as=20a=20side=20card=20on=20this=20screen)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ dm/ios/Sources/Launcher.swift | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index 680925b..7d079d9 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -277,9 +277,9 @@ private struct LauncherView: View {
+     @State private var category: LauncherCategory?
+ 
+     var body: some View {
+-        // Adaptive (0182): sizes scale with the screen — the reference is the iPhone 15 Pro Max landscape canvas (2796x1290); on an iPad (4:3) the same scale keeps the title, button and settings row in proportion, and the poster fills by cropping (scaledToFill).
++        // Adaptive (0182): sizes scale with the screen — the reference is the iPhone 15 Pro Max landscape canvas in POINTS (932x430), not pixels: geo.size is in points, so dividing by the pixel width 2796 shrank everything to a third. On an iPad (4:3) the same scale keeps the title, button and settings row in proportion, and the poster fills by cropping (scaledToFill).
+         GeometryReader { geo in
+-        let s = min(max(geo.size.width / 2796, 0.5), 1.6)
++        let s = min(max(geo.size.width / 932, 0.5), 1.6)
+         ZStack {
+             // The poster (0182): the Odyssey key art, full-bleed. The navy backdrop behind it is the fallback if the art is missing.
+             if let art = dmLauncherTitleImage() {
+@@ -330,7 +330,8 @@ private struct LauncherView: View {
+         }
+         }
+         .preferredColorScheme(.dark)
+-        .sheet(item: $category) { c in
++        // Full-screen settings page (0185): a sheet presents as a side card on this screen, the user wants the settings page full-screen.
++        .fullScreenCover(item: $category) { c in
+             LauncherCategorySheet(category: c, m: m)
+         }
+     }
+-- 
+2.43.0
+
