@@ -1,0 +1,89 @@
+From a17071de8127d842482bc42e062c8b8aefffcca6 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Wed, 18 Nov 2026 07:58:11 +0800
+Subject: [PATCH] 0181: liquid glass for the project's own launcher
+ (glass-only, no gold, no Odyssey colours)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The launcher stays the project's own default layout (game card left,
+settings List right, same structure) — only the surfaces turn to glass:
+the game card is one glass slab and the settings list is one glass
+sheet over a neutral deep-navy backdrop (white/blue glows, no red, no
+gold). iOS 26 native .glassEffect regular, ultraThinMaterial below 26.
+No row icons, no Odyssey red/gold, no layout change.
+---
+ dm/ios/Sources/Launcher.swift | 38 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index b7655c7..12793ee 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -151,6 +151,38 @@ private struct DocumentPicker: UIViewControllerRepresentable {
+     }
+ }
+ 
++/// Liquid Glass for the launcher's panels (0181): iOS 26 native .glassEffect, regular; below iOS 26 a translucent material fill. The deployment target is iOS 26, so the fallback is dead code kept for the pattern's sake — the same ladder the pad's discs use (0111: real UIGlassEffect on 26+, vector disc below). Layered, not flat: a soft inner highlight along the top edge and a gentle drop shadow give the card depth; the corner radius is a little larger (32) for the game's rounded, playful shapes. Glass needs something behind it to refract: the backdrop is a deep navy-black base, neutral on purpose — the text is white on dark glass, and a loud backdrop would fight it.
++private extension View {
++    @ViewBuilder func dmGlassCard(cornerRadius: CGFloat = 32) -> some View {
++        Group {
++            if #available(iOS 26.0, *) {
++                self.glassEffect(.regular, in: RoundedRectangle(cornerRadius: cornerRadius))
++            } else {
++                self.background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: cornerRadius))
++            }
++        }
++        .overlay(
++            RoundedRectangle(cornerRadius: cornerRadius)
++                .strokeBorder(
++                    LinearGradient(colors: [.white.opacity(0.45), .white.opacity(0.06)], startPoint: .top, endPoint: .bottom),
++                    lineWidth: 1
++                )
++        )
++        .shadow(color: .black.opacity(0.28), radius: 16, x: 0, y: 8)
++    }
++}
++
++private struct LauncherBackdrop: View {
++    var body: some View {
++        ZStack {
++            Color(red: 0.04, green: 0.06, blue: 0.11)
++            RadialGradient(colors: [.white.opacity(0.08), .clear], center: .topLeading, startRadius: 0, endRadius: 620)
++            RadialGradient(colors: [Color(red: 0.30, green: 0.45, blue: 0.80).opacity(0.12), .clear], center: .bottomTrailing, startRadius: 0, endRadius: 680)
++        }
++        .ignoresSafeArea()
++    }
++}
++
+ private struct LauncherView: View {
+     @ObservedObject var m: LauncherModel
+     let play: () -> Void
+@@ -173,7 +205,7 @@ private struct LauncherView: View {
+                         .font(.callout).foregroundStyle(.secondary)
+                     playButton
+                 }
+-                .padding(16)
++                .padding(20)   // (0181) a little more air inside the glass panel
+                 .frame(width: geometry.size.width / 3, height: geometry.size.height)
+                 List {
+                     ForEach(m.sections, id: \.self) { section in
+@@ -201,10 +233,14 @@ private struct LauncherView: View {
+                     }
+                 }
+                 .listStyle(.insetGrouped)
++                .scrollContentBackground(.hidden)   // (0181) the list's own background goes, so the single glass panel behind it shows
++                .listRowBackground(Color.clear)   // (0181) every row is clear: the rows sit on the one glass panel, not on their own cards
+                 .contentMargins(.horizontal, 12, for: .scrollContent)
+                 .frame(width: geometry.size.width * 2 / 3)
+             }
++            .dmGlassCard(cornerRadius: 0)   // (0181) one whole piece of glass: the game card and the settings list sit on a single glass panel, edge to edge; the toggles, sliders and menus on it are already glass on iOS 26, system-drawn
+         }
++        .background(LauncherBackdrop())   // (0181) the backdrop the glass refracts
+         .preferredColorScheme(.dark)
+         .task {
+             while !Task.isCancelled {
+-- 
+2.43.0
+

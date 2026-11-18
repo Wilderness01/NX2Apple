@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Tue, 17 Nov 2026 23:10:00 +0000
+Subject: [PATCH] 0180: keep the in-game menu liquid glass (row icons + forced
+ dark) after the launcher reverts to the project's own default
+
+0180 is 0171 split: the launcher goes back to the project's own default
+(no 0171 glass cards, no 0173 Mario background, no 0176 Diablo, no 0178 red
+map), but the in-game gear menu keeps its liquid-glass treatment — the row
+icons (GameMenu.swift) and the forced dark window style (front_ios.m), so the
+system UIMenu on iOS 26 renders as dark glass over the game instead of a
+flat pale panel.
+
+---
+ dm/ios/Sources/GameMenu.swift | 25 +++++++++---
+ dm/ios/Sources/front_ios.m    |  1 +
+ 2 files changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/dm/ios/Sources/GameMenu.swift b/dm/ios/Sources/GameMenu.swift
+index b10c74b..f863d66 100644
+--- a/dm/ios/Sources/GameMenu.swift
++++ b/dm/ios/Sources/GameMenu.swift
+@@ -18,9 +18,9 @@ private func gameMenuItems() -> [UIMenuElement] {
+     let layouts = (0..<3).filter { dm_pad_layout_offered(Int32($0)) }.map { l in
+         UIAction(title: names[l], state: dm_pad_layout() == l ? .on : .off) { _ in dm_pad_layout_set(Int32(l)) }
+     }
+-    let layout = UIMenu(title: LauncherText.text("ui.controllerLayout", "Controller layout"), options: .singleSelection, children: layouts)   // a choice's value shows in its submenu: a subtitle would make each row two lines
+-    let padSettings = UIAction(title: "按键设置") { _ in dm_gamepad_open_pad_settings() }   // the button editor (DmGamepad.m): the icons' size and where they sit
+-    let hudSettings = UIAction(title: "HUD 设置") { _ in dm_hud_pad_open_editor() }   // (0148) the pad-style HUD editor (HudPadEditor.m): drag the elements on the game, live in the running game
++    let layout = UIMenu(title: LauncherText.text("ui.controllerLayout", "Controller layout"), image: UIImage(systemName: "gamecontroller"), options: .singleSelection, children: layouts)   // a choice's value shows in its submenu: a subtitle would make each row two lines
++    let padSettings = UIAction(title: "按键设置", image: UIImage(systemName: "gamecontroller.fill")) { _ in dm_gamepad_open_pad_settings() }   // the button editor (DmGamepad.m): the icons' size and where they sit
++    let hudSettings = UIAction(title: "HUD 设置", image: UIImage(systemName: "gauge")) { _ in dm_hud_pad_open_editor() }   // (0148) the pad-style HUD editor (HudPadEditor.m): drag the elements on the game, live in the running game
+     var items: [UIMenuElement] = []
+     var placed = false
+     if let m = gameMenuModel {
+@@ -36,17 +36,32 @@ private func gameMenuItems() -> [UIMenuElement] {
+     return items
+ }
+ 
++/// A leading icon for a menu row (0171): by the setting's env key, so the icon matches what the row does. Rows without a mapping get none. SF Symbols; the menu draws them in its own tint, and a toggle's checkmark is the system's (on iOS 26 it shares the leading slot — see the report's device check).
++private func gameMenuRowIcon(_ env: String) -> UIImage? {
++    switch env {
++    case "DM_RUMBLE": return UIImage(systemName: "iphone.radiowaves.left.and.right")   // Game rumble
++    case "DM_TOUCH_HAPTICS": return UIImage(systemName: "hand.tap")   // Touch feedback
++    case "DM_SHOW_FPS": return UIImage(systemName: "speedometer")   // Frame-rate counter
++    case "DM_PICTURE_FIT": return UIImage(systemName: "photo")   // Picture: fill or fit
++    case "DM_OPMODE": return UIImage(systemName: "tv")   // Console mode: docked is the TV
++    case "DM_SCREEN_ASPECT": return UIImage(systemName: "aspectratio")   // Picture shape
++    case "DM_PRESENT_UPSCALE": return UIImage(systemName: "sparkles")   // Upscaling
++    case "DM_LANG": return UIImage(systemName: "globe")   // Game language
++    default: return nil
++    }
++}
++
+ private func gameMenuRow(_ m: LauncherModel, _ s: Setting) -> UIMenuElement {
+     let now = m.values[s.env] ?? s.def, fixed = m.fixed.contains(s.env)
+     let attributes: UIMenuElement.Attributes = fixed ? .disabled : []
+     func pick(_ v: String) { m.choose(s, v); _ = dm_setting_live(s.env, v) }
+     if s.kind == "toggle" {
+-        let a = UIAction(title: s.label, attributes: attributes, state: now == s.onValue ? .on : .off) { _ in pick(now == s.onValue ? s.offValue : s.onValue) }
++        let a = UIAction(title: s.label, image: gameMenuRowIcon(s.env), attributes: attributes, state: now == s.onValue ? .on : .off) { _ in pick(now == s.onValue ? s.offValue : s.onValue) }
+         if fixed { a.subtitle = LauncherText.text("ui.setInEnvTxt", "Set in env.txt") }
+         return a
+     }
+     let options = s.options ?? []
+     let current = options.first { $0[0] == now }?[1] ?? now
+     let actions = options.map { o in UIAction(title: o[1], attributes: attributes, state: o[0] == now ? .on : .off) { _ in pick(o[0]) } }
+-    return UIMenu(title: s.label, subtitle: fixed ? "\(current), \(LauncherText.text("ui.setInEnvTxtInline", "set in env.txt"))" : nil, options: .singleSelection, children: actions)
++    return UIMenu(title: s.label, subtitle: fixed ? "\(current), \(LauncherText.text("ui.setInEnvTxtInline", "set in env.txt"))" : nil, image: gameMenuRowIcon(s.env), options: .singleSelection, children: actions)
+ }
+diff --git a/dm/ios/Sources/front_ios.m b/dm/ios/Sources/front_ios.m
+index 4225b98..c9be3ec 100644
+--- a/dm/ios/Sources/front_ios.m
++++ b/dm/ios/Sources/front_ios.m
+@@ -179,6 +179,7 @@ static void launcher_done(void) { [g_root startGame]; }
+     if (self.fill) LOG("front end: picture Fill (DM_PICTURE_FIT=fill), the 16:9 picture covers the screen in landscape and its edges are cropped");
+     self.view.clipsToBounds = YES;   // with Fill the game view is larger than the screen
+     self.view.window.traitOverrides.preferredContentSizeCategory = UIContentSizeCategorySmall;   // UIKit draws the in-game menu (GameMenu.swift) in this window: it keeps one compact text size over the game, whatever the system's text size
++    self.view.window.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;   // (0171) the in-game menu is a system UIMenu (GameMenu.swift): iOS draws it, and on iOS 26 it is Liquid Glass automatically — but in the system's light style it reads as a flat pale panel over the dark game scene. Dark here makes it dark glass, white text on dark glass, which reads over the game. The pad's own panels already use explicit dark colours (DmGamepad.m buildEditBar, HudPadEditor.m buildEditBar; the frame-rate label, hints and progress views are explicit white on black), so they do not change; the quit prompt goes dark with it.
+     self.game = [[DmGameView alloc] initWithFrame:self.view.bounds];
+     [self.view addSubview:self.game];
+     g_layer = (CAMetalLayer *)self.game.layer;
+-- 
+2.43.0
+
