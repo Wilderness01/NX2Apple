@@ -1,0 +1,36 @@
+From 7de95c9ee56389465fed716afe6589d7752901a3 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Wed, 18 Nov 2026 14:29:41 +0800
+Subject: [PATCH] 0190 launcher sheet: wrap character/list if-else in Group so
+ .navigationTitle compiles
+
+---
+ dm/ios/Sources/Launcher.swift | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index ed1f45e..def63e3 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -496,6 +496,10 @@ private struct LauncherCategorySheet: View {
+ 
+     var body: some View {
+         NavigationStack {
++            // Group wraps the if/else into one concrete type: applying
++            // .navigationTitle to the raw _ConditionalContent does not compile
++            // ("cannot infer contextual base"), which broke build #85.
++            Group {
+             if category == .character {
+                 CharacterPickerView()
+             } else {
+@@ -535,6 +539,7 @@ private struct LauncherCategorySheet: View {
+                 }
+             }
+             }
++            }
+             .navigationTitle(category.title)
+             .navigationBarTitleDisplayMode(.inline)
+             .toolbar {
+-- 
+2.43.0
+
