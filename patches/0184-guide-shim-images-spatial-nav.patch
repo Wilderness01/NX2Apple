@@ -1,0 +1,67 @@
+From 5086867bc5d849e1e7903492ebbeb6578c631e20 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Wed, 18 Nov 2026 09:22:05 +0800
+Subject: [PATCH] =?UTF-8?q?0184:=20guide=20images=20and=20stick=20?=
+ =?UTF-8?q?=E2=80=94=20fire=20NXFirstPaintEndAfterLoad=20so=20loadImage=20?=
+ =?UTF-8?q?runs,=20and=20move=20focus=20with=20the=20D-pad/stick=20(spatia?=
+ =?UTF-8?q?l=20navigation)=20when=20the=20page=20does=20not=20take=20the?=
+ =?UTF-8?q?=20arrow=20key?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ dm/host/web_apple.m | 30 +++++++++++++++++++++++++++++-
+ 1 file changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/dm/host/web_apple.m b/dm/host/web_apple.m
+index 8dd53be..0a03403 100644
+--- a/dm/host/web_apple.m
++++ b/dm/host/web_apple.m
+@@ -106,6 +106,33 @@ static NSString *const SHIM = @R"JS(
+   document.addEventListener('blur', function () { setTimeout(function () { mark(document.activeElement); }, 0); }, true);
+   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', style); else style();
+   window.addEventListener('load', mirror);
++  // The Switch's web applet fires NXFirstPaintEndAfterLoad after the first paint, and pages load their images on it (the action guide's loadImage turns each img's ref into a src there, and only there when window.nx exists). WKWebView never fires it, so no guide image ever loads and a detail page is blank. Fire it once after load, so the page's own image loading runs.
++  window.addEventListener('load', function () { setTimeout(function () { window.dispatchEvent(new Event('NXFirstPaintEndAfterLoad')); }, 0); });
++
++  // Spatial navigation (0184): the Switch's browser moves the focus with the D-pad and the left stick, and pages written for it (the action guide) rely on that — they have no arrow-key handler of their own. WKWebView has none, so an arrow key the page does not consume would move nothing and the stick could not be used in the guide. When an arrow keydown is not cancelled and the focus did not move, move it to the nearest focusable element in that direction (primary distance first, then how far off-axis it is); with nothing focused, take the first focusable element.
++  var spatial = function (code) {
++    var cur = document.activeElement;
++    var els = document.querySelectorAll('a[href],button,input,select,textarea,[tabindex]:not([tabindex="-1"]),[onclick]');
++    if (!cur || cur === document.body || cur === document.documentElement) {
++      for (var i = 0; i < els.length; i++) { var f = els[i].getBoundingClientRect(); if (f.width || f.height) { els[i].focus(); return; } }
++      return;
++    }
++    var r = cur.getBoundingClientRect(), cx = r.left + r.width / 2, cy = r.top + r.height / 2;
++    var dx = code === 37 ? -1 : code === 39 ? 1 : 0, dy = code === 38 ? -1 : code === 40 ? 1 : 0;
++    var best = null, bestScore = Infinity;
++    for (var j = 0; j < els.length; j++) {
++      var el = els[j];
++      if (el === cur) continue;
++      var er = el.getBoundingClientRect();
++      if (!er.width && !er.height) continue;
++      var vx = (er.left + er.width / 2) - cx, vy = (er.top + er.height / 2) - cy;
++      var primary = dx !== 0 ? vx * dx : vy * dy;
++      if (primary <= 0) continue;
++      var score = primary + (dx !== 0 ? Math.abs(vy) : Math.abs(vx)) * 2;
++      if (score < bestScore) { bestScore = score; best = el; }
++    }
++    if (best) best.focus();
++  };
+ 
+   // The controller: host bits (nn::hid::NpadButton: A0 B1 X2 Y3 LS4 RS5 L6 R7 ZL8 ZR9 +10 −11 left12 up13 right14 down15) in the standard mapping's order
+   var STD = [1, 0, 3, 2, 6, 7, 8, 9, 11, 10, 4, 5, 13, 15, 12, 14];
+@@ -123,7 +150,8 @@ static NSString *const SHIM = @R"JS(
+     var e = new KeyboardEvent(type, {key: KEYS[code][0], code: KEYS[code][1], bubbles: true, cancelable: true, repeat: !!repeat});
+     Object.defineProperty(e, 'keyCode', {get: function () { return code; }});
+     Object.defineProperty(e, 'which', {get: function () { return code; }});
+-    var t = at || target(), r = t.dispatchEvent(e);
++    var t = at || target(), before = document.activeElement, r = t.dispatchEvent(e);
++    if (type === 'keydown' && code >= 37 && code <= 40 && r && document.activeElement === before) spatial(code);
+     if (cfg.debug && type === 'keydown') { var a = document.activeElement; post({k: 'log', d: 'key ' + code + ' at ' + (t.id || t.tagName) + ' -> focus ' + (a && (a.id || a.tagName)) + (a && a.matches(':focus') ? ' (:focus)' : ' (not :focus)') + ' hasFocus ' + document.hasFocus()}); }
+     return r;
+   };
+-- 
+2.43.0
+
