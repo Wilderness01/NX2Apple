@@ -1,0 +1,37 @@
+From 8cf05ebc35af66f8b5e666720dbb8f2b531bb4d5 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Thu, 19 Nov 2026 01:00:53 +0800
+Subject: [PATCH] 0200: glass overlay must not eat touches (bottom bar dead
+ since 0194)
+
+---
+ dm/ios/Sources/Launcher.swift | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index 7990a2e..e0e87b2 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -167,9 +167,11 @@ private extension View {
+     @ViewBuilder func dmGlassCard(cornerRadius: CGFloat = 32, opacity: Double = 70, light: Bool = false) -> some View {
+         let op = max(0, min(100, opacity)) / 100
+         dmGlassBase(cornerRadius: cornerRadius, opacity: op)
++            // 0200: these overlays are decoration only, but SwiftUI hit-testing gives a tap to the topmost view that contains it — the fill RoundedRectangle covers the whole panel, so it ate every tap and the buttons underneath (bottom bar, box controls) never saw one. The bar has been dead since 0194 added this fill (V1.3.36's 0181 glass had only the 1pt stroke, which is why Play still worked then; 0197's contentShape could not help, the overlay sits above the buttons). Let touches fall through to the content.
+             .overlay(
+                 RoundedRectangle(cornerRadius: cornerRadius)
+                     .fill((light ? Color.white : Color(red: 0.05, green: 0.07, blue: 0.13)).opacity((light ? 0.55 : 0.45) * op))
++                    .allowsHitTesting(false)
+             )
+             .overlay(
+                 RoundedRectangle(cornerRadius: cornerRadius)
+@@ -177,6 +179,7 @@ private extension View {
+                         LinearGradient(colors: [.white.opacity(0.45 * op), .white.opacity(0.06 * op)], startPoint: .top, endPoint: .bottom),
+                         lineWidth: 1
+                     )
++                    .allowsHitTesting(false)
+             )
+             .shadow(color: .black.opacity(0.28 * op), radius: 16, x: 0, y: 8)
+     }
+-- 
+2.43.0
+
