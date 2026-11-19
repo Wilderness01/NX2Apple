@@ -152,3 +152,7 @@
 0202-launcher-outfit-renders.patch
 0203-peach-mario-marker-bone.patch
 0204-wario-mario-skeleton-reskin.patch
+0205-outfit-image-name-strip-mario-prefix.patch
+0206-launcher-glass-slider-fix.patch
+0207-wario-single-body-shape.patch
+0208-peach-fmdl-rename-mario.patch

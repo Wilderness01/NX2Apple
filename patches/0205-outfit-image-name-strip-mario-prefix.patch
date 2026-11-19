@@ -1,0 +1,45 @@
+From da5684c894ef8b59b269dd13c23c8e2f352c0ddf Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Thu, 19 Nov 2026 10:49:48 +0800
+Subject: [PATCH] 0205: outfit cards strip Mario prefix so renders load
+
+---
+ dm/ios/Sources/Launcher.swift | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index 6881c35..83fc4da 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -383,19 +383,25 @@ private struct DeckItem: Identifiable {
+     let name: String
+ }
+ 
++/// The render filename for an outfit id (0205): the ids are Mario-prefixed ItemNames ("Mario64"), but the renders are named of_<character>_<bare>.png ("of_mario_64.png") — strip the "Mario" prefix. Without this every card looked up "of_mario_Mario64", found nothing, and fell back to a text-only card; only "default" worked, because its id is literally "default" (V1.3.44 device report).
++private func dmOutfitImageName(character: String, id: String) -> String {
++    let base = id.hasPrefix("Mario") ? String(id.dropFirst(5)) : id
++    return "of_\(character)_" + base
++}
++
+ /// The grid's list for a character and a slot (0194, 0201). The first entry is always "default". Mario gets all 50 caps + 52 clothes; Luigi gets his 3 clothes and default-only caps; Wario gets his 8 costumes in each slot; Peach, Pauline and Toad get default only for now. The card image is the real render of_<character>_<id>.png; the default card uses of_<character>_default (only Mario's exists — the rest fall back to a text-only card).
+ private func dmDeckItems(character: String, caps: Bool) -> [DeckItem] {
+     var items: [DeckItem] = [DeckItem(id: "default", image: "of_\(character)_default", name: "\u{9ed8}\u{8ba4}")]
+     switch character {
+     case "mario":
+         let src = caps ? dmOutfitCaps : dmOutfitClothes
+-        items += src.map { DeckItem(id: $0.id, image: "of_mario_" + $0.id, name: $0.name) }
++        items += src.map { DeckItem(id: $0.id, image: dmOutfitImageName(character: "mario", id: $0.id), name: $0.name) }
+     case "luigi":
+         if !caps {
+-            items += dmLuigiClothes.map { DeckItem(id: $0.id, image: "of_luigi_" + $0.id, name: $0.name) }
++            items += dmLuigiClothes.map { DeckItem(id: $0.id, image: dmOutfitImageName(character: "luigi", id: $0.id), name: $0.name) }
+         }
+     case "wario":
+-        items += dmWarioOutfits.map { DeckItem(id: $0.id, image: "of_wario_" + $0.id, name: $0.name) }
++        items += dmWarioOutfits.map { DeckItem(id: $0.id, image: dmOutfitImageName(character: "wario", id: $0.id), name: $0.name) }
+     default:
+         break
+     }
+-- 
+2.43.0
+
