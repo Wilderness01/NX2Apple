@@ -1,0 +1,179 @@
+From 0c4b8d86e1a5ca215d36134e0aef445acc5dc3ef Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Thu, 19 Nov 2026 01:25:51 +0000
+Subject: [PATCH] 0204: Wario rebuilt as a Mario-skeleton reskin
+
+---
+ dm/romfs-overlay/ObjectData/Wario.szs         | Bin 1284199 -> 1284199 bytes
+ .../ObjectData/WarioColorClassic.szs          | Bin 1108375 -> 1108375 bytes
+ .../ObjectData/WarioColorGold.szs             | Bin 3329287 -> 3329287 bytes
+ .../ObjectData/WarioColorLuigi.szs            | Bin 1107799 -> 1107799 bytes
+ .../ObjectData/WarioColorWaluigi.szs          | Bin 1088323 -> 1088323 bytes
+ .../ObjectData/WarioColorWario.szs            | Bin 1106836 -> 1106836 bytes
+ dm/romfs-overlay/ObjectData/WarioHigh.szs     | Bin 4129495 -> 4129495 bytes
+ .../ObjectData/WarioPrimitiveMan.szs          | Bin 209383 -> 209383 bytes
+ 8 files changed, 0 insertions(+), 0 deletions(-)
+
+diff --git a/dm/romfs-overlay/ObjectData/Wario.szs b/dm/romfs-overlay/ObjectData/Wario.szs
+index 23487abd0fe361dfdf0d8d4618f7e2b27fc6241b..6a7e69616a9562059921671464d2e73d771a7d36 100644
+GIT binary patch
+delta 398
+zcmXxbF-QVo7zW_)zw^>7Jw1OlQ%h-Si9m2`aBvb%lY-K_gR|K+2%@thqNVK{oP->T
+zmOxOHmOuw-kiele+?*O4g5dfr8lIPr_y6BnyEtnX+iwL=8~{WR7+Qq{eid{o82G^T
+zR~#4Tg#e!a;<Ko;IF@#7%GY^zw9>@Q6kIFU@UW7?rs2b0Im-fAH`Xy)$upI%BwkcB
+zR1KQ$O88OH7)NDq6W<RMJkry+THeN~o@U|SRmRA(2wgR_jnt)VUdtvU0uhOeNMwPy
+ziHFE!kt`7}@ezgiNr0#%*q2SdvBp&hg2N#MVTgdU3{hC=Jel7Do>{W%`Kmu?Oiy`=
+z-Q%N`bBh4oaVv=fE5t;+wZimEYMj`->2m>O9E$FUHn>$yv4@7g&T|Qgx=AZJoIhp+
+fIL|r)HCpU$=tzyR&13jdO?O6O&)ZjT_`dfCSUh`&
+
+delta 342
+zcma*eJxjxI5C-u7HL*!FP4glKK`OYoR8e#i!C7cxi=fR5_yMvCPKx57gWK~7TwRO=
+z?BI7OIJk<qbnN8d<`cx-gWqxYa5pLANg0=Kk*QdkY6woEC45II15qud{|0Aq9W<2r
+z7ktI3DD)4`*~fLSdi_^J=Fu4z;@~3d;(53SFI&SyW@A0sk~Y(2TqQkmF-{8c;2d`G
+ze(c~h-IN7>?%;!y&$|_DXZsRzDkP}?uC4sW%7q%FkxnzzB!f({XqM*4rWQHWCYL<&
+zM^+xJcJP=xhNl7*s>SLh-_`Ls@UfxmNbf^j<`!-TE~Z-ZpSxR4wI_Sz-33SX5BWW3
+AS^xk5
+
+diff --git a/dm/romfs-overlay/ObjectData/WarioColorClassic.szs b/dm/romfs-overlay/ObjectData/WarioColorClassic.szs
+index 56582c6904c64a4283dc3a0b3199fa5f58461312..9d68c334666582710beb3d87ff4da23ec5db815c 100644
+GIT binary patch
+delta 386
+zcmXxby-Nad7zgm@ciyE}p5En4W|l`wO9X;jgTqb2X;MSp3!Kev5d?v~5Y->>3^xfm
+z6fHrZC@p~w(IC+!t>Hh=*boHQW6|*W^6>rrzV1kKN7~(6DYO6p0pJ)qr3`+ROez>i
+z!2cEd<w?Oo=)d?Zn`{9q8x6|mNw)Qh7i1A!s@8GGP_b!A*sT_rjEB}Tri>y}=*r@W
+zp`&8abW^|&LuWCJY^~z^b_Dm#94=PZact&T;&+v|iY!T29UGQ<D%uyK%?L*VgeL--
+zB0&-&BAF&LBupd{A<>>_%PYGv1!lpIK^zj01b+@vFyFqnzd1Z|ME>Ed*LTM+vdXUU
+z*3p6ifX=X$#l90~0lah)^h<CLJh>_H0C}IH^GF+9tEue9jlRlSMxf4XWe1bTJO{@G
+dpQA=kUk!Z09eQ#apK7^wlIw<h%2+-Ze*h8Wd4d1{
+
+delta 330
+zcma*eF-yZ>5C-7y(%2-Lrb#OXK@?nEsvtUvkfD>%)D{Pu<O6>|HW8c@MNs#5=<MpE
+z60n2+p&-Roiod|c!Ob^_y9dv4_i{I!w1<=S<6CSiRz(?tqj(A5amqkcO_{&JX}1gv
+zW&Z_V-Bc8M`)BOqvKO7+t0nVT9^~TTJZs^35FyCcai6)^NVcTTbOo15M|_NvTmpCp
+zExaFkI7v5UfuB2=a%%8y72DaKgq(6|mVZ}{zHzjWK@~D-hN@(dO%Bb{9Jy2@kLn{w
+x`)kK|(4G~jrV7<!@uGK4eDoXm6cg!PhzsrDw(lb{s{h>mA~K%bQ84wdogWa<V!HqU
+
+diff --git a/dm/romfs-overlay/ObjectData/WarioColorGold.szs b/dm/romfs-overlay/ObjectData/WarioColorGold.szs
+index 8584106815ab24b00085ef99d0915d26b2b925aa..812c7115e2d1509cfd7df5a8fabc2b78f9d5bdd4 100644
+GIT binary patch
+delta 572
+zcmXZTy=xP37zgm@xx4ht+vSp6(l*!jlK6T_jOOxk5QPl72o4rHT?$G!8<0+JLO@Dz
+z5Q@)mSP;zM3%Cd=#L1TqF6vM>C;tVfj-Fp6!{^8IeSY6(a`=rW@czEbw(Po(beovc
+zq{*JUF3DPetdPFQPijHTCKc&{>xf<t*q-gwpDuAy{<KD%l7nVR9(tRcmOI_PDD4&-
+zm>P1gJ>ZPIY>(K)Ta{+#7H6ONRXN0v`+xSgv&ngsM{F%l3_0z#xUe`#$X0K_MWlv&
+z?hQnG<;RXcaeM{^RL~#>OQ6FUh(iLBkb*QAkO332kb^u}P=F#V!wRfI32az{b=Uw0
+z%20tSoP~369xlK|xCAcLpbibV3{AKKSD`g`d@oU1GbqZCNm<HKlqZV{RHSH`R%n$<
+zvlD+yk)K^l4ooflvF&Yy&jW8y?)KyA$NhQuJMb#}I^>~uLsyB8zE2&Q_AORr+%KRN
+z3vUj+7va017uUY-&%cOqt;}!3U+B9r^iQVFaikG-6dDgA1)JNYSH}^)u%Qk%<4<qG
+S%(i!Zc4U4?&9l4S>CQi!-=ClW
+
+delta 445
+zcmb7*J4=FL7>3{1Ov~fvIW;rw_^DZ*x}n9nEu+av+)|RJww8uF8UpJX0w;e$Ak-G^
+zEd~9MrpD?m`~wZo!*#)ZU5;M#rMdfKTPx|==WeC6@++sD+8OZ{+QuEqJ@u<Xdse9#
+zV*@)Y?qXZ3Nw;|I(h>Qn^tD%p<&>ONTiPcFjXiPHDmrSYB%NAQ`(<3~>zMg@DcARP
+z;1+oq83_JmU-g!@%($=P(<C6DjfxIU1CJc-Hg&>SNuCXbFF<I*LCg?NVwP|bZeos@
+zCp?6g@DY9@Km-Yk2oYf-LPUue5hoJF0+A$AM4DJ6GQ<**C6<XCktbG&Rbq`;CpL&p
+z!X^qtkth*cM48woc8JOYs&-DE5cUMrcSuE4LM10}a5?3@5tgCll*5y>+#q)MI;gt-
+UBO~~Jo7QA(b$pMZUiGv40~z^)fdBvi
+
+diff --git a/dm/romfs-overlay/ObjectData/WarioColorLuigi.szs b/dm/romfs-overlay/ObjectData/WarioColorLuigi.szs
+index fceb3de5a6ac162806a68c792ac3d6cd616ba16f..45c28930e1d933957b9aac13fc1a4ac86d74c752 100644
+GIT binary patch
+delta 386
+zcmXxbze@sP7zgm@J?}cN^t{U-nOYt#EfENA4Gsr^aGKPR=N+8QZV?25{UD-0;2CZb
+zawuAYKv7x(9il-bgK!J~fyRa)xE_m!&zFbq`+mnmeLU3f-wOUD0Qi7o=oC`;Rj5$G
+zAPD?laaf!d9Qgl>&tioov9wjE98R-kltv<xak*T>JyXMm6~s<C#}quaRxobnnMzk0
+z&rAbVi>BKGewYReqr9_*@4GS{R5G|!-oQyE!=k^dtd(amx@uUrv~$V6lx#*g;v+l}
+z$P5vQpGahu%#i>I5}Aa$lC7-nhgFydFANcgLJYhGh{Iy*!T#p(#F6;Ni*C=IyeJyG
+z!8=D6eE{u2GmSkb!hCq;MCq5{9*vYnkO#<m6zwP4;CfYKw{GZF(Nh9-qh`84eav!j
+en)5hnjKp={6WqZ_N#Jue(~5DOKv$h8o8k|`r+Kyj
+
+delta 330
+zcma*eu}Z^m5C-u7rLjpgO_Np(f+)DSR6%qSAwxkBn%d%Ell;L4$R>i5qB!XOJ%Ou>
+zO27`jL%>10N%09>9NheZxO?zB?mq4&Wp`3`AKzkIv1-Z?9LG!ej#CDr8p`|)&iYkg
+zDElw?>ZhVGI5=l7t6ua5ua?YXd6bKXi>!m^QG_5{$9?8vBiWKB(-mALJ@HW{xdiYI
+zJ9t0xaGGw)0zY>!<<#QcDz>wI2|4A`uKunaedA~$gKA{b4AsdZn;e>@IdZ8%9yP~~
+x_Sa7Epgk*4Z567;;zjS8_!zeEDJIgp5SQA)?a)VL)c?8rMPxj=<6!FVSwE-5V($O|
+
+diff --git a/dm/romfs-overlay/ObjectData/WarioColorWaluigi.szs b/dm/romfs-overlay/ObjectData/WarioColorWaluigi.szs
+index ada307d9d9139b7648a9945217e5adb4c5181bf8..97e7bb1cda5ca460d44fa3d6ace1385955668f80 100644
+GIT binary patch
+delta 434
+zcmXZTJ4*vm5C!0w-HmHryEifMk*KS7q6kVV5dzUhFo}v9vkQsXX+W&(gn$H%Ac#|}
+z3W5P&U?W6~l~1tJLOUz}f|aG~ASu4foVjP7ZxYWpiL0d~Mrk>@u0{dD4+^a&JII?d
+zIZL3{b2(+Yq9AixNgAZ4O^j9-(>o35rSI7S`e=7LLThtV=%>l-FiDv~)OhNrg-jfE
+zI?fbO@Y_QJ^WzxUvwG-|hv5I&@B9=tak+q@`iVwA*+C4~4?Hwu#<7`GKRuXnBC~75
+zur>_~nZ#tKFc)iJDr;nJ=3!puV}7PFy=GX#)7P$nql16|1i@*75QL!_oEB(>Hi%T;
+ztr>|vvLPx;iv6}NI_-lku}b-zTfQsR?5{1+jb}EN#i%L+T)$Qfs^mf_Q!y9jmdhS1
+zizEB8EZoXVsrE=(z6&qxPww}+xc^=;o*V@rCP6XoNW7VdoIW}H#T$t6rg(pD>)T?a
+OdLrHWYJq(*B>w?g0fdSG
+
+delta 348
+zcmbV@y-LGi6o$`9(!@4DO;WWeh|o<eLLFTS-5k;%QPbos;#LFV<R(am0}g`pfQW;5
+z2}&StBJ=`^;DtCjsvpuTaCvzic%Ny}nHHU=QG_5T(S-$o;DRA%(VE!ZRJjJ$+^@Q6
+z2|!nN8m)`fOA+$p-nEG}`8>$bmYcm*IX@hrBmHDYw77+fikfm1x6zfyIKw5i4cQv*
+zqBo(2+$*U5W#7XA`s$qF@;ve6D`{ac4=S>swz00PDQ}9xF)<;N#-uYDOeH3h$zoby
+zDl=7>Y$k`vW%8J+1^FAB@=9UFgP#CuP=}TLolHYMl29%+Lq?OjJoL+QOTNrB^PleL
+NGws=V3GV!D{TGKxZ!`b^
+
+diff --git a/dm/romfs-overlay/ObjectData/WarioColorWario.szs b/dm/romfs-overlay/ObjectData/WarioColorWario.szs
+index 294ce43fd678edd2c9173f0a2b4fe500024e108c..fe9c25a3a664b67d3b2f97f908c36f4598c5437d 100644
+GIT binary patch
+delta 386
+zcmXxby-Nad7zgm@cQ5Icr+4|1ndQ;a5`o~>;NT>jCN<=F2WPWe1VLagNc0Ch!c9UB
+zMN1GUN=u+aHb`_qYxoZ|HUz=-STuaTJbZt@Z*!Duj&gTz1^*HN@W3&&3rYMcRH$Ge
+zgYZ`z7N-RV{{P~$SYb<8+Nx7NPqU+!TptVKO1Xx6hK4Ou#$Gwg6g)OpF>d6UN>>Wc
+z3>{UIrrRQZ7&;4MaAzIgcY}CPN#k;P6DO54i~g=MW}e09s$t#K8j^J(S&VRmCjt@4
+z4Dk^^k;p8WBLO0lAPMy)OIh0wt1u5<7$Ojb7<da1hsDml_08dlEeQ|j{ed%iQ8adq
+zw|36Q19Zpj6b|eN<MGmt(l60Da+Q`W0AxIh?jvn*qpGnRC-kc1k|K3(J2jj>W;i&_
+ddK@)+;%exL&e&BF_*6}IVq7oKS0_q?{{iIEd0PMg
+
+delta 330
+zcma*eu}Z^m5C-u7C9z2~O_Np(f+)DSR6%qSAwwsjsVxpR$sc@xY$7-*l@7XpeF0Y&
+zm4Y37fNli`S1G=OgPUIvcMpEY-N)T%+8Rw;Pw$DNSf(-rXUQ7AlZ=6=s<M8A%T5^>
+z%J~bvI+-YRkFVHgWgoY@Z?-IBy<dor>%57VevB~R#zXF5C*6}8(+%9DZ3!?-3kl($
+zH1Toj<09LY6@DII&Z*A3P3-4K5^*Y|QT`2Ged}r=gG{n$fhuH^LoO}S5_wc5pK23V
+x2V3WO)V>|6hKkhc_*EZT`0Uj&Ff3&E5eC}DT`xdvRQ|aK<JfriCgD67nm^0*VkH0o
+
+diff --git a/dm/romfs-overlay/ObjectData/WarioHigh.szs b/dm/romfs-overlay/ObjectData/WarioHigh.szs
+index 9f90490abb0f9331c0f5c9a1f20afd998cc26dd3..173d7a5d415dff3989db3e6728ce6712e42d83f6 100644
+GIT binary patch
+delta 572
+zcmXxbOKTHR7{>8)W-=zDP1<QLO_Q`4>!n_5H5#wg>7uJbQj0E3GJ&b<ZUsT8R;2g=
+z-bGdgyHMN+LP~=hp<M(QMd(7hYx4zk=Rzn<|50509$ubvp8d5Wy^qg7s<FIM%2bAy
+zpjwbW)dq!DaTWPjJYVP+hKl_!elIk1UKSs&kl*{+t}O0Fbwb8#%ks4D%DNwyt=g;}
+zl9&F3Wb5<V;VR1OdPN+c=_5;i)+;(GiN{lN@FXG68YLO4%}B3N(&@jevOljgT+6cJ
+zyKn5~Tf3=Yz(fQVP9TaHY@Ea?3?PmK1~CK&!$=~9G%^@L7Nf`^j{?Rpjv`!~#stpb
+zEY9IPCUF55aS4|(g)5lGRa`>}*Kq@7+{7*1#vR<nJ<Q-f9(3%cH@TX0)UXPZDy7mY
+zqrwrDRio`M%_Boz1$N}?T4%e}JMdinK|Td@QB$eS-HoDb2PtjJyCBUktM%g0TaQPS
+zDu={omyJv>x%y*ku;<McEV{jo;!gjuY^c@Q(4eX0-tUA~YxmI0$+x9ayK8O@bevya
+GH+2la6Rwc}
+
+delta 516
+zcma*eIZFd!5XSNMO;(fDxb7y=^-R3ac;8p71rs9{n(TrfAgy4fC?eX=7qGIhQ3+^a
+zZz))aoroVmD+|HGe-L{Ie#6Ye%=7WLe#X^PCakES3TWBRw8&ScK%iBPGJb>IY&i(1
+z@L%wmEoddVwLSVnxtCURk0BkG#8y#TvhStjW@}j-Z%8h@hz#c^bS-I84)d$pmWO;%
+zJ7R65<Ym*6ox+%|=W||OnWEfv$fUQTU8bUrmH&=R|HSk)0tmuD1u79j7$&MvjR<OB
+zp%ykAL=i(Ab*P7n1~j4x&1gX@5=f#A?dU)!y3mat^r8>_7{DM>7{V|{Fp4pZV*-<y
+z!Zc<ui#g0=0gG6=HT`t&fn54l$Wbxns>aftzi7zYdQ?UYL(b1!Iq*$6UAN^USozQ0
+PE`0>ABe%|b`ab>x`JtIy
+
+diff --git a/dm/romfs-overlay/ObjectData/WarioPrimitiveMan.szs b/dm/romfs-overlay/ObjectData/WarioPrimitiveMan.szs
+index e69df32a889bf367ab65660d50d6a30e39da606d..eca885e4a8ba8aa39e5c94dd193d5a1e237f0416 100644
+GIT binary patch
+delta 272
+zcmaF<nCJOpo(<vQjC_+HL|RRr6mH1KKiMEcY4WWouE`(5?HL7tylh6n$qK>plXpk>
+zFbYjB2$Y|!9_hm<4Ah}Bc|oK-qX>|dJy}0OcXCCPJ);;@zbB(ONLRCSbh~pj<96q0
+zCc}Ng0t|u-|AiQY8AKRF8UBkgh%-oRZjb)MG}$+flX+k3_Q{cPij2!9SI0SPGBYr2
+zIkQmy(0?W%gNdQR9?bBOT6*X|ND3qh6lt(uK6zu@DjpUF29y6lV#_h0A%^jaj4LJw
+n$2-fg0!1!@3<1fb8p1kRAYN+nw0OhKX3X1owufpnPhtZA$T?f|
+
+delta 206
+zcmaF<nCJOpo(<vQlkZ1bPo5NR$jCR@AVO*KtthU^AHwY!MS;9*M*hhP!Sa)LNBA%b
+zOfCqNpR69~!zeiUL8Q*)1(EiQVn9|lqYzM~&g6<H`^n1D3X`u#`7jEDbTvCiw>w8O
+zZg-AmGTb-0HkyxJfI)~sj6q^^XS5B=<S&6jlLeSrCcm35K3QP~%Vgsd;w15HPVj9O
+OU|!F&Jye@{5*q;TGDq3~
+
+-- 
+2.43.0
+
