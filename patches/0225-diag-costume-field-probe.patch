@@ -1,0 +1,195 @@
+From fdf570db5dc1031ec5c1736398a6cd4c4b957e41 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Thu, 19 Nov 2026 23:47:33 +0000
+Subject: [PATCH] 0225: diagnostic probe for the equipped-costume field in
+ memory
+
+Read-only probe (no writes to game memory) to pin the GameDataHolder
+offset of the equipped cap/clothes fields and whether each stores a name
+string or an integer index, for the 0226 launcher-costume override. On a
+few presented-frame milestones it reads the u64 at main+0x13130a0 (the
+GameDataHolder pointer slot, a runtime-filled .bss clue), dumps and scans
+the first 0x800 bytes of the object for the costume name strings
+(MarioHakama, MarioExplorer) and the file-encoded u32 values 27/28, and
+falls back to a background heap scan when the slot path finds nothing.
+Everything logs as [dm] diag-costume lines into Documents/log.txt.
+Diagnostic only: remove before 0226, together with DM_FS=1 in the
+workflow env (which adds the file-open logging that pins the save file
+name and read timing).
+---
+ dm/host/hle_cheats.c | 154 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 154 insertions(+)
+
+diff --git a/dm/host/hle_cheats.c b/dm/host/hle_cheats.c
+index b728052..9e9588e 100644
+--- a/dm/host/hle_cheats.c
++++ b/dm/host/hle_cheats.c
+@@ -1044,11 +1044,165 @@ static void cheats_pass(void) {
+     pthread_mutex_unlock(&g_lock);
+ }
+ 
++// ---------- 0225 diagnostic: equipped-costume field probe (DIAGNOSTIC ONLY) ----------
++// Purpose: pin the in-memory equipped-costume field (GameDataHolder offset, and whether
++// it stores a name string or an integer index) for the 0226 launcher-costume override.
++// The save file says the equipped fields are CurrentCapName (value 27 = MarioExplorer)
++// and CurrentClothName (value 28 = MarioHakama) at file offsets 0x59b4/0x59bc, encoded
++// as string-pool index minus 176 (REPORT-SAVEFILE-COSTUME-FIELD.md). The file offsets
++// are NOT the memory offsets: the game parses the save into a GameDataHolder object
++// whose layout is unknown. This probe READS ONLY (no writes to game memory) and logs
++// everything as [dm] diag-costume lines into Documents/log.txt. REMOVE before 0226:
++// the 0226 fix replaces this probe with the host write, and DM_FS=1 (workflow env)
++// goes away with it too.
++// How it works: on a few presented-frame milestones it reads the u64 at main+0x13130a0
++// (REPORT-LAUNCHER-COSTUME-OVERRIDE.md section 2.4: a 24-byte registry entry associates
++// the GameDataHolder string with that pointer slot; the slot is file-zero .bss, filled
++// at runtime, so it is only a CLUE). If the slot is 0 or points nowhere useful the probe
++// says so and falls back to a background heap scan for the costume name strings.
++// Milestones are presented frames since the first present; the save is read at boot,
++// before the title screen, so by frame 60 the GameDataHolder exists.
++#define DIAG_COSTUME_SLOT 0x13130a0ull   // NSO vaddr of the GameDataHolder pointer slot (clue only)
++#define DIAG_COSTUME_WIN  0x800         // bytes of the GameDataHolder object scanned per milestone
++#define DIAG_COSTUME_HEX  0x200         // bytes of it hex-dumped at the two print milestones
++
++static const char *diag_costume_names[2] = { "MarioHakama", "MarioExplorer" };
++
++// Scan buf[0..len) for the costume name strings and for the file-encoded u32 values
++// 27 (Explorer) / 28 (Hakama); log every hit with its offset in the object window.
++static void diag_costume_scan(const uint8_t *buf, size_t len, uint64_t base, int *found) {
++    for (int s = 0; s < 2; s++) {
++        const char *name = diag_costume_names[s]; size_t nl = strlen(name);
++        for (size_t i = 0; i + nl <= len; i++) {
++            if (!memcmp(buf + i, name, nl)) {
++                LOG("diag-costume: string \"%s\" at %#llx (+%#zx in window)", name,
++                    (unsigned long long)(base + i), i);
++                *found = 1;
++            }
++        }
++    }
++    for (size_t i = 0; i + 4 <= len; i += 4) {
++        uint32_t v; memcpy(&v, buf + i, 4);
++        if (v == 27 || v == 28)
++            LOG("diag-costume: u32 %u at %#llx (+%#zx in window)", v,
++                (unsigned long long)(base + i), i);
++    }
++}
++
++// Hex-dump len bytes (16 per line) with an ASCII column.
++static void diag_costume_hex(const uint8_t *buf, size_t len, uint64_t base) {
++    for (size_t i = 0; i < len; i += 16) {
++        char hx[50], asc[17]; size_t n = len - i < 16 ? len - i : 16, p = 0;
++        for (size_t k = 0; k < 16; k++) {
++            if (k < n) p += (size_t)snprintf(hx + p, sizeof hx - p, "%02x ", buf[i + k]);
++            else p += (size_t)snprintf(hx + p, sizeof hx - p, "   ");
++        }
++        for (size_t k = 0; k < n; k++) asc[k] = buf[i + k] >= 0x20 && buf[i + k] < 0x7f ? (char)buf[i + k] : '.';
++        asc[n] = 0;
++        LOG("diag-costume: %#llx +%04zx: %s %s", (unsigned long long)base, i, hx, asc);
++    }
++}
++
++// Read the GameDataHolder object window and scan it; hex-dump the first part when
++// asked. Returns 1 if a costume string was found in the window.
++static int diag_costume_object(uint64_t obj, int hex) {
++    uint8_t win[DIAG_COSTUME_WIN];
++    int found = 0;
++    for (size_t off = 0; off < DIAG_COSTUME_WIN; off += 8) {
++        uint64_t v = 0;
++        if (mem_read(obj + off, 8, &v)) {   // unreadable page: stop, keep what was read
++            LOG("diag-costume: object window unreadable at %#llx (+%#zx)", (unsigned long long)(obj + off), off);
++            return 0;
++        }
++        memcpy(win + off, &v, 8);
++    }
++    diag_costume_scan(win, DIAG_COSTUME_WIN, obj, &found);
++    if (hex) diag_costume_hex(win, DIAG_COSTUME_HEX, obj);
++    return found;
++}
++
++// Background heap scan (only when the slot path found nothing): search the opened heap
++// for the two costume name strings and log up to 16 hit addresses each, with 32 bytes
++// of context. Runs off the presenting thread so a multi-GB heap never stalls a frame.
++static void *diag_heap_scan_thread(void *arg) {
++    (void)arg;
++    uint64_t hb = 0; size_t hopen = 0;
++    dm_guest_heap_range(&hb, &hopen);
++    if (!hb || !hopen) { LOG("diag-costume: heap scan: no heap yet"); return NULL; }
++    LOG("diag-costume: heap scan: %#llx + %#zx", (unsigned long long)hb, hopen);
++    const size_t CH = 1u << 20, OV = 15;   // 1 MB chunks, 15-byte overhang so a name straddling a boundary is still found
++    uint8_t *chunk = malloc(CH + OV);
++    if (!chunk) { LOG("diag-costume: heap scan: malloc failed"); return NULL; }
++    for (int s = 0; s < 2; s++) {
++        const char *name = diag_costume_names[s]; size_t nl = strlen(name);
++        int hits = 0;
++        for (size_t off = 0; off < hopen && hits < 16; off += CH) {
++            size_t n = hopen - off < CH ? hopen - off : CH;   // string starts are searched in [0, n)
++            size_t want = n + OV < hopen - off ? n + OV : hopen - off;
++            vm_size_t got = 0;
++            if (vm_read_overwrite(mach_task_self(), (vm_address_t)(hb + off), (vm_size_t)want, (vm_address_t)(uintptr_t)chunk, &got) || got != want) {
++                if (vm_read_overwrite(mach_task_self(), (vm_address_t)(hb + off), (vm_size_t)n, (vm_address_t)(uintptr_t)chunk, &got) || got != n)
++                    continue;   // unmapped chunk (heap grew/shrank): skip it
++                want = n;
++            }
++            for (size_t i = 0; i + nl <= want && i < n; ) {
++                uint8_t *p = memchr(chunk + i, (unsigned char)name[0], want - i);
++                if (!p) break;
++                i = (size_t)(p - chunk);
++                if (i < n && i + nl <= want && !memcmp(p, name, nl)) {
++                    uint64_t hit = hb + off + i;
++                    LOG("diag-costume: heap: string \"%s\" at %#llx", name, (unsigned long long)hit);
++                    uint8_t ctx[32]; vm_size_t cg = 0;   // 16 bytes before, 16 after
++                    uint64_t cs = hit >= 16 ? hit - 16 : hit;
++                    if (!vm_read_overwrite(mach_task_self(), (vm_address_t)cs, 32, (vm_address_t)(uintptr_t)ctx, &cg) && cg == 32) {
++                        char hx[100]; size_t q = 0;
++                        for (int k = 0; k < 32; k++) q += (size_t)snprintf(hx + q, sizeof hx - q, "%02x ", ctx[k]);
++                        LOG("diag-costume: heap: context %#llx: %s", (unsigned long long)cs, hx);
++                    }
++                    hits++;
++                    i += nl;
++                } else i++;
++            }
++        }
++        LOG("diag-costume: heap scan: \"%s\": %d hit(s)", name, hits);
++    }
++    free(chunk);
++    LOG("diag-costume: heap scan done");
++    return NULL;
++}
++
++static void diag_costume_probe(void) {
++    static int frame, done_mask, found, scan_started;
++    static const int milestones[5] = { 60, 600, 1800, 3600, 7200 };
++    frame++;
++    for (int m = 0; m < 5; m++) {
++        if (frame != milestones[m] || (done_mask & (1 << m))) continue;
++        done_mask |= 1 << m;
++        uint64_t base = 0, slot = 0;
++        if (g_main_mod) base = (uint64_t)(uintptr_t)g_main_mod->base;
++        LOG("diag-costume: milestone frame %d [%.2fs] main base %#llx", frame, (now_ns() - g_t0_ns) / 1e9, (unsigned long long)base);
++        if (!base) { LOG("diag-costume: no main module yet"); continue; }
++        if (mem_read(base + DIAG_COSTUME_SLOT, 8, &slot))
++            LOG("diag-costume: slot %#llx unreadable", (unsigned long long)(base + DIAG_COSTUME_SLOT));
++        else {
++            LOG("diag-costume: slot main+%#llx = %#llx", DIAG_COSTUME_SLOT, (unsigned long long)slot);
++            if (slot) found |= diag_costume_object(slot, m == 1 || m == 4);
++        }
++        if (m == 4 && !found && !scan_started) {   // last milestone, slot path found nothing: scan the heap
++            scan_started = 1;
++            pthread_t th; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
++            if (pthread_create(&th, &a, diag_heap_scan_thread, NULL)) LOG("[RED] diag-costume: cannot start heap scan thread");
++            pthread_attr_destroy(&a);
++        }
++    }
++}
++
+ // Per presented frame (hle_nvn.c dump_frame): apply the cheats and note the present, so the idle thread stands down
+ // (brief: once per presented frame; the idle thread only when it is not presenting)
+ void dm_cheats_present(void) {
+     atomic_store(&g_present_ns, now_ns());
+     cheats_pass();
++    diag_costume_probe();   // 0225 diagnostic only: equipped-costume field probe (read-only)
+ }
+ 
+ // The fixed ~60 Hz passes when the game is not presenting (window minimized, graphics suspended or before the first
+-- 
+2.43.0
+
