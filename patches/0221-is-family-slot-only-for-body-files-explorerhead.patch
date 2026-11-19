@@ -1,0 +1,25 @@
+From b5d04d856264c0ab1bd7215fe4a2fe76067318b9 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Thu, 19 Nov 2026 12:20:16 +0000
+Subject: [PATCH] 0221: is_family slot only for body files (ExplorerHead kept)
+
+---
+ dm/host/hle_fs.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/dm/host/hle_fs.c b/dm/host/hle_fs.c
+index 970cd97..6aa4851 100644
+--- a/dm/host/hle_fs.c
++++ b/dm/host/hle_fs.c
+@@ -1038,7 +1038,7 @@ static int dm_char_redirect(const char *p, char *out, size_t n) {
+         // is broken here; the same-core fallback below still applies
+         // (for Mario it names the file already asked for and is skipped,
+         // so the file is kept).
+-        if (!is_named_form && strcmp(part, "Cap")) {
++        if (!is_named_form && strcmp(part, "Cap") && !plen) {
+             if (slot && !strncmp(slot, "Mario", 5) && slot[5]) {
+                 snprintf(cand[ncand], sizeof cand[0], "%s%s%s", ch, slot + 5, part); ncand++;
+             } else if (slot && !strcmp(slot, "default")) {
+-- 
+2.43.0
+
