@@ -1,0 +1,88 @@
+From 5c141820c137e290ac4b2d26a7ad3f5790c0dcde Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Thu, 19 Nov 2026 07:07:04 +0000
+Subject: [PATCH] 0215: game tab choice rows white + setting descriptions
+
+---
+ dm/ios/Sources/LauncherRow.swift | 55 ++++++++++++++++++++++++++++----
+ 1 file changed, 49 insertions(+), 6 deletions(-)
+
+diff --git a/dm/ios/Sources/LauncherRow.swift b/dm/ios/Sources/LauncherRow.swift
+index 49c5dc3..5a6bb61 100644
+--- a/dm/ios/Sources/LauncherRow.swift
++++ b/dm/ios/Sources/LauncherRow.swift
+@@ -17,9 +17,33 @@ struct SettingRow: View {
+     private var noteColor: Color { dark ? .white.opacity(0.7) : .secondary }
+ 
+     private var locked: Bool { m.fixed.contains(s.env) }
++    /// (0215) A description for the rows launcher.json leaves without one:
++    /// settings.tsv has no note for the console mode, the game language or
++    /// the frame-rate counter, and the launcher only shows the row's note.
++    /// Chinese, from what each switch does — the operation mode and the
++    /// desired language (dm/host/hle_oe.c), the frame-rate counter
++    /// (dm/ios/Sources/front_ios.m showFPS). A row with a note keeps its own.
++    /// (The canonical place for a note is settings.tsv + the l10n table;
++    /// this fallback lives here because the note has to show on this tab.)
++    private var fallbackNote: String {
++        switch s.env {
++        case "DM_OPMODE": return "\u{5e95}\u{5ea7}\u{5206}\u{8fa8}\u{7387}\u{66f4}\u{9ad8}\u{ff0c}\u{624b}\u{6301}\u{5206}\u{8fa8}\u{7387}\u{66f4}\u{4f4e}\u{3002}"
++        case "DM_LANG": return "\u{6e38}\u{620f}\u{663e}\u{793a}\u{7684}\u{8bed}\u{8a00}\u{3002}"
++        case "DM_SHOW_FPS": return "\u{5728}\u{5c4f}\u{5e55}\u{4e0a}\u{663e}\u{793a}\u{5f53}\u{524d}\u{5e27}\u{7387}\u{3002}"
++        default: return ""
++        }
++    }
++    /// The note under the title: the row's own note, or the fallback above.
++    private var baseNote: String { s.note.isEmpty ? fallbackNote : s.note }
+     private var note: String {
+-        guard locked else { return s.note }
+-        return (s.note.isEmpty ? "" : s.note + " · ") + (m.fromLaunch.contains(s.env) ? LauncherText.text("ui.setAtLaunch", "Set at launch") : LauncherText.text("ui.setByEnvFile", "Set by an env file"))
++        guard locked else { return baseNote }
++        return (baseNote.isEmpty ? "" : baseNote + " · ") + (m.fromLaunch.contains(s.env) ? LauncherText.text("ui.setAtLaunch", "Set at launch") : LauncherText.text("ui.setByEnvFile", "Set by an env file"))
++    }
++    /// The label of the currently selected option, for the choice row's right side.
++    private var currentLabel: String {
++        let v = m.values[s.env] ?? s.def
++        if let o = s.options?.first(where: { $0[0] == v }), o.count > 1 { return o[1] }
++        return v
+     }
+     private var rangeValue: Binding<Double> {
+         Binding(get: { Double(m.values[s.env] ?? s.def) ?? s.max ?? 1 },
+@@ -38,12 +62,31 @@ struct SettingRow: View {
+         Group {
+             switch s.kind {
+             case "choice":
+-                Picker(selection: m.binding(s)) {
+-                    ForEach(s.options ?? [], id: \.[0]) { Text($0[1]).tag($0[0]) }
++                // (0215) A menu Picker only shows the selected value, in the
++                // system default colour, and never shows the label — on the
++                // dark glass the value is unreadable and the row says
++                // nothing about the setting (not even the note, which lives
++                // in the label). So the row is a Menu whose label is drawn
++                // here: title + note on the left, the current value +
++                // chevron on the right, all explicit white on iOS. The
++                // Picker inside supplies the menu items, with the checkmark
++                // on the current one.
++                Menu {
++                    Picker(selection: m.binding(s)) {
++                        ForEach(s.options ?? [], id: \.[0]) { Text($0[1]).tag($0[0]) }
++                    } label: {
++                        EmptyView()
++                    }
+                 } label: {
+-                    settingLabel
++                    HStack {
++                        settingLabel
++                        Spacer()
++                        Text(currentLabel).foregroundStyle(titleColor)
++                        Image(systemName: "chevron.up.chevron.down")
++                            .font(.footnote)
++                            .foregroundStyle(noteColor)
++                    }
+                 }
+-                .pickerStyle(.menu)
+             case "range":
+                 VStack(alignment: .leading, spacing: 8) {
+                     HStack {
+-- 
+2.43.0
+

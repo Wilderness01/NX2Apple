@@ -1,0 +1,62 @@
+From 724fc0b694430469d00fd126adf41cf80ca26f7d Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Thu, 19 Nov 2026 07:13:49 +0000
+Subject: [PATCH] 0216: keep non-body costume files on outfit slot
+
+---
+ dm/host/hle_fs.c | 32 ++++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/dm/host/hle_fs.c b/dm/host/hle_fs.c
+index 2b5510d..8e2623a 100644
+--- a/dm/host/hle_fs.c
++++ b/dm/host/hle_fs.c
+@@ -852,6 +852,24 @@ static const char *dm_char_parts[] = {
+     "HairNoCap", "HandL", "HandR", "Under", "Head", "Face", "Hair", "Eye",
+     "Cap", "2D",
+ };
++// 0216 (log-84): part-less files whose core is NOT a costume body -- a
++// system file (CapAnimation, CapCommonInfo, Hack, 2DMini) or a costume
++// part (ExplorerRuck, HarietSkirt, ...). These have no slot counterpart:
++// the slot candidate for them is the bare body file (MarioFootball.szs),
++// which always exists, so Part B would substitute a body file for a
++// system/part file and the cap system would crash looking a member up in
++// it (NULL+8 at main+0x66d6d8). Exact core matches only: "Hakama",
++// "Poncho" and "Rsv" are also costume names (MarioHakama, MarioPoncho,
++// MarioRsv are bodies), and SpaceSuit is a body while SpaceHelmet is a
++// part, so a suffix blocklist would wrongly block bodies.
++static const char *dm_char_nonbody_cores[] = {
++    "2DMini", "CapAnimation", "CapCommonInfo", "Hack",
++    "DiddyKongTail", "ExplorerRuck",
++    "EyeRsv", "FaceRsv", "HandLRsv", "HandRRsv", "HeadRsv",
++    "HakamaHakama", "HarietSkirt", "KingCape", "KoopaShell",
++    "PeachHeadShort", "PeachSkirt", "PonchoGuitar", "PonchoPoncho",
++    "SpaceHelmet",
++};
+ static int dm_char_redirect(const char *p, char *out, size_t n) {
+     // The path checks come first, so a player-model open is logged even when
+     // no character is picked: the log then proves the game opens the file at
+@@ -975,6 +993,20 @@ static int dm_char_redirect(const char *p, char *out, size_t n) {
+     char cand[2][256];
+     int ncand = 0;
+     if (is_family) {
++        // 0216 (log-84): a part-less file with a non-body core (see
++        // dm_char_nonbody_cores) has no slot counterpart at all -- keep
++        // the original file, whether the slot is a costume name or
++        // "default" (with "default" the candidate would be Mario.szs,
++        // equally the wrong type).
++        if (!plen) {
++            for (size_t i = 0; i < sizeof dm_char_nonbody_cores / sizeof *dm_char_nonbody_cores; i++) {
++                if (core_len == strlen(dm_char_nonbody_cores[i]) && !memcmp(core, dm_char_nonbody_cores[i], core_len)) {
++                    LOG("[char] fs %s kept (sel=%s cap=%s clothes=%s: non-body core %.*s)", p, sel,
++                        cap ? cap : "(unset)", clothes ? clothes : "(unset)", (int)core_len, core);
++                    return 0;
++                }
++            }
++        }
+         // 0211 (Part B): a set slot applies to a costume file too -- the
+         // slot's costume first, then the same core. A "default" pick tries
+         // the character's default part first, then the same core. Named
+-- 
+2.43.0
+
