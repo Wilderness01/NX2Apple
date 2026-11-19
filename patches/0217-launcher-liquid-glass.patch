@@ -1,0 +1,51 @@
+From eb2dd56c924f645b56d3f25b5c5c060e725c7da1 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Thu, 19 Nov 2026 10:11:28 +0000
+Subject: [PATCH] 0217: launcher glass uses liquid glass
+
+---
+ dm/ios/Sources/Launcher.swift | 19 ++++++++++---------
+ 1 file changed, 10 insertions(+), 9 deletions(-)
+
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index ab1577f..2b0df7b 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -160,9 +160,9 @@ private struct DocumentPicker: UIViewControllerRepresentable {
+     }
+ }
+ 
+-/// Liquid Glass for the launcher's panels (0181, 0194, 0201, 0206): iOS 26 native .glassEffect, regular; below iOS 26 a translucent material fill. The deployment target is iOS 26, so the fallback is dead code kept for the pattern's sake — the same ladder the pad's discs use (0111: real UIGlassEffect on 26+, vector disc below). Layered, not flat: a soft inner highlight along the top edge and a gentle drop shadow give the card depth; the corner radius is a little larger (32) for the game's rounded, playful shapes. Glass needs something behind it to refract: the backdrop is a deep navy-black base, neutral on purpose — the text is white on dark glass, and a loud backdrop would fight it.
++/// Liquid Glass for the launcher's panels (0181, 0194, 0201, 0206, 0217): iOS 26 native .glassEffect, regular; below iOS 26 a translucent material fill. The deployment target is iOS 26, so the fallback is dead code kept for the pattern's sake — the same ladder the pad's discs use (0111: real UIGlassEffect on 26+, vector disc below). Layered, not flat: a soft inner highlight along the top edge and a gentle drop shadow give the card depth; the corner radius is a little larger (32) for the game's rounded, playful shapes. Glass needs something behind it to refract: the backdrop is a deep navy-black base, neutral on purpose — the text is white on dark glass, and a loud backdrop would fight it.
+ ///
+-/// `opacity` (0194, 0201, 0206) is the ONE glass-intensity setting (UserDefaults DmGlassOpacity, 0-100, default 70): 0 makes the glass vanish entirely (no effect, no tint, no shadow), 100 is the deepest. The box and the bottom bar read the same value, so one slider drives both. `light` is the bottom bar's pale pill: a white tint instead of the dark navy one, so its dark icons stay readable. (0206: below 35 the glass is `.clear`, at and above it `.regular` with a deepening tint — the frost itself switches, so the slider is visible.)
++/// `opacity` (0194, 0201, 0206, 0217) is the ONE glass-intensity setting (UserDefaults DmGlassOpacity, 0-100, default 70): 0 makes the glass vanish entirely (no effect, no tint, no shadow), 100 is the deepest. The box and the bottom bar read the same value, so one slider drives both. `light` is the bottom bar's pale pill: a white tint instead of the dark navy one, so its dark icons stay readable. (0217: one .regular glass throughout, .interactive() so it shimmers under a touch like the pad's discs; the strength fades the glass layer's own opacity 0 -> 1 from the slider's 0 to the 70 anchor and holds 1 past it, and the tint is one continuous line over the whole range, deepening to 100. The 0206 .clear/.regular switch at 35 is gone — it made the panel jump colour the instant the slider crossed it; now 0 -> 100 is a single smooth ramp.)
+ private extension View {
+     @ViewBuilder func dmGlassCard(cornerRadius: CGFloat = 32, opacity: Double = 70, light: Bool = false) -> some View {
+         let op = max(0, min(100, opacity)) / 100
+@@ -185,14 +185,15 @@ private extension View {
+         } else {
+             Group {
+                 if #available(iOS 26.0, *) {
+-                    // 0201: true liquid glass. The tint lives INSIDE the glass effect, so the intensity slider drives the glass itself: clear and refractive at low values, milkier at high ones. Before (0194), a solid fill overlay sat on top of the glass and turned the panel into frosted plastic; the slider only faded that white wash, so the glass never visibly changed and the user saw "no effect".
+-                    // 0206: tint-only still read as nothing on device (V1.3.44): `.regular` keeps a FIXED frost level no matter the tint alpha, and the tint is a near-black navy (max 0.45) over an already dark poster, so 0→100 changed almost no pixel. The value now also switches the glass itself: below 0.35 the glass is `.clear` (poster sharp behind), at and above it is `.regular` (frosted), with the tint deepening 0.15→0.75 as the value rises. Dragging past the threshold visibly frosts the panel over — that step is the intensity the user feels. The tint curve is continuous across the threshold; only the frost steps.
++                    // 0217: liquid glass, the pad's ladder (0111/0115). One .regular glass throughout, .interactive() so it shimmers under a touch like the pad's discs (UIGlassEffect.interactive = YES). The 0206 .clear/.regular switch at 35 is gone — it made the panel jump colour the instant the slider crossed it, which is the abrupt change the user saw. The strength now ramps smoothly: the glass layer's own opacity fades 0 -> 1 from the slider's 0 to the 70 anchor (the shipped look, fade 1 at 70) and holds 1 past it, and the tint is one continuous line over the whole range (the 0206 tint curve, extended below 35 and clamped at 0), deepening to 100. No threshold anywhere, so 0 -> 100 is a single smooth ramp. The glass lives on a background shape, not on the panel itself, so the fade touches only the glass — the text and buttons on top stay fully opaque at every value. (0201: the tint lives INSIDE the glass effect, so the slider drives the glass itself; before it, a solid fill overlay sat on top of the glass and turned the panel into frosted plastic.)
++                    let anchor = 0.70
++                    let fade = opacity <= anchor ? opacity / anchor : 1
++                    let tintAlpha = max(0, (light ? 0.25 : 0.15) + (light ? 0.55 : 0.60) * (opacity - 0.35) / 0.65)
+                     let tint = light ? Color.white : Color(red: 0.05, green: 0.07, blue: 0.13)
+-                    if opacity < 0.35 {
+-                        self.glassEffect(.clear, in: RoundedRectangle(cornerRadius: cornerRadius))
+-                    } else {
+-                        let deep = (opacity - 0.35) / 0.65
+-                        self.glassEffect(.regular.tint(tint.opacity((light ? 0.25 : 0.15) + (light ? 0.55 : 0.60) * deep)), in: RoundedRectangle(cornerRadius: cornerRadius))
++                    self.background {
++                        RoundedRectangle(cornerRadius: cornerRadius)
++                            .glassEffect(.regular.interactive().tint(tint.opacity(tintAlpha)), in: RoundedRectangle(cornerRadius: cornerRadius))
++                            .opacity(fade)
+                     }
+                 } else {
+                     self.background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: cornerRadius))
+-- 
+2.43.0
+

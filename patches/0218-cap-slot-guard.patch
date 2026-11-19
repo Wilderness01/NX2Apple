@@ -1,0 +1,36 @@
+From 9a3a9b180063fc23573173e9f0af6f685832fd6c Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Thu, 19 Nov 2026 10:10:20 +0000
+Subject: [PATCH] 0218: cap slot guard (cap loader looks up by name)
+
+---
+ dm/host/hle_fs.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/dm/host/hle_fs.c b/dm/host/hle_fs.c
+index 8e2623a..9c83caa 100644
+--- a/dm/host/hle_fs.c
++++ b/dm/host/hle_fs.c
+@@ -990,6 +990,19 @@ static int dm_char_redirect(const char *p, char *out, size_t n) {
+     // A set value names the costume to force ("default" = the character's own
+     // default part); unset follows the save, with the adapted-or-default rule.
+     const char *slot = !strcmp(part, "Cap") ? cap : clothes;
++    // 0218 (log-85): the slot must not apply to cap files. The cap loader
++    // looks the cap model up by name ("MarioCap") inside the cap file, like
++    // the High/Mechanic loaders (log-60/62). Every costume cap's FMDL is
++    // named after itself (MarioClownCap, MarioHarietCap, ...) and costume
++    // caps lack the CheckpointFlagWarp bymls the original MarioCap.szs has,
++    // so a slot redirect makes the lookup return NULL, the cap sub-object
++    // at [x21+0x50] is never created, and the checkpoint-warp parameter
++    // copy faults on NULL+8 at main+0x66d6d8 (log-84/85, same pc). The
++    // character's own cap files (PeachCap/CityMayorCap/ToadCap in the
++    // overlay) ARE safe -- their FMDL is "MarioCap" with the full byml
++    // set -- so the character swap (ch + "Cap", built by the else branch
++    // below) must keep working; only the slot is disabled here.
++    if (!strcmp(part, "Cap")) slot = NULL;
+     char cand[2][256];
+     int ncand = 0;
+     if (is_family) {
+-- 
+2.43.0
+
