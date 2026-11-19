@@ -1,0 +1,174 @@
+From d56a5743fad30e8841b3a767b4c4b0e32f75c505 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Thu, 19 Nov 2026 06:05:47 +0000
+Subject: [PATCH] 0211: apply outfit slot for Mario and costume files
+
+---
+ dm/host/hle_fs.c | 109 +++++++++++++++++++++++++++++++++++------------
+ 1 file changed, 82 insertions(+), 27 deletions(-)
+
+diff --git a/dm/host/hle_fs.c b/dm/host/hle_fs.c
+index 8ca98ac..2b5510d 100644
+--- a/dm/host/hle_fs.c
++++ b/dm/host/hle_fs.c
+@@ -886,14 +886,21 @@ static int dm_char_redirect(const char *p, char *out, size_t n) {
+     const char *sel = getenv("DM_CHAR_SELECT");
+     const char *cap = getenv("DM_CHAR_CAP");
+     const char *clothes = getenv("DM_CHAR_CLOTHES");
++    // 0211 (Part A): Mario goes through the slot logic instead of returning
++    // early. The early return discarded the launcher's cap/clothes pick
++    // unconditionally, so a Mario outfit pick could never apply (log-82:
++    // 410 kept, 0 redirects). Unset (or "mario") is the Mario character;
++    // an unset slot falls through to the original file below, so an
++    // unpicked Mario behaves exactly as before.
++    const char *ch;
+     if (!sel || !strcmp(sel, "mario")) {
+-        LOG("[char] fs %s kept (sel=%s)", p, sel ? sel : "(unset)");
+-        return 0;
+-    }
+-    const char *ch = !strcmp(sel, "luigi") ? "Luigi" : !strcmp(sel, "wario") ? "Wario" : !strcmp(sel, "peach") ? "Peach" : !strcmp(sel, "pauline") ? "CityMayor" : !strcmp(sel, "toad") ? "Toad" : NULL;
+-    if (!ch) {
+-        LOG("[char] fs %s kept (sel=%s: unknown character)", p, sel);
+-        return 0;
++        ch = "Mario";
++    } else {
++        ch = !strcmp(sel, "luigi") ? "Luigi" : !strcmp(sel, "wario") ? "Wario" : !strcmp(sel, "peach") ? "Peach" : !strcmp(sel, "pauline") ? "CityMayor" : !strcmp(sel, "toad") ? "Toad" : NULL;
++        if (!ch) {
++            LOG("[char] fs %s kept (sel=%s: unknown character)", p, sel);
++            return 0;
++        }
+     }
+     char stem[256];
+     size_t slen = flen - 4;
+@@ -914,37 +921,53 @@ static int dm_char_redirect(const char *p, char *out, size_t n) {
+     // DM_ROMFS_OVERLAY to the MountRom name, i.e. "content"); there is no
+     // "rom" mount on device, so a lookup for a mount named "rom" finds
+     // nothing. Find the mount the matched prefix names first, and fall back
+-    // to any mount that has an overlay set.
++    // to any mount that has an overlay set. (0211: keep the mount the game
++    // named as well -- its image holds the stock costume files, which a
++    // Mario slot target may be; the overlay alone cannot name them.)
+     const mount_t *rom = NULL;
+-    for (int i = 0; i < g_nmnt; i++) if (mnt_named(&g_mnt[i], mntname)) { rom = &g_mnt[i]; break; }
+-    if (!rom || !rom->overlay[0]) {
+-        rom = NULL;
++    const mount_t *named = NULL;
++    for (int i = 0; i < g_nmnt; i++) if (mnt_named(&g_mnt[i], mntname)) { named = &g_mnt[i]; break; }
++    rom = named && named->overlay[0] ? named : NULL;
++    if (!rom) {
+         for (int i = 0; i < g_nmnt; i++) if (g_mnt[i].overlay[0]) { rom = &g_mnt[i]; break; }
+     }
+-    if (!rom || !rom->overlay[0]) {
++    if (!rom && !(named && named->img)) {
+         LOG("[char] fs %s kept (sel=%s: no overlay mount)", p, sel);
+         return 0;
+     }
+     // Named-model rule (generalizes the 0163 High/64 family guard): a
+     // NON-EMPTY core names a distinct model identity -- a costume or a
+     // model form (High, 64, 64Metal, Mechanic, Aloha, Pilot, ...). The
+-    // loader looks the model's bfres up by that name (log-60:
++    // form loaders look the model's bfres up by that name (log-60:
+     // MarioHigh.bfres; log-62: MarioMechanic.bfres), and every overlay
+     // file's inner bfres is named for its own stem (LuigiColorWario.szs
+     // holds MarioColorWario.bfres, WarioHigh.szs holds MarioHigh.bfres,
+-    // ...), so a file with a core may only ever map to the SAME core for
+-    // the picked character (<Char><Core><Part>). The cap/clothes slot must
+-    // never be applied to one: MarioMechanic.szs asked with
+-    // clothes=MarioColorWario produced LuigiColorWario.szs (inner
+-    // MarioColorWario.bfres), the Mechanic loader got NULL and the game
+-    // crashed reading [NULL+0x28] (log-62: SIGSEGV addr=0x28 at
+-    // main+0x6ad530, one line after the redirect) -- the same class as the
+-    // log-60 High crash (NULL+8 at main+0x66d6d8). When the character
+-    // ships no file for that core (Luigi has no Mechanic file) the
+-    // original is kept, so the shop preview / form still shows Mario
+-    // instead of crashing. Only a base file (empty core: Mario.szs,
+-    // MarioEye.szs, MarioHead.szs, ...) may take the slot.
++    // ...), so a file with a High or Mechanic core may only ever map to
++    // the SAME core for the picked character (<Char><Core><Part>):
++    // MarioMechanic.szs asked with clothes=MarioColorWario produced
++    // LuigiColorWario.szs (inner MarioColorWario.bfres), the Mechanic
++    // loader got NULL and the game crashed reading [NULL+0x28] (log-62:
++    // SIGSEGV addr=0x28 at main+0x6ad530, one line after the redirect) --
++    // the same class as the log-60 High crash (NULL+8 at main+0x66d6d8).
++    // When the character ships no file for that core (Luigi has no
++    // Mechanic file) the original is kept, so the shop preview / form
++    // still shows Mario instead of crashing.
++    // 0211: every OTHER core may take the slot (the 0165 same-core-only
++    // rule is narrowed to High/Mechanic). The actor wears the save's
++    // equipped costume, so a base-file-only slot could never change what
++    // Mario wears (log-82: the pick was ignored, Mario stayed Explorer).
++    // Whether the actor's costume loader looks its model up by name like
++    // the Mechanic loader does is UNPINNED -- the base loader does not
++    // (log-69: Mario.szs -> LuigiColorWario.szs, inner MarioColorLuigi,
++    // worked), but if the costume loader does, a slot redirect crashes
++    // the same way (NULL+0x28 on load); the device test decides, and if
++    // it crashes the slot-on-costume step is reverted and the pick is
++    // applied by overriding the save instead (0166 territory).
+     const int is_family = core_len > 0;
++    // A form whose loader looks the bfres up by name (log-60 High, log-62
++    // Mechanic): same core only, never the slot.
++    const int is_named_form = (core_len == 4 && !memcmp(core, "High", 4)) ||
++                              (core_len == 8 && !memcmp(core, "Mechanic", 8));
+     // The slot env var (cap files follow DM_CHAR_CAP, everything else DM_CHAR_CLOTHES).
+     // A set value names the costume to force ("default" = the character's own
+     // default part); unset follows the save, with the adapted-or-default rule.
+@@ -952,6 +975,20 @@ static int dm_char_redirect(const char *p, char *out, size_t n) {
+     char cand[2][256];
+     int ncand = 0;
+     if (is_family) {
++        // 0211 (Part B): a set slot applies to a costume file too -- the
++        // slot's costume first, then the same core. A "default" pick tries
++        // the character's default part first, then the same core. Named
++        // forms (High/Mechanic) keep the 0165 same-core-only rule. The
++        // loop below skips a candidate that names the file already asked
++        // for (for Mario the same core IS that file), and accepts a target
++        // the mount's image holds as well as the overlay.
++        if (!is_named_form) {
++            if (slot && !strncmp(slot, "Mario", 5) && slot[5]) {
++                snprintf(cand[ncand], sizeof cand[0], "%s%s%s", ch, slot + 5, part); ncand++;
++            } else if (slot && !strcmp(slot, "default")) {
++                snprintf(cand[ncand], sizeof cand[0], "%s%s", ch, part); ncand++;
++            }
++        }
+         snprintf(cand[ncand], sizeof cand[0], "%s%.*s%s", ch, (int)core_len, core, part); ncand++;
+     } else if (slot && !strcmp(slot, "default")) {
+         snprintf(cand[ncand], sizeof cand[0], "%s%s", ch, part); ncand++;
+@@ -965,15 +1002,33 @@ static int dm_char_redirect(const char *p, char *out, size_t n) {
+         snprintf(cand[ncand], sizeof cand[0], "%s%s", ch, part); ncand++;
+     }
+     for (int i = 0; i < ncand; i++) {
++        // A candidate that names the file already asked for is not a
++        // redirect (for Mario the same core IS that file; the default part
++        // is too, for a base file) -- skip it, or the log would show a
++        // redirect to the same file and a costume file could be rewritten
++        // to the default part while the preload still names it by its own
++        // core.
++        if (!strcmp(cand[i], stem)) continue;
+         char rest[1024], tmp[1024];
+         snprintf(rest, sizeof rest, "/ObjectData/%s.szs", cand[i]);
+-        if (!rom_overlay_path(rom, rest, tmp, sizeof tmp)) continue;
++        // A target counts when the overlay has it, or when the mount's
++        // image does: a Mario slot target is a stock RomFS costume
++        // (Mario64.szs), which the overlay never carries. img_find takes
++        // no lock of its own (its callers hold PATH_LOCK); the redirect
++        // runs before h_fs_OpenFile takes it, so take it here.
++        int found = rom && rom->overlay[0] && rom_overlay_path(rom, rest, tmp, sizeof tmp);
++        if (!found && named && named->img) {
++            PATH_LOCK();
++            found = img_find(named->img, rest) >= 0;
++        }
++        if (!found) continue;
+         snprintf(out, n, "%s%s.szs", matched, cand[i]);
+         LOG("[char] fs %s -> %s (sel=%s cap=%s clothes=%s)", p, out, sel,
+             cap ? cap : "(unset)", clothes ? clothes : "(unset)");
+         return 1;
+     }
+-    LOG("[char] fs %s kept (sel=%s: no overlay file for %s)", p, sel, cand[0]);
++    LOG("[char] fs %s kept (sel=%s cap=%s clothes=%s: no overlay/image file for %s)", p, sel,
++        cap ? cap : "(unset)", clothes ? clothes : "(unset)", cand[0]);
+     return 0;
+ }
+ 
+-- 
+2.43.0
+

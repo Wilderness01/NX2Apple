@@ -1,0 +1,44 @@
+From ff19c8fd5167471e10a5191f02607ece0e9eb40d Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Thu, 19 Nov 2026 05:50:50 +0000
+Subject: [PATCH] 0209: restore character hero image in picker
+
+---
+ dm/ios/Sources/Launcher.swift | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index 755fb81..8ae87f1 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -530,7 +530,7 @@ private struct OutfitGridView: View {
+     }
+ }
+ 
+-/// The character picker (0194, 0201, in the box): the flat outfit grid on top, the six character cards in a row at the bottom. The choice is saved to DmCharSelect.character (NSUserDefaults), which dm_char_select_apply_saved reads at startup before the game starts, so the next launch plays as the picked character. The roster is Mario / Luigi / Wario / Peach / Pauline / Toad; the grid follows the pick. Pauline and Toad need their model patches (0193) to play in-game — the picker itself only writes the name.
++/// The character picker (0194, 0201, 0209, in the box): the hero on the left and the flat outfit grid on the right, the six character cards in a row at the bottom. The choice is saved to DmCharSelect.character (NSUserDefaults), which dm_char_select_apply_saved reads at startup before the game starts, so the next launch plays as the picked character. The roster is Mario / Luigi / Wario / Peach / Pauline / Toad; the hero and the grid follow the pick. Pauline and Toad need their model patches (0193) to play in-game — the picker itself only writes the name.
+ private struct CharacterPickerView: View {
+     let scale: CGFloat
+     @State private var selected: String = UserDefaults.standard.string(forKey: "DmCharSelect.character") ?? "mario"
+@@ -553,8 +553,16 @@ private struct CharacterPickerView: View {
+ 
+     var body: some View {
+         VStack(spacing: 6 * scale) {
+-            // The outfit grid (0201): flat, full width of the box — the hero is gone here (the flat-grid layout the user picked has no hero; the character is named in the grid title and picked from the cards below). The grid scrolls; the character cards stay pinned at the bottom.
+-            OutfitGridView(characterId: current.id, characterName: current.name, scale: scale)
++            // Top row (0209): the hero is back. 0201 dropped it when the stacked deck became a flat grid, but the settled design keeps the big image next to the clothes — "大图330宽" in the mockup is 330 mockup pixels, i.e. 170pt at 2x, the 0194 frame. Hero on the left in a fixed frame (so a narrow render like Peach or Pauline does not move the grid), grid on the right; both follow the picked character. The grid keeps 4 columns and scrolls; the character cards stay pinned at the bottom.
++            HStack(alignment: .top, spacing: 12 * scale) {
++                if let img = dmCharImage(current.image) {
++                    Image(uiImage: img)
++                        .resizable()
++                        .scaledToFit()
++                        .frame(width: 170 * scale, height: 190 * scale)
++                }
++                OutfitGridView(characterId: current.id, characterName: current.name, scale: scale)
++            }
+             // Cards: one row, left to right. The selected card gets a gold ring.
+             HStack(spacing: 8 * scale) {
+                 ForEach(roster) { c in
+-- 
+2.43.0
+
