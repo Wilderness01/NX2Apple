@@ -1,0 +1,591 @@
+From ae81f57dfe725c084fb73c96b1296507e0b29a89 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Thu, 19 Nov 2026 07:50:56 +0800
+Subject: [PATCH] 0201: true liquid glass, flat outfit grid with real renders
+ and Chinese names
+
+Glass: the tint now lives inside .glassEffect(.regular.tint(...)) so the
+intensity slider drives the glass itself (clear and refractive at low
+values, milkier at high ones). The 0194 solid fill overlay sat on top of
+the glass and turned the panel into frosted plastic; the slider only
+faded that white wash, so the glass never visibly changed.
+
+Outfits: the stacked deck is replaced by a flat scrollable grid (the
+user's mockup layout: title, subtitle, four columns, foil background,
+gold border on the worn one). Cards show a real 3D render
+(of_<character>_<ItemName>.png, Blender) above the Chinese name from
+the game's ItemCloth.msbt. A plain Button tap selects now: the deck's
+tap-to-select never fired because DragGesture's default minimumDistance
+is 10pt, so a stationary tap never activated the gesture and the pick
+always stayed default. The hero is gone from this tab; the character
+is named in the grid title and picked from the cards below.
+---
+ dm/ios/Sources/Launcher.swift | 442 ++++++++++++++--------------------
+ 1 file changed, 181 insertions(+), 261 deletions(-)
+
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index e0e87b2..6881c35 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -160,19 +160,14 @@ private struct DocumentPicker: UIViewControllerRepresentable {
+     }
+ }
+ 
+-/// Liquid Glass for the launcher's panels (0181, 0194): iOS 26 native .glassEffect, regular; below iOS 26 a translucent material fill. The deployment target is iOS 26, so the fallback is dead code kept for the pattern's sake — the same ladder the pad's discs use (0111: real UIGlassEffect on 26+, vector disc below). Layered, not flat: a soft inner highlight along the top edge and a gentle drop shadow give the card depth; the corner radius is a little larger (32) for the game's rounded, playful shapes. Glass needs something behind it to refract: the backdrop is a deep navy-black base, neutral on purpose — the text is white on dark glass, and a loud backdrop would fight it.
++/// Liquid Glass for the launcher's panels (0181, 0194, 0201): iOS 26 native .glassEffect, regular; below iOS 26 a translucent material fill. The deployment target is iOS 26, so the fallback is dead code kept for the pattern's sake — the same ladder the pad's discs use (0111: real UIGlassEffect on 26+, vector disc below). Layered, not flat: a soft inner highlight along the top edge and a gentle drop shadow give the card depth; the corner radius is a little larger (32) for the game's rounded, playful shapes. Glass needs something behind it to refract: the backdrop is a deep navy-black base, neutral on purpose — the text is white on dark glass, and a loud backdrop would fight it.
+ ///
+-/// `opacity` (0194) is the ONE glass-intensity setting (UserDefaults DmGlassOpacity, 0-100, default 70): 0 makes the glass vanish entirely (no effect, no tint, no shadow), 100 is the deepest. The box and the bottom bar read the same value, so one slider drives both. `light` is the bottom bar's pale pill: a white tint instead of the dark navy one, so its dark icons stay readable.
++/// `opacity` (0194, 0201) is the ONE glass-intensity setting (UserDefaults DmGlassOpacity, 0-100, default 70): 0 makes the glass vanish entirely (no effect, no tint, no shadow), 100 is the deepest. The box and the bottom bar read the same value, so one slider drives both. `light` is the bottom bar's pale pill: a white tint instead of the dark navy one, so its dark icons stay readable.
+ private extension View {
+     @ViewBuilder func dmGlassCard(cornerRadius: CGFloat = 32, opacity: Double = 70, light: Bool = false) -> some View {
+         let op = max(0, min(100, opacity)) / 100
+-        dmGlassBase(cornerRadius: cornerRadius, opacity: op)
+-            // 0200: these overlays are decoration only, but SwiftUI hit-testing gives a tap to the topmost view that contains it — the fill RoundedRectangle covers the whole panel, so it ate every tap and the buttons underneath (bottom bar, box controls) never saw one. The bar has been dead since 0194 added this fill (V1.3.36's 0181 glass had only the 1pt stroke, which is why Play still worked then; 0197's contentShape could not help, the overlay sits above the buttons). Let touches fall through to the content.
+-            .overlay(
+-                RoundedRectangle(cornerRadius: cornerRadius)
+-                    .fill((light ? Color.white : Color(red: 0.05, green: 0.07, blue: 0.13)).opacity((light ? 0.55 : 0.45) * op))
+-                    .allowsHitTesting(false)
+-            )
++        dmGlassBase(cornerRadius: cornerRadius, opacity: op, light: light)
++            // 0200: overlays are decoration only, but SwiftUI hit-testing gives a tap to the topmost view that contains it — a fill covering the whole panel ate every tap and the buttons underneath (bottom bar, box controls) never saw one. Keep them non-interactive.
+             .overlay(
+                 RoundedRectangle(cornerRadius: cornerRadius)
+                     .strokeBorder(
+@@ -184,13 +179,14 @@ private extension View {
+             .shadow(color: .black.opacity(0.28 * op), radius: 16, x: 0, y: 8)
+     }
+ 
+-    @ViewBuilder private func dmGlassBase(cornerRadius: CGFloat, opacity: Double) -> some View {
++    @ViewBuilder private func dmGlassBase(cornerRadius: CGFloat, opacity: Double, light: Bool) -> some View {
+         if opacity <= 0 {
+             self
+         } else {
+             Group {
+                 if #available(iOS 26.0, *) {
+-                    self.glassEffect(.regular, in: RoundedRectangle(cornerRadius: cornerRadius))
++                    // 0201: true liquid glass. The tint lives INSIDE the glass effect, so the intensity slider drives the glass itself: clear and refractive at low values, milkier at high ones. Before (0194), a solid fill overlay sat on top of the glass and turned the panel into frosted plastic; the slider only faded that white wash, so the glass never visibly changed and the user saw "no effect".
++                    self.glassEffect(.regular.tint((light ? Color.white : Color(red: 0.05, green: 0.07, blue: 0.13)).opacity((light ? 0.55 : 0.45) * opacity)), in: RoundedRectangle(cornerRadius: cornerRadius))
+                 } else {
+                     self.background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: cornerRadius))
+                 }
+@@ -246,7 +242,7 @@ private func dmCharImage(_ name: String) -> UIImage? {
+     UIImage(named: name, in: Bundle(for: LauncherModel.self), compatibleWith: nil)
+ }
+ 
+-/// An outfit's dot-art icon (0194): the game's real 8-bit icons, extracted from the RomFS *2D.szs files and bundled in LauncherBackground as outfit_<ItemName>.png (67 files, height 260px). UIImage(named:) finds the file the Sources glob bundles at the bundle root.
++/// An outfit's real 3D render (0201): the character in T-pose wearing it, rendered in Blender from the game's own models and bundled in LauncherBackground as of_<character>_<ItemName>.png (transparent background). Replaces the 8-bit dot-art icons (0194, extracted from the RomFS *2D.szs) — the user wants the cards to look like the flat-grid mockup, a real render, not pixel icons. UIImage(named:) finds the file the Sources glob bundles at the bundle root. Returns nil when the render is missing; the card then shows the Chinese name in text.
+ private func dmOutfitImage(_ name: String) -> UIImage? {
+     UIImage(named: name, in: Bundle(for: LauncherModel.self), compatibleWith: nil)
+ }
+@@ -254,152 +250,152 @@ private func dmOutfitImage(_ name: String) -> UIImage? {
+ // Caps (50)
+ private let dmOutfitCaps: [(id: String, name: String)] = [
+     ("Mario64", "64"),
+-    ("Mario64Metal", "64Metal"),
+-    ("MarioAloha", "Aloha"),
+-    ("MarioArmor", "Armor"),
+-    ("MarioArmorWestern", "ArmorWestern"),
+-    ("MarioBandman", "Bandman"),
+-    ("MarioBatter", "Batter"),
+-    ("MarioClown", "Clown"),
+-    ("MarioColorClassic", "ColorClassic"),
+-    ("MarioColorGold", "ColorGold"),
+-    ("MarioColorLuigi", "ColorLuigi"),
+-    ("MarioColorWaluigi", "ColorWaluigi"),
+-    ("MarioColorWario", "ColorWario"),
+-    ("MarioConductor", "Conductor"),
+-    ("MarioCook", "Cook"),
+-    ("MarioDiddyKong", "DiddyKong"),
+-    ("MarioDoctor", "Doctor"),
+-    ("MarioDot3d", "Dot3d"),
+-    ("MarioExplorer", "Explorer"),
+-    ("MarioFootball", "Football"),
+-    ("MarioGolf", "Golf"),
+-    ("MarioGunman", "Gunman"),
+-    ("MarioHappi", "Happi"),
+-    ("MarioHariet", "Hariet"),
+-    ("MarioKoopa", "Koopa"),
+-    ("MarioMaker", "Maker"),
+-    ("MarioMechanic", "Mechanic"),
+-    ("MarioNew3DS", "New3DS"),
+-    ("MarioPainter", "Painter"),
+-    ("MarioPeach", "Peach"),
+-    ("MarioPilot", "Pilot"),
+-    ("MarioPirate", "Pirate"),
+-    ("MarioPoncho", "Poncho"),
+-    ("MarioPrimitiveMan", "PrimitiveMan"),
+-    ("MarioRacer", "Racer"),
+-    ("MarioRango", "Rango"),
+-    ("MarioSailor", "Sailor"),
+-    ("MarioSanta", "Santa"),
+-    ("MarioSatellite", "Satellite"),
+-    ("MarioScientist", "Scientist"),
+-    ("MarioShopman", "Shopman"),
+-    ("MarioSnowSuit", "SnowSuit"),
+-    ("MarioSpaceSuit", "SpaceSuit"),
+-    ("MarioSpewart", "Spewart"),
+-    ("MarioSuit", "Suit"),
+-    ("MarioSunshine", "Sunshine"),
+-    ("MarioSwimwear", "Swimwear"),
+-    ("MarioTailCoat", "TailCoat"),
+-    ("MarioTopper", "Topper"),
+-    ("MarioZombie", "Zombie"),
++    ("Mario64Metal", "\u{91d1}\u{5c5e}\u{9a6c}\u{529b}\u{6b27}"),
++    ("MarioAloha", "\u{963f}\u{7f57}\u{54c8}"),
++    ("MarioArmor", "\u{6b66}\u{8005}"),
++    ("MarioArmorWestern", "\u{88c5}\u{7532}"),
++    ("MarioBandman", "\u{4e50}\u{624b}"),
++    ("MarioBatter", "\u{68d2}\u{7403}"),
++    ("MarioClown", "\u{5c0f}\u{4e11}"),
++    ("MarioColorClassic", "\u{7ecf}\u{5178}"),
++    ("MarioColorGold", "\u{91d1}\u{8272}"),
++    ("MarioColorLuigi", "\u{8def}\u{6613}\u{5409}"),
++    ("MarioColorWaluigi", "\u{74e6}\u{8def}\u{6613}\u{5409}"),
++    ("MarioColorWario", "\u{74e6}\u{529b}\u{6b27}"),
++    ("MarioConductor", "\u{6307}\u{6325}\u{5bb6}"),
++    ("MarioCook", "\u{53a8}\u{5e08}"),
++    ("MarioDiddyKong", "\u{8fea}\u{8fea}"),
++    ("MarioDoctor", "\u{533b}\u{751f}"),
++    ("MarioDot3d", "8-bit\u{9a6c}\u{529b}\u{6b27}"),
++    ("MarioExplorer", "\u{63a2}\u{9669}\u{5bb6}"),
++    ("MarioFootball", "\u{7f8e}\u{5f0f}\u{6a44}\u{6984}\u{7403}"),
++    ("MarioGolf", "\u{9ad8}\u{5c14}\u{592b}\u{7403}"),
++    ("MarioGunman", "\u{725b}\u{4ed4}"),
++    ("MarioHappi", "\u{6cd5}\u{88ab}"),
++    ("MarioHariet", "\u{54c8}\u{5229}\u{827e}\u{7279}"),
++    ("MarioKoopa", "\u{65b0}\u{90ce}\u{9177}\u{9738}\u{738b}"),
++    ("MarioMaker", "\u{5efa}\u{7b51}\u{5de5}"),
++    ("MarioMechanic", "\u{673a}\u{68b0}\u{5e08}"),
++    ("MarioNew3DS", "\u{65f6}\u{9ae6}"),
++    ("MarioPainter", "\u{753b}\u{5de5}"),
++    ("MarioPeach", "\u{65b0}\u{5a18}\u{6843}\u{82b1}\u{516c}\u{4e3b}"),
++    ("MarioPilot", "\u{98de}\u{884c}\u{5458}"),
++    ("MarioPirate", "\u{6d77}\u{76d7}"),
++    ("MarioPoncho", "\u{5f6d}\u{4e18}"),
++    ("MarioPrimitiveMan", "\u{539f}\u{59cb}\u{4eba}"),
++    ("MarioRacer", "\u{8d5b}\u{624b}"),
++    ("MarioRango", "\u{6717}\u{683c}"),
++    ("MarioSailor", "\u{6c34}\u{624b}"),
++    ("MarioSanta", "\u{5723}\u{8bde}\u{8001}\u{4eba}"),
++    ("MarioSatellite", "\u{536b}\u{661f}\u{6e38}\u{620f}"),
++    ("MarioScientist", "\u{79d1}\u{5b66}\u{5bb6}"),
++    ("MarioShopman", "\u{514b}\u{96f7}\u{5409}\u{4f73}\u{666e}\u{5e97}\u{5458}"),
++    ("MarioSnowSuit", "\u{9632}\u{5bd2}"),
++    ("MarioSpaceSuit", "\u{5b87}\u{822a}"),
++    ("MarioSpewart", "\u{65af}\u{666e}\u{74e6}\u{7279}"),
++    ("MarioSuit", "\u{897f}\u{5e3d}"),
++    ("MarioSunshine", "\u{592a}\u{9633}\u{4e4b}\u{5149}"),
++    ("MarioSwimwear", "\u{6cf3}\u{955c}"),
++    ("MarioTailCoat", "\u{7ec5}\u{58eb}"),
++    ("MarioTopper", "\u{6258}\u{5e15}"),
++    ("MarioZombie", "\u{50f5}\u{5c38}"),
+ ]
+ 
+ // Clothes (52)
+ private let dmOutfitClothes: [(id: String, name: String)] = [
+     ("Mario64", "64"),
+-    ("Mario64Metal", "64Metal"),
+-    ("MarioAloha", "Aloha"),
+-    ("MarioArmor", "Armor"),
+-    ("MarioArmorWestern", "ArmorWestern"),
+-    ("MarioBandman", "Bandman"),
+-    ("MarioBatter", "Batter"),
+-    ("MarioBone", "Bone"),
+-    ("MarioClown", "Clown"),
+-    ("MarioColorClassic", "ColorClassic"),
+-    ("MarioColorGold", "ColorGold"),
+-    ("MarioColorLuigi", "ColorLuigi"),
+-    ("MarioColorWaluigi", "ColorWaluigi"),
+-    ("MarioColorWario", "ColorWario"),
+-    ("MarioConductor", "Conductor"),
+-    ("MarioCook", "Cook"),
+-    ("MarioDiddyKong", "DiddyKong"),
+-    ("MarioDoctor", "Doctor"),
+-    ("MarioExplorer", "Explorer"),
+-    ("MarioFootball", "Football"),
+-    ("MarioGolf", "Golf"),
+-    ("MarioGunman", "Gunman"),
+-    ("MarioHakama", "Hakama"),
+-    ("MarioHappi", "Happi"),
+-    ("MarioHariet", "Hariet"),
+-    ("MarioKoopa", "Koopa"),
+-    ("MarioMaker", "Maker"),
+-    ("MarioMechanic", "Mechanic"),
+-    ("MarioNew3DS", "New3DS"),
+-    ("MarioPainter", "Painter"),
+-    ("MarioPeach", "Peach"),
+-    ("MarioPilot", "Pilot"),
+-    ("MarioPirate", "Pirate"),
+-    ("MarioPoncho", "Poncho"),
+-    ("MarioPrimitiveMan", "PrimitiveMan"),
+-    ("MarioRacer", "Racer"),
+-    ("MarioRango", "Rango"),
+-    ("MarioSailor", "Sailor"),
+-    ("MarioSanta", "Santa"),
+-    ("MarioSatellite", "Satellite"),
+-    ("MarioScientist", "Scientist"),
+-    ("MarioShopman", "Shopman"),
+-    ("MarioSnowSuit", "SnowSuit"),
+-    ("MarioSpaceSuit", "SpaceSuit"),
+-    ("MarioSpewart", "Spewart"),
+-    ("MarioSuit", "Suit"),
+-    ("MarioSunshine", "Sunshine"),
+-    ("MarioSwimwear", "Swimwear"),
+-    ("MarioTailCoat", "TailCoat"),
+-    ("MarioTopper", "Topper"),
+-    ("MarioUnderwear", "Underwear"),
+-    ("MarioZombie", "Zombie"),
++    ("Mario64Metal", "\u{91d1}\u{5c5e}\u{9a6c}\u{529b}\u{6b27}"),
++    ("MarioAloha", "\u{963f}\u{7f57}\u{54c8}"),
++    ("MarioArmor", "\u{6b66}\u{8005}"),
++    ("MarioArmorWestern", "\u{88c5}\u{7532}"),
++    ("MarioBandman", "\u{4e50}\u{624b}"),
++    ("MarioBatter", "\u{68d2}\u{7403}"),
++    ("MarioBone", "\u{67af}\u{9aa8}"),
++    ("MarioClown", "\u{5c0f}\u{4e11}"),
++    ("MarioColorClassic", "\u{7ecf}\u{5178}"),
++    ("MarioColorGold", "\u{91d1}\u{8272}"),
++    ("MarioColorLuigi", "\u{8def}\u{6613}\u{5409}"),
++    ("MarioColorWaluigi", "\u{74e6}\u{8def}\u{6613}\u{5409}"),
++    ("MarioColorWario", "\u{74e6}\u{529b}\u{6b27}"),
++    ("MarioConductor", "\u{6307}\u{6325}\u{5bb6}"),
++    ("MarioCook", "\u{53a8}\u{5e08}"),
++    ("MarioDiddyKong", "\u{8fea}\u{8fea}"),
++    ("MarioDoctor", "\u{533b}\u{751f}"),
++    ("MarioExplorer", "\u{63a2}\u{9669}\u{5bb6}"),
++    ("MarioFootball", "\u{7f8e}\u{5f0f}\u{6a44}\u{6984}\u{7403}"),
++    ("MarioGolf", "\u{9ad8}\u{5c14}\u{592b}\u{7403}"),
++    ("MarioGunman", "\u{725b}\u{4ed4}"),
++    ("MarioHakama", "\u{548c}\u{670d}"),
++    ("MarioHappi", "\u{796d}\u{5178}"),
++    ("MarioHariet", "\u{54c8}\u{5229}\u{827e}\u{7279}"),
++    ("MarioKoopa", "\u{65b0}\u{90ce}\u{9177}\u{9738}\u{738b}"),
++    ("MarioMaker", "\u{5efa}\u{7b51}\u{5de5}"),
++    ("MarioMechanic", "\u{673a}\u{68b0}\u{5e08}"),
++    ("MarioNew3DS", "\u{65f6}\u{9ae6}"),
++    ("MarioPainter", "\u{753b}\u{5de5}"),
++    ("MarioPeach", "\u{65b0}\u{5a18}\u{6843}\u{82b1}\u{516c}\u{4e3b}"),
++    ("MarioPilot", "\u{98de}\u{884c}\u{5458}"),
++    ("MarioPirate", "\u{6d77}\u{76d7}"),
++    ("MarioPoncho", "\u{5f6d}\u{4e18}"),
++    ("MarioPrimitiveMan", "\u{539f}\u{59cb}\u{4eba}"),
++    ("MarioRacer", "\u{8d5b}\u{624b}"),
++    ("MarioRango", "\u{6717}\u{683c}"),
++    ("MarioSailor", "\u{6c34}\u{624b}"),
++    ("MarioSanta", "\u{5723}\u{8bde}\u{8001}\u{4eba}"),
++    ("MarioSatellite", "\u{536b}\u{661f}\u{6e38}\u{620f}"),
++    ("MarioScientist", "\u{79d1}\u{5b66}\u{5bb6}"),
++    ("MarioShopman", "\u{514b}\u{96f7}\u{5409}\u{4f73}\u{666e}\u{5e97}\u{5458}"),
++    ("MarioSnowSuit", "\u{9632}\u{5bd2}"),
++    ("MarioSpaceSuit", "\u{5b87}\u{822a}"),
++    ("MarioSpewart", "\u{65af}\u{666e}\u{74e6}\u{7279}"),
++    ("MarioSuit", "\u{897f}\u{670d}"),
++    ("MarioSunshine", "\u{592a}\u{9633}\u{4e4b}\u{5149}"),
++    ("MarioSwimwear", "\u{6cf3}\u{8863}"),
++    ("MarioTailCoat", "\u{5a5a}\u{793c}\u{71d5}\u{5c3e}\u{670d}"),
++    ("MarioTopper", "\u{6258}\u{5e15}"),
++    ("MarioUnderwear", "\u{77ed}\u{88e4}"),
++    ("MarioZombie", "\u{50f5}\u{5c38}"),
+ ]
+ 
+ // Wario's costumes with a dot-art icon (0194): 8 of his 10. Captain and High have no *2D.szs in RomFS, so no icon exists and the picker does not offer them (never invent one). The id is the Mario-prefixed ItemName the host redirect expects (it swaps the prefix for the picked character); the icon is Wario's own dot art, so the card shows what Wario will wear.
+-private let dmWarioOutfits: [(id: String, icon: String, name: String)] = [
+-    ("Mario64", "outfit_Wario64", "64"),
+-    ("MarioColorClassic", "outfit_WarioColorClassic", "ColorClassic"),
+-    ("MarioColorGold", "outfit_WarioColorGold", "ColorGold"),
+-    ("MarioColorLuigi", "outfit_WarioColorLuigi", "ColorLuigi"),
+-    ("MarioColorWaluigi", "outfit_WarioColorWaluigi", "ColorWaluigi"),
+-    ("MarioColorWario", "outfit_WarioColorWario", "ColorWario"),
+-    ("MarioPilot", "outfit_WarioPilot", "Pilot"),
+-    ("MarioPrimitiveMan", "outfit_WarioPrimitiveMan", "PrimitiveMan"),
++private let dmWarioOutfits: [(id: String, name: String)] = [
++    ("Mario64", "64"),
++    ("MarioColorClassic", "\u{7ecf}\u{5178}"),
++    ("MarioColorGold", "\u{91d1}\u{8272}"),
++    ("MarioColorLuigi", "\u{8def}\u{6613}\u{5409}"),
++    ("MarioColorWaluigi", "\u{74e6}\u{8def}\u{6613}\u{5409}"),
++    ("MarioColorWario", "\u{74e6}\u{529b}\u{6b27}"),
++    ("MarioPilot", "\u{98de}\u{884c}\u{5458}"),
++    ("MarioPrimitiveMan", "\u{539f}\u{59cb}\u{4eba}"),
+ ]
+ 
+ // Luigi's clothes (0194): 3. He has no cap files at all, so his cap is always the default.
+-private let dmLuigiClothes: [(id: String, icon: String, name: String)] = [
+-    ("MarioColorLuigi", "outfit_LuigiColorLuigi", "ColorLuigi"),
+-    ("MarioColorWaluigi", "outfit_LuigiColorWaluigi", "ColorWaluigi"),
+-    ("MarioColorWario", "outfit_LuigiColorWario", "ColorWario"),
++private let dmLuigiClothes: [(id: String, name: String)] = [
++    ("MarioColorLuigi", "\u{8def}\u{6613}\u{5409}"),
++    ("MarioColorWaluigi", "\u{74e6}\u{8def}\u{6613}\u{5409}"),
++    ("MarioColorWario", "\u{74e6}\u{529b}\u{6b27}"),
+ ]
+ 
+-/// One outfit in the deck (0194): `id` is the value written to DmCharSelect.cap / DmCharSelect.clothes (a Mario-prefixed ItemName, or "default" for the character's own default part); `icon` is the bundled dot-art image name (nil for the default card, which has no icon); `name` is the label on the card.
++/// One outfit in the grid (0194, 0201): `id` is the value written to DmCharSelect.cap / DmCharSelect.clothes (a Mario-prefixed ItemName, or "default" for the character's own default part); `image` is the bundled real-render filename (of_<character>_<id>.png, nil when no render exists — the card then shows the name in text); `name` is the Chinese label on the card (the game's own ItemCloth.msbt name, suffix stripped).
+ private struct DeckItem: Identifiable {
+     let id: String
+-    let icon: String?
++    let image: String?
+     let name: String
+ }
+ 
+-/// The deck's list for a character and a slot (0194). The first entry is always "default". Mario gets all 50 caps + 52 clothes; Luigi gets his 3 clothes and default-only caps; Wario gets his 8 icon'd costumes in each slot; Peach, Pauline and Toad get default only for now.
++/// The grid's list for a character and a slot (0194, 0201). The first entry is always "default". Mario gets all 50 caps + 52 clothes; Luigi gets his 3 clothes and default-only caps; Wario gets his 8 costumes in each slot; Peach, Pauline and Toad get default only for now. The card image is the real render of_<character>_<id>.png; the default card uses of_<character>_default (only Mario's exists — the rest fall back to a text-only card).
+ private func dmDeckItems(character: String, caps: Bool) -> [DeckItem] {
+-    var items: [DeckItem] = [DeckItem(id: "default", icon: nil, name: "\u{9ed8}\u{8ba4}")]
++    var items: [DeckItem] = [DeckItem(id: "default", image: "of_\(character)_default", name: "\u{9ed8}\u{8ba4}")]
+     switch character {
+     case "mario":
+         let src = caps ? dmOutfitCaps : dmOutfitClothes
+-        items += src.map { DeckItem(id: $0.id, icon: "outfit_" + $0.id, name: $0.name) }
++        items += src.map { DeckItem(id: $0.id, image: "of_mario_" + $0.id, name: $0.name) }
+     case "luigi":
+         if !caps {
+-            items += dmLuigiClothes.map { DeckItem(id: $0.id, icon: $0.icon, name: $0.name) }
++            items += dmLuigiClothes.map { DeckItem(id: $0.id, image: "of_luigi_" + $0.id, name: $0.name) }
+         }
+     case "wario":
+-        items += dmWarioOutfits.map { DeckItem(id: $0.id, icon: $0.icon, name: $0.name) }
++        items += dmWarioOutfits.map { DeckItem(id: $0.id, image: "of_wario_" + $0.id, name: $0.name) }
+     default:
+         break
+     }
+@@ -431,160 +427,97 @@ private struct FoilBackground: View {
+     }
+ }
+ 
+-/// The outfit deck (0194): a flat stack of cards, no tilt — the front card large, the next two peeking out up-right and dimmed. Swiping the front card left or right sends it to the back and the deck cycles forever; tapping the front card selects it (gold border + writes DmCharSelect.cap / DmCharSelect.clothes). The segmented control switches the deck between caps and clothes; the counter below shows the front card's place among the costumes ("N / total"), or the default label when the front card is the default. The stack order is rebuilt whenever the character or the slot changes, with the currently worn outfit at the front.
+-private struct OutfitDeckView: View {
++/// The outfit grid (0201, flat — replaces the 0194 stacked deck): a scrollable grid of cards, one per outfit the character can wear, laid out like the user's flat-grid mockup — title "<character>的服装", subtitle "只显示<character>能穿的衣服", four columns, foil background on every card, a real 3D render above the Chinese name, gold border on the worn one. No stacking: the deck's swipe-to-cycle hid the outfits, and its tap-to-select never fired — DragGesture's default minimumDistance is 10pt, so a stationary tap never activated the gesture and selectFront() never ran, which is why the user could never change clothes and it always stayed default. A plain Button tap selects now, and the worn card is visible in the grid at all times.
++private struct OutfitGridView: View {
+     let characterId: String
++    let characterName: String
+     let scale: CGFloat
+     @State private var capsMode: Bool = true
+-    @State private var stack: [String] = []
+-    @State private var dragOffset: CGSize = .zero
+     @State private var cap: String = UserDefaults.standard.string(forKey: "DmCharSelect.cap") ?? "default"
+     @State private var clothes: String = UserDefaults.standard.string(forKey: "DmCharSelect.clothes") ?? "default"
+ 
+     private var items: [DeckItem] { dmDeckItems(character: characterId, caps: capsMode) }
+-    private var costumes: [DeckItem] { Array(items.dropFirst()) }
+     private var selectedId: String { capsMode ? cap : clothes }
+-    /// What the character actually wears: the stored value when the deck offers it, otherwise the default (a costume another character owns is not in this character's list, and must not leave the deck with nothing highlighted).
+     private var effectiveSelectedId: String {
+         items.contains { $0.id == selectedId } ? selectedId : "default"
+     }
+ 
+-    private func rebuildStack() {
+-        let sel = effectiveSelectedId
+-        var ids = items.map { $0.id }
+-        if let i = ids.firstIndex(of: sel) { ids.remove(at: i); ids.insert(sel, at: 0) }
+-        stack = ids
+-    }
+-
+-    private func cardItem(at depth: Int) -> DeckItem? {
+-        guard stack.count > depth else { return nil }
+-        let id = stack[depth]
+-        return items.first { $0.id == id }
+-    }
+-
+-    private var frontItem: DeckItem? { cardItem(at: 0) }
+-
+-    private var counterText: String {
+-        guard let f = frontItem else { return "" }
+-        if f.id == "default" { return "\u{9ed8}\u{8ba4}" }
+-        if let i = costumes.firstIndex(where: { $0.id == f.id }) {
+-            return "\(i + 1) / \(costumes.count)"
+-        }
+-        return ""
+-    }
+-
+-    private func cycle() {
+-        guard stack.count > 1 else { return }
+-        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+-            stack = Array(stack.dropFirst()) + [stack[0]]
+-        }
+-    }
+-
+-    private func selectFront() {
+-        guard let f = frontItem else { return }
++    private func select(_ item: DeckItem) {
+         if capsMode {
+-            cap = f.id
+-            UserDefaults.standard.set(f.id, forKey: "DmCharSelect.cap")
++            cap = item.id
++            UserDefaults.standard.set(item.id, forKey: "DmCharSelect.cap")
+         } else {
+-            clothes = f.id
+-            UserDefaults.standard.set(f.id, forKey: "DmCharSelect.clothes")
++            clothes = item.id
++            UserDefaults.standard.set(item.id, forKey: "DmCharSelect.clothes")
+         }
+     }
+ 
+     var body: some View {
+-        VStack(spacing: 5 * scale) {
+-            // The cards, in a tight panel just bigger than the stack (0194: the panel hugs the cards, it does not fill the box).
+-            ZStack(alignment: .topLeading) {
+-                if let back = cardItem(at: 2) {
+-                    deckCard(back, depth: 2).offset(x: 44 * scale, y: 0)
+-                }
+-                if let mid = cardItem(at: 1) {
+-                    deckCard(mid, depth: 1).offset(x: 22 * scale, y: 9 * scale)
+-                }
+-                if let front = cardItem(at: 0) {
+-                    deckCard(front, depth: 0)
+-                        .offset(x: 0, y: 18 * scale)
+-                        .offset(dragOffset)
+-                        .gesture(
+-                            DragGesture()
+-                                .onChanged { v in dragOffset = v.translation }
+-                                .onEnded { v in
+-                                    // One gesture does both jobs: a tap (near-zero travel) selects the front card, a swipe past the threshold cycles it to the back.
+-                                    if abs(v.translation.width) < 10 && abs(v.translation.height) < 10 {
+-                                        selectFront()
+-                                    } else if abs(v.translation.width) > 60 * scale {
+-                                        cycle()
+-                                    }
+-                                    dragOffset = .zero
+-                                }
+-                        )
++        VStack(alignment: .leading, spacing: 8 * scale) {
++            // Header: title + subtitle + cap/clothes switch.
++            HStack(alignment: .firstTextBaseline) {
++                VStack(alignment: .leading, spacing: 2 * scale) {
++                    Text(characterName + "\u{7684}\u{670d}\u{88c5}")
++                        .font(.system(size: 20 * scale, weight: .bold))
++                        .foregroundStyle(.white)
++                    Text("\u{53ea}\u{663e}\u{793a}" + characterName + "\u{80fd}\u{7a7f}\u{7684}\u{8863}\u{670d}")
++                        .font(.system(size: 13 * scale))
++                        .foregroundStyle(.secondary)
+                 }
+-            }
+-            .frame(width: 148 * scale, height: 160 * scale)
+-            .padding(8 * scale)
+-            .background(
+-                RoundedRectangle(cornerRadius: 18 * scale)
+-                    .fill(Color.white.opacity(0.06))
+-            )
+-            // Slot switch + counter.
+-            HStack(spacing: 8 * scale) {
++                Spacer()
+                 Picker("", selection: $capsMode) {
+                     Text("\u{5e3d}\u{5b50}").tag(true)
+                     Text("\u{8863}\u{670d}").tag(false)
+                 }
+                 .pickerStyle(.segmented)
+                 .frame(width: 130 * scale)
+-                Spacer()
+-                Text(counterText)
+-                    .font(.system(size: 14 * scale))
+-                    .foregroundStyle(.secondary)
++            }
++            // Grid: four columns, scrollable; a tap on a card wears it.
++            ScrollView {
++                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8 * scale), count: 4), spacing: 8 * scale) {
++                    ForEach(items) { item in
++                        gridCard(item)
++                    }
++                }
+             }
+         }
+-        .onAppear(perform: rebuildStack)
+-        .onChange(of: capsMode) { _ in rebuildStack() }
+-        .onChange(of: characterId) { _ in rebuildStack() }
+     }
+ 
+-    private func deckCard(_ item: DeckItem, depth: Int) -> some View {
+-        let w: CGFloat = (depth == 0 ? 124 : depth == 1 ? 114 : 104) * scale
+-        let h: CGFloat = (depth == 0 ? 142 : depth == 1 ? 131 : 120) * scale
++    private func gridCard(_ item: DeckItem) -> some View {
+         let selected = item.id == effectiveSelectedId
+-        return ZStack {
+-            RoundedRectangle(cornerRadius: 14 * scale)
+-                .fill(Color(red: 0.15, green: 0.19, blue: 0.26))
+-            FoilBackground(animated: depth == 0)
+-            if depth > 0 {
++        return Button { select(item) } label: {
++            ZStack {
+                 RoundedRectangle(cornerRadius: 14 * scale)
+-                    .fill(Color.black.opacity(depth == 1 ? 0.35 : 0.55))
+-            }
+-            VStack(spacing: 4 * scale) {
+-                if let icon = item.icon, let img = dmOutfitImage(icon) {
+-                    Image(uiImage: img)
+-                        .resizable()
+-                        .scaledToFit()
+-                        .frame(maxWidth: w - 24 * scale, maxHeight: h - 56 * scale)
++                    .fill(Color(red: 0.15, green: 0.19, blue: 0.26))
++                FoilBackground(animated: false)
++                VStack(spacing: 4 * scale) {
++                    if let img = item.image.flatMap(dmOutfitImage) {
++                        Image(uiImage: img)
++                            .resizable()
++                            .scaledToFit()
++                            .frame(maxHeight: 78 * scale)
++                    }
+                     Text(item.name)
+-                        .font(.system(size: 15 * scale, weight: .semibold))
++                        .font(.system(size: 14 * scale, weight: .semibold))
+                         .foregroundStyle(.white)
+                         .lineLimit(1)
+-                } else {
+-                    Text(item.name)
+-                        .font(.system(size: 20 * scale, weight: .bold))
+-                        .foregroundStyle(.white)
++                        .minimumScaleFactor(0.7)
+                 }
++                .padding(.vertical, 8 * scale)
++                .padding(.horizontal, 4 * scale)
+             }
+-            .padding(.vertical, 10 * scale)
++            .frame(height: 118 * scale)
++            .clipShape(RoundedRectangle(cornerRadius: 14 * scale))
++            .overlay(
++                RoundedRectangle(cornerRadius: 14 * scale)
++                    .stroke(selected ? Color(red: 0.95, green: 0.75, blue: 0.25) : Color.white.opacity(0.15), lineWidth: selected ? 3 * scale : 1)
++            )
+         }
+-        .frame(width: w, height: h)
+-        .clipShape(RoundedRectangle(cornerRadius: 14 * scale))
+-        .overlay(
+-            RoundedRectangle(cornerRadius: 14 * scale)
+-                .stroke(selected ? Color(red: 0.95, green: 0.75, blue: 0.25) : Color.white.opacity(0.15), lineWidth: selected ? 3 * scale : 1)
+-        )
++        .buttonStyle(.plain)
+     }
+ }
+ 
+-/// The character picker (0194, in the box): the hero on the left, the outfit deck on the right, the six character cards in a row at the bottom. The choice is saved to DmCharSelect.character (NSUserDefaults), which dm_char_select_apply_saved reads at startup before the game starts, so the next launch plays as the picked character. The roster is Mario / Luigi / Wario / Peach / Pauline / Toad; the hero and the deck follow the pick. Pauline and Toad need their model patches (0193) to play in-game — the picker itself only writes the name.
++/// The character picker (0194, 0201, in the box): the flat outfit grid on top, the six character cards in a row at the bottom. The choice is saved to DmCharSelect.character (NSUserDefaults), which dm_char_select_apply_saved reads at startup before the game starts, so the next launch plays as the picked character. The roster is Mario / Luigi / Wario / Peach / Pauline / Toad; the grid follows the pick. Pauline and Toad need their model patches (0193) to play in-game — the picker itself only writes the name.
+ private struct CharacterPickerView: View {
+     let scale: CGFloat
+     @State private var selected: String = UserDefaults.standard.string(forKey: "DmCharSelect.character") ?? "mario"
+@@ -607,21 +540,8 @@ private struct CharacterPickerView: View {
+ 
+     var body: some View {
+         VStack(spacing: 6 * scale) {
+-            // Top row: hero + deck, centred as a group in the box.
+-            HStack(spacing: 0) {
+-                Spacer()
+-                // Hero: the selected character, large, in a fixed frame so a narrow render (Peach, Pauline) does not move the deck.
+-                if let img = dmCharImage(current.image) {
+-                    Image(uiImage: img)
+-                        .resizable()
+-                        .scaledToFit()
+-                        .frame(width: 170 * scale, height: 190 * scale)
+-                }
+-                Spacer()
+-                OutfitDeckView(characterId: current.id, scale: scale)
+-                Spacer()
+-            }
+-            Spacer()
++            // The outfit grid (0201): flat, full width of the box — the hero is gone here (the flat-grid layout the user picked has no hero; the character is named in the grid title and picked from the cards below). The grid scrolls; the character cards stay pinned at the bottom.
++            OutfitGridView(characterId: current.id, characterName: current.name, scale: scale)
+             // Cards: one row, left to right. The selected card gets a gold ring.
+             HStack(spacing: 8 * scale) {
+                 ForEach(roster) { c in
+-- 
+2.43.0
+
