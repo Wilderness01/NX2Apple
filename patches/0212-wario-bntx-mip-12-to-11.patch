@@ -1,0 +1,25 @@
+From 31e540d2e7771c217407a77072ebc29bd5584cba Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Thu, 19 Nov 2026 06:04:40 +0000
+Subject: [PATCH] 0212: fix WarioHigh BNTX mip count 12->11
+
+---
+ dm/romfs-overlay/ObjectData/WarioHigh.szs | Bin 4147927 -> 4147927 bytes
+ 1 file changed, 0 insertions(+), 0 deletions(-)
+
+diff --git a/dm/romfs-overlay/ObjectData/WarioHigh.szs b/dm/romfs-overlay/ObjectData/WarioHigh.szs
+index 88abc62e68aa0b85d8b2998562e3496eb35a251e..49b297ea053d8b7d0e5862518ec1cf54b21e17a7 100644
+GIT binary patch
+delta 282
+zcmWN?HwwaF0Dw{QtFgpxV(-28-WCty?2^d?I0y~_!6A4NHJ5PDX#~IF@oe)a*|=P#
+zmrxB!u{1+`Wd1(H(eXUr#o?x#0uDIgf($o2@WKZLegqIi2w_AJMGPu5#F0P}DWs7>
+z7CGcmKoKRBQ9%_o)X_i_Ews@=7d`Ybzz`#hF~Jlw%(1`{E3C1>7CTEf_ow$CqquZ}
+
+delta 279
+zcmWm4w++Hj002?_Z!pPZn;c9|Cg->ct56_OxT5eBw1AhO_cTZx#nUzCIbY%7aurXh
+z+d^{<TfSBLxy!R6w43EfDDc4#6#)bhLKqSJ-zZ{;BY`ARNJEE#46?`}j{=G)p^OTu
+uFi}Gt4K&e08y$4fLmvZJ7-EDmCYWM|ITl!Ag*7(VVuw8rIJ%Z|dc1xP@nbsx
+
+-- 
+2.43.0
+

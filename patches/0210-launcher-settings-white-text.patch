@@ -1,0 +1,145 @@
+From 1f93b9e4c0326154480e15105782ff1b87bcc922 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Thu, 19 Nov 2026 05:51:41 +0000
+Subject: [PATCH] 0210: settings text white for dark glass
+
+---
+ dm/ios/Sources/Launcher.swift    | 28 ++++++++++++++--------------
+ dm/ios/Sources/LauncherRow.swift | 12 +++++++++---
+ 2 files changed, 23 insertions(+), 17 deletions(-)
+
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index 8ae87f1..ab1577f 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -28,10 +28,10 @@ private struct GameDataSection: View {
+         ScrollView {
+             VStack(alignment: .leading, spacing: 16) {
+                 HStack {
+-                    Text(LauncherText.text("ui.gameData", "Game data"))
++                    Text(LauncherText.text("ui.gameData", "Game data")).foregroundStyle(.white)
+                     Spacer()
+                     Text(picked.isEmpty ? LauncherText.text("ui.appFolder", "This app's folder") : (picked as NSString).lastPathComponent)
+-                        .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
++                        .foregroundStyle(.white.opacity(0.7)).lineLimit(1).truncationMode(.middle)
+                 }
+                 Button(picked.isEmpty ? LauncherText.text("ui.chooseGameData", "Choose game data…") : LauncherText.text("ui.chooseDifferentLocation", "Choose a different location…")) { picking = true }
+                     // The sheet sits on the button, not on the Section: SwiftUI hands a Section's modifiers to every row, so one tap presented a picker per row and they invalidated each other (LNPANDY/NX2Apple#315).
+@@ -54,7 +54,7 @@ private struct GameDataSection: View {
+                 Text(note.isEmpty
+                      ? LauncherText.text("ui.pickGameDataNote", "Pick the game's romfs.img or its RomFS folder — an external drive or iCloud Drive works. The app remembers the choice; a re-signed build asks once more.")
+                      : note)
+-                    .font(.footnote).foregroundStyle(.secondary)
++                    .font(.footnote).foregroundStyle(.white.opacity(0.7))
+             }
+             .padding(16)
+         }
+@@ -87,10 +87,10 @@ private struct CloudSavesSection: View {
+         ScrollView {
+             VStack(alignment: .leading, spacing: 16) {
+                 HStack {
+-                    Text(LauncherText.text("ui.cloudSaves", "Cloud saves"))
++                    Text(LauncherText.text("ui.cloudSaves", "Cloud saves")).foregroundStyle(.white)
+                     Spacer()
+                     Text(folder.isEmpty ? LauncherText.text("ui.off", "Off") : (folder as NSString).lastPathComponent)
+-                        .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
++                        .foregroundStyle(.white.opacity(0.7)).lineLimit(1).truncationMode(.middle)
+                 }
+                 Button(folder.isEmpty ? LauncherText.text("ui.chooseCloudFolder", "Choose a folder in iCloud Drive…") : LauncherText.text("ui.chooseDifferentFolder", "Choose a different folder…")) { picking = true }
+                     // The sheet sits on the button, not on the Section: SwiftUI hands a Section's modifiers to every row, so one tap presented a picker per row and they invalidated each other (LNPANDY/NX2Apple#315).
+@@ -113,7 +113,7 @@ private struct CloudSavesSection: View {
+                 Text(note.isEmpty
+                      ? LauncherText.text("ui.cloudFolderNote", "Choose a folder in iCloud Drive, and the same one in the Mac app's Cloud saves. The save comes in when the game starts and goes out after each save; a save that is replaced is kept in save-backups.")
+                      : note)
+-                    .font(.footnote).foregroundStyle(.secondary)
++                    .font(.footnote).foregroundStyle(.white.opacity(0.7))
+             }
+             .padding(16)
+         }
+@@ -475,7 +475,7 @@ private struct OutfitGridView: View {
+                         .foregroundStyle(.white)
+                     Text("\u{53ea}\u{663e}\u{793a}" + characterName + "\u{80fd}\u{7a7f}\u{7684}\u{8863}\u{670d}")
+                         .font(.system(size: 13 * scale))
+-                        .foregroundStyle(.secondary)
++                        .foregroundStyle(.white.opacity(0.7))
+                 }
+                 Spacer()
+                 Picker("", selection: $capsMode) {
+@@ -610,22 +610,22 @@ private struct GameTabContent: View {
+             VStack(alignment: .leading, spacing: 16) {
+                 VStack(alignment: .leading, spacing: 8) {
+                     HStack {
+-                        Text("\u{73bb}\u{7483}\u{5f3a}\u{5ea6}")
++                        Text("\u{73bb}\u{7483}\u{5f3a}\u{5ea6}").foregroundStyle(.white)
+                         Spacer()
+-                        Text("\(Int(glassOpacity))%").monospacedDigit().foregroundStyle(.secondary)
++                        Text("\(Int(glassOpacity))%").monospacedDigit().foregroundStyle(.white.opacity(0.7))
+                     }
+                     Slider(value: $glassOpacity, in: 0...100, step: 1)
+                         .accessibilityLabel("\u{73bb}\u{7483}\u{5f3a}\u{5ea6}")
+                 }
+-                ForEach(m.rows(in: "Game")) { SettingRow(s: $0, m: m) }
++                ForEach(m.rows(in: "Game")) { SettingRow(s: $0, m: m, dark: true) }
+                 Button(LauncherText.text("ui.resetDefaults", "Reset to tested defaults")) { m.reset() }
+                     .disabled(!m.changed)
+                 Text(LauncherText.text("ui.resetDefaultsNote", "Brings back all settings this game was tested with."))
+-                    .font(.footnote).foregroundStyle(.secondary)
++                    .font(.footnote).foregroundStyle(.white.opacity(0.7))
+                 HStack {
+-                    Text(LauncherText.text("ui.memoryAvailable", "Memory available"))
++                    Text(LauncherText.text("ui.memoryAvailable", "Memory available")).foregroundStyle(.white)
+                     Spacer()
+-                    Text(ByteCountFormatter.string(fromByteCount: Int64(memory), countStyle: .memory)).monospacedDigit().foregroundStyle(.secondary)
++                    Text(ByteCountFormatter.string(fromByteCount: Int64(memory), countStyle: .memory)).monospacedDigit().foregroundStyle(.white.opacity(0.7))
+                 }
+             }
+             .padding(16)
+@@ -648,7 +648,7 @@ private struct SettingsListContent: View {
+     var body: some View {
+         ScrollView {
+             VStack(alignment: .leading, spacing: 16) {
+-                ForEach(m.rows(in: section)) { SettingRow(s: $0, m: m) }
++                ForEach(m.rows(in: section)) { SettingRow(s: $0, m: m, dark: true) }
+             }
+             .padding(16)
+         }
+diff --git a/dm/ios/Sources/LauncherRow.swift b/dm/ios/Sources/LauncherRow.swift
+index a7a53a8..49c5dc3 100644
+--- a/dm/ios/Sources/LauncherRow.swift
++++ b/dm/ios/Sources/LauncherRow.swift
+@@ -9,6 +9,12 @@ extension LauncherModel {
+ struct SettingRow: View {
+     let s: Setting
+     @ObservedObject var m: LauncherModel
++    /// iOS launcher (0210): the rows sit on dark glass over a bright poster, and the box renders in the light colour scheme on device (the IPA sets no UIUserInterfaceStyle; the launcher's .preferredColorScheme(.dark) evidently does not make default text white there), so default dark text is invisible. When true, all text is explicit white. Mac leaves this off and keeps the system default (its window follows the system appearance).
++    var dark: Bool = false
++
++    /// Title white / system primary; notes and percentages white 70% / system secondary.
++    private var titleColor: Color { dark ? .white : .primary }
++    private var noteColor: Color { dark ? .white.opacity(0.7) : .secondary }
+ 
+     private var locked: Bool { m.fixed.contains(s.env) }
+     private var note: String {
+@@ -23,8 +29,8 @@ struct SettingRow: View {
+ 
+     private var settingLabel: some View {
+         VStack(alignment: .leading, spacing: 4) {
+-            Text(s.label)
+-            if !note.isEmpty { Text(note).font(.footnote).foregroundStyle(.secondary) }
++            Text(s.label).foregroundStyle(titleColor)
++            if !note.isEmpty { Text(note).font(.footnote).foregroundStyle(noteColor) }
+         }
+     }
+ 
+@@ -43,7 +49,7 @@ struct SettingRow: View {
+                     HStack {
+                         settingLabel
+                         Spacer()
+-                        Text(percentage).monospacedDigit().foregroundStyle(.secondary)
++                        Text(percentage).monospacedDigit().foregroundStyle(noteColor)
+                     }
+                     Slider(value: rangeValue, in: (s.min ?? 0)...(s.max ?? 1), step: s.step ?? 0.05)
+                         .accessibilityLabel(s.label)
+-- 
+2.43.0
+
