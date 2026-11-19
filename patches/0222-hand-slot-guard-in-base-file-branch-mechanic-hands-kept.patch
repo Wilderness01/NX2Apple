@@ -1,0 +1,67 @@
+From c52d72d5ce294b53a7a7a00ecef3133e6b54b878 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Thu, 19 Nov 2026 12:55:16 +0000
+Subject: [PATCH] 0222: hand slot guard in base-file branch (Mechanic hands
+ kept)
+
+---
+ dm/host/hle_fs.c | 43 +++++++++++++++++++++++++++++--------------
+ 1 file changed, 29 insertions(+), 14 deletions(-)
+
+diff --git a/dm/host/hle_fs.c b/dm/host/hle_fs.c
+index 6aa4851..56a3309 100644
+--- a/dm/host/hle_fs.c
++++ b/dm/host/hle_fs.c
+@@ -1049,20 +1049,35 @@ static int dm_char_redirect(const char *p, char *out, size_t n) {
+     } else if (slot && !strcmp(slot, "default")) {
+         snprintf(cand[ncand], sizeof cand[0], "%s%s", ch, part); ncand++;
+     } else if (slot && !strncmp(slot, "Mario", 5) && slot[5]) {
+-        // 0220: a cap slot maps to the MarioCap reskin (<Cap>R, e.g.
+-        // MarioClownCapR.szs), NOT to the stock costume cap -- the reskin
+-        // is the file that contains a "MarioCap" model with the full
+-        // CheckpointFlagWarp byml set. The reskin lives under a distinct
+-        // name so the direct save-equipped path (which asks for
+-        // MarioClownCap.szs by name) still loads the RomFS original. If
+-        // the reskin is not found, the next candidate is the character
+-        // default ("MarioCap" for Mario = the stem, self-skipped), so the
+-        // file is kept -- the 0218 behavior, never a crash.
+-        if (!strcmp(part, "Cap"))
+-            snprintf(cand[ncand], sizeof cand[0], "%s%s%sR", ch, slot + 5, part);
+-        else
+-            snprintf(cand[ncand], sizeof cand[0], "%s%s%s", ch, slot + 5, part);
+-        ncand++;
++        // 0222 (log-93): never redirect a hand file to a costume hand
++        // file. The Mechanic form has no own hands (no
++        // MarioMechanicHandL/R.szs in RomFS) so it borrows the player's
++        // hands and looks "MarioHandL"/"MarioHandR" up by name; a costume
++        // hand file's FMDL is named after itself, the lookup returns NULL,
++        // and the bone-transform setup faults at NULL+0x28 (0x6ad530).
++        // The ch+part fallback below still applies: for Mario it names
++        // the file itself and is skipped, so the file is kept; for Peach
++        // it names PeachHandL/R, whose FMDL is "MarioHandL/R", so the
++        // lookup succeeds. STOPGAP (house rule: a rule that turns a
++        // feature off): the proper fix, like 0220 for caps, is hand
++        // reskins with FMDL "MarioHandL"/"MarioHandR"
++        // (REPORT-LOG93-CRASH.md §9.3).
++        if (strcmp(part, "HandL") && strcmp(part, "HandR")) {
++            // 0220: a cap slot maps to the MarioCap reskin (<Cap>R, e.g.
++            // MarioClownCapR.szs), NOT to the stock costume cap -- the reskin
++            // is the file that contains a "MarioCap" model with the full
++            // CheckpointFlagWarp byml set. The reskin lives under a distinct
++            // name so the direct save-equipped path (which asks for
++            // MarioClownCap.szs by name) still loads the RomFS original. If
++            // the reskin is not found, the next candidate is the character
++            // default ("MarioCap" for Mario = the stem, self-skipped), so the
++            // file is kept -- the 0218 behavior, never a crash.
++            if (!strcmp(part, "Cap"))
++                snprintf(cand[ncand], sizeof cand[0], "%s%s%sR", ch, slot + 5, part);
++            else
++                snprintf(cand[ncand], sizeof cand[0], "%s%s%s", ch, slot + 5, part);
++            ncand++;
++        }
+         snprintf(cand[ncand], sizeof cand[0], "%s%s", ch, part); ncand++;
+     } else if (core_len) {
+         snprintf(cand[ncand], sizeof cand[0], "%s%.*s%s", ch, (int)core_len, core, part); ncand++;
+-- 
+2.43.0
+
