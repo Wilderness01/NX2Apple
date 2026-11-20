@@ -1,0 +1,276 @@
+From 9f0c89e0851769960119ae7323f1184a3b32d376 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Fri, 20 Nov 2026 05:51:42 +0000
+Subject: [PATCH] 0225c: targeted diagnostic probe for the SaveData
+ object (signature test)
+
+DIAGNOSTIC ONLY - remove before 0226, with DM_FS=1.
+
+Round 3 of the equipped-costume field probe. The disassembly pinned
+the fields (SaveData+0x718 clothes, +0x770 cap; each a string object
+{vtable+0x00, buffer+0x08, capacity+0x10}) but not the pointer chain
+from the registry to the SaveData object, so this round tests
+candidates against the signature instead of scanning blind:
+
+- diag_savedata_test: a candidate O matches iff both buffers hold
+  the current clothes/cap names (from DM_CHAR_CLOTHES/DM_CHAR_CAP,
+  falling back to the save's Hakama/Explorer when unset or
+  "default"), both capacities are small positive (0x10..0x100) and
+  both vtable pointers land in the main module mapping. Every
+  candidate is logged with its path, buffer pointers/contents,
+  capacities and vtable pointers, MATCH / NEAR-MATCH / reason;
+  on a MATCH the first 0x100 bytes of the object are hex-dumped
+  and the path IS the chain.
+- Candidates: the registry object's record slots (+0x48..+0xA8),
+  each tested directly and after one more dereference, plus the
+  .data globals at main+0x1360738/0x1360740/0x1360750/0x1360E28,
+  direct and dereferenced once.
+- Runs at frames 600 and 7200 (early, so a short session still
+  yields the answer); the 0225/0225b milestone, slot, registry
+  and heap-scan behaviour is kept.
+- Read-only: every read goes through the guarded mem_read /
+  vm_read_overwrite paths; the probe writes nothing to game memory.
+
+Verified on the host by extraction: gcc -fsyntax-only -Wall
+-Wextra -Wpedantic clean against stubs, and an 11-case functional
+harness over the real extracted code passes (match, cap-buffer
+mismatch, capacity 0, vtable out of range, env/default/unset
+expected-name resolution, registry-sub and .data-global end-to-end,
+no-candidate case).
+---
+ dm/host/hle_cheats.c | 191 ++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 188 insertions(+), 3 deletions(-)
+
+diff --git a/dm/host/hle_cheats.c b/dm/host/hle_cheats.c
+index 58c5654..740958a 100644
+--- a/dm/host/hle_cheats.c
++++ b/dm/host/hle_cheats.c
+@@ -1044,7 +1044,7 @@ static void cheats_pass(void) {
+     pthread_mutex_unlock(&g_lock);
+ }
+ 
+-// ---------- 0225b diagnostic: equipped-costume field probe, round 2 (DIAGNOSTIC ONLY) ----------
++// ---------- 0225c diagnostic: equipped-costume field probe, round 3 (DIAGNOSTIC ONLY) ----------
+ // Purpose: pin the in-memory equipped-costume field (GameDataHolder offset, and whether
+ // it stores a name string or an integer index) for the 0226 launcher-costume override.
+ // The save file says the equipped fields are CurrentCapName (value 27 = MarioExplorer)
+@@ -1073,6 +1073,21 @@ static void cheats_pass(void) {
+ // so NOTHING from a past session is hardcoded. The heap scan now always runs at
+ // frame 7200 (0225 only ran it when the slot path found nothing), because the
+ // pointer scan needs the pool addresses from the string scan.
++// 0225c (this round) adds the targeted SaveData-object signature test on top of
++// everything 0225/0225b does (kept unchanged): disassembly
++// (REPORT-SAVELOAD-DISASM.md section 7.2) PINNED the field layout - SaveData+0x718
++// is the clothes string object, SaveData+0x770 the cap string object, each
++// {+0x00: vtable*, +0x08: char* buffer, +0x10: s32 capacity} whose buffer holds
++// the costume NAME string (a private copy, not a pool pointer - log-103 proved
++// no pool pointer exists in the heap). At frames 600 and 7200, every candidate
++// pointer from the registry walk (and one more dereference of it) and from the
++// .data globals (main+0x1360738/0x1360740/0x1360750/0x1360E28, direct and
++// dereferenced once) is tested against that signature: both buffers must hold
++// the expected names (the launcher pick from DM_CHAR_CLOTHES/DM_CHAR_CAP,
++// falling back to the save's known Hakama/Explorer when the env says
++// "default"), both capacities small positive (0x10..0x100), both vtables in
++// the main module mapping. The first MATCH is the SaveData object and the
++// path that reached it IS the pointer chain.
+ // Milestones are presented frames since the first present; the save is read at boot,
+ // before the title screen, so by frame 60 the GameDataHolder exists.
+ #define DIAG_COSTUME_SLOT 0x13130a0ull   // NSO vaddr of the GameDataHolder pointer slot (clue only)
+@@ -1220,6 +1235,173 @@ static int diag_costume_registry(uint64_t reg) {
+     return found;
+ }
+ 
++// 0225c: targeted SaveData-object signature test (REPORT-SAVELOAD-DISASM.md
++// section 7.2). Disassembly PINNED the field layout: SaveData+0x718 is the
++// clothes string object, SaveData+0x770 the cap string object, each a string
++// object {+0x00: vtable*, +0x08: char* buffer, +0x10: s32 capacity} whose
++// buffer holds the costume NAME string (a private copy, NOT a pointer to the
++// save string pool - log-103 proved no pool pointer exists in the heap). The
++// 0225/0225b probes scanned for the wrong things (inline strings, pool
++// pointers, u32 indices), which is why they found nothing. The correct
++// signature for a candidate object O is: [O+0x720] points at a buffer holding
++// the current clothes name AND [O+0x778] points at a buffer holding the
++// current cap name AND both capacities at +0x10 are small positive
++// (0x10..0x100) AND both vtables point into the main module mapping.
++// Candidates come from (a) the registry walk - every collected sub-object
++// pointer, and one more dereference of it (the registry slots are code
++// addresses, so the real object may be one indirection away) - and (b) the
++// .data globals at main+0x1360738/0x1360740/0x1360750/0x1360E28 (read by the
++// load function and the accessor cluster), each tested directly and
++// dereferenced once. The first MATCH is the SaveData object and the path
++// that reached it IS the pointer chain; it also yields the capacities.
++#define DIAG_SAVEDATA_OFF_CLOTHES 0x718
++#define DIAG_SAVEDATA_OFF_CAP     0x770
++#define DIAG_SAVEDATA_CAP_MIN 0x10
++#define DIAG_SAVEDATA_CAP_MAX 0x100
++#define DIAG_SAVEDATA_MAIN_SPAN 0x1400000ull   // main module mapping size (text+rodata+data)
++#define DIAG_SAVEDATA_MAX 160   // candidates tested per run
++
++// Resolve the expected buffer contents: the launcher pick from the live env
++// channel (DM_CHAR_CLOTHES / DM_CHAR_CAP), which the diagnostic run keeps
++// equal to the save. "default" (or unset) is not a costume name, so it falls
++// back to the save's known equipped names (log-101/102/103: Hakama/Explorer);
++// the source is logged so the analyst knows which pair was tested.
++static void diag_savedata_expected(const char **clothes, const char **cap, const char **src_c, const char **src_p) {
++    const char *c = getenv("DM_CHAR_CLOTHES");
++    const char *p = getenv("DM_CHAR_CAP");
++    *clothes = (c && *c && strcmp(c, "default") != 0) ? c : diag_costume_names[0];
++    *cap = (p && *p && strcmp(p, "default") != 0) ? p : diag_costume_names[1];
++    *src_c = (c && *c && strcmp(c, "default") != 0) ? "env" : "fallback(save)";
++    *src_p = (p && *p && strcmp(p, "default") != 0) ? "env" : "fallback(save)";
++}
++
++// Read the string at guest buffer address buf (up to 40 bytes, guarded) into
++// out as a printable string (non-printables become '.'); returns 1 if the
++// buffer holds exactly `want` (NUL-terminated). out is "<unreadable>" when
++// the buffer cannot be read at all.
++static int diag_savedata_buf(uint64_t buf, const char *want, char *out, size_t outn) {
++    uint8_t win[40];
++    size_t got = diag_costume_read(buf, win, sizeof win);
++    size_t wl = strlen(want);
++    int eq = got > wl && win[wl] == 0 && !memcmp(win, want, wl);
++    if (!got) { snprintf(out, outn, "<unreadable>"); return 0; }
++    size_t n = got < outn - 1 ? got : outn - 1;
++    for (size_t i = 0; i < n; i++) out[i] = win[i] >= 0x20 && win[i] < 0x7f ? (char)win[i] : '.';
++    out[n] = 0;
++    return eq;
++}
++
++// Test one candidate object O against the SaveData signature. Logs one line
++// with every field and the verdict, so every miss is diagnosable. Returns 1
++// on MATCH. A NEAR-MATCH (both buffers and both capacities right, only the
++// vtable range check failing) is logged distinctly and hex-dumped too: the
++// vtable bound is a plausibility heuristic, and two exact name strings in
++// the right places are already conclusive on their own.
++static int diag_savedata_test(uint64_t o, const char *path, uint64_t base,
++                              const char *exp_c, const char *exp_p) {
++    uint64_t vt_c = 0, buf_c = 0, vt_p = 0, buf_p = 0, v = 0;
++    int32_t cap_c = 0, cap_p = 0;
++    int r_vt_c = mem_read(o + DIAG_SAVEDATA_OFF_CLOTHES, 8, &vt_c) == 0;
++    int r_buf_c = mem_read(o + DIAG_SAVEDATA_OFF_CLOTHES + 8, 8, &buf_c) == 0;
++    int r_cap_c = mem_read(o + DIAG_SAVEDATA_OFF_CLOTHES + 0x10, 4, &v) == 0;
++    if (r_cap_c) cap_c = (int32_t)(uint32_t)v;
++    int r_vt_p = mem_read(o + DIAG_SAVEDATA_OFF_CAP, 8, &vt_p) == 0;
++    int r_buf_p = mem_read(o + DIAG_SAVEDATA_OFF_CAP + 8, 8, &buf_p) == 0;
++    int r_cap_p = mem_read(o + DIAG_SAVEDATA_OFF_CAP + 0x10, 4, &v) == 0;
++    if (r_cap_p) cap_p = (int32_t)(uint32_t)v;
++    char sc[40] = "<n/a>", sp[40] = "<n/a>";
++    int eq_c = r_buf_c && buf_c && diag_savedata_buf(buf_c, exp_c, sc, sizeof sc);
++    int eq_p = r_buf_p && buf_p && diag_savedata_buf(buf_p, exp_p, sp, sizeof sp);
++    int cap_ok = r_cap_c && r_cap_p && cap_c >= DIAG_SAVEDATA_CAP_MIN && cap_c <= DIAG_SAVEDATA_CAP_MAX
++              && cap_p >= DIAG_SAVEDATA_CAP_MIN && cap_p <= DIAG_SAVEDATA_CAP_MAX;
++    int vt_ok = r_vt_c && r_vt_p && vt_c >= base && vt_c < base + DIAG_SAVEDATA_MAIN_SPAN
++             && vt_p >= base && vt_p < base + DIAG_SAVEDATA_MAIN_SPAN;
++    const char *why;
++    int match = 0, near = 0;
++    if (!r_vt_c || !r_buf_c || !r_cap_c || !r_vt_p || !r_buf_p || !r_cap_p) why = "field-unreadable";
++    else if (!eq_c || !eq_p) why = "buffer-mismatch";
++    else if (!cap_ok) why = "capacity-out-of-range";
++    else if (!vt_ok) { why = "NEAR-MATCH"; near = 1; }
++    else { why = "MATCH"; match = 1; }
++    LOG("diag-costume: savedata %s O=%#llx vt_c=%#llx buf_c=%#llx \"%s\" cap_c=%d vt_p=%#llx buf_p=%#llx \"%s\" cap_p=%d -> %s",
++        path, (unsigned long long)o, (unsigned long long)vt_c, (unsigned long long)buf_c, sc, cap_c,
++        (unsigned long long)vt_p, (unsigned long long)buf_p, sp, cap_p, why);
++    if (match || near) {
++        static int dumped;
++        if (!dumped) {
++            dumped = 1;
++            uint8_t win[0x100];
++            size_t got = diag_costume_read(o, win, sizeof win);
++            if (got) diag_costume_hex(win, got, o);
++        }
++    }
++    return match;
++}
++
++// Test one candidate once (deduped, guest-pointer filtered). Returns 1 on MATCH.
++static int diag_savedata_once(uint64_t o, const char *path, uint64_t base,
++                              const char *exp_c, const char *exp_p,
++                              uint64_t *seen, int *nseen, int *tested) {
++    if (o < 0x100000000ull) return 0;   // not a guest pointer
++    for (int i = 0; i < *nseen; i++) if (seen[i] == o) return 0;
++    if (*nseen >= DIAG_SAVEDATA_MAX) return 0;
++    seen[(*nseen)++] = o;
++    (*tested)++;
++    return diag_savedata_test(o, path, base, exp_c, exp_p);
++}
++
++// 0225c: walk the registry and the .data globals, testing every candidate
++// pointer (and one more dereference of it) against the SaveData signature.
++// The .data globals are main-relative NSO vaddrs read by the save-load
++// function and the pseudo-global accessor cluster (REPORT-SAVELOAD-DISASM.md
++// section 6.3). Returns the number of MATCHes.
++static const uint64_t diag_savedata_globals[4] = { 0x1360738ull, 0x1360740ull, 0x1360750ull, 0x1360E28ull };
++
++static int diag_costume_savedata(uint64_t reg, uint64_t base) {
++    const char *exp_c, *exp_p, *src_c, *src_p;
++    diag_savedata_expected(&exp_c, &exp_p, &src_c, &src_p);
++    LOG("diag-costume: savedata expected clothes=\"%s\" (%s) cap=\"%s\" (%s)", exp_c, src_c, exp_p, src_p);
++    uint8_t win[DIAG_COSTUME_WIN];
++    size_t got = diag_costume_read(reg, win, DIAG_COSTUME_WIN);
++    if (!got) { LOG("diag-costume: savedata: registry %#llx unreadable", (unsigned long long)reg); return 0; }
++    uint64_t subs[DIAG_COSTUME_SUB_MAX]; int nsub = 0;
++    uint64_t recs[DIAG_COSTUME_REC_MAX]; int nrec = 0;
++    diag_registry_collect(win, got, subs, &nsub);
++    diag_registry_links(win, reg, got, recs, &nrec);
++    for (int i = 0; i < nrec; i++) {   // later records may name more sub-objects
++        uint8_t rwin[DIAG_COSTUME_WIN];
++        size_t rgot = diag_costume_read(recs[i], rwin, DIAG_COSTUME_WIN);
++        if (rgot) diag_registry_collect(rwin, rgot, subs, &nsub);
++    }
++    uint64_t seen[DIAG_SAVEDATA_MAX]; int nseen = 0, tested = 0, matched = 0;
++    char path[48];
++    for (int i = 0; i < nsub; i++) {
++        snprintf(path, sizeof path, "reg-sub[%d]", i);
++        matched += diag_savedata_once(subs[i], path, base, exp_c, exp_p, seen, &nseen, &tested);
++        uint64_t d = 0;
++        if (mem_read(subs[i], 8, &d) == 0) {
++            snprintf(path, sizeof path, "reg-sub[%d]-deref", i);
++            matched += diag_savedata_once(d, path, base, exp_c, exp_p, seen, &nseen, &tested);
++        }
++    }
++    for (int g = 0; g < 4; g++) {
++        uint64_t gv = 0;
++        if (mem_read(base + diag_savedata_globals[g], 8, &gv)) {
++            LOG("diag-costume: savedata data-%#llx unreadable", (unsigned long long)(base + diag_savedata_globals[g]));
++            continue;
++        }
++        snprintf(path, sizeof path, "data-%#llx", (unsigned long long)diag_savedata_globals[g]);
++        matched += diag_savedata_once(gv, path, base, exp_c, exp_p, seen, &nseen, &tested);
++        uint64_t d = 0;
++        if (mem_read(gv, 8, &d) == 0) {
++            snprintf(path, sizeof path, "data-%#llx-deref", (unsigned long long)diag_savedata_globals[g]);
++            matched += diag_savedata_once(d, path, base, exp_c, exp_p, seen, &nseen, &tested);
++        }
++    }
++    LOG("diag-costume: savedata: tested %d candidate(s), %d match(es)", tested, matched);
++    return matched;
++}
++
+ // 0225b: is the string hit at `hit` the save string pool's copy of
+ // diag_costume_names[s]? The pool packs the costume names NUL-terminated in
+ // alphabetical order (REPORT-SAVEFILE-COSTUME-FIELD.md: Mario, MarioCaptain,
+@@ -1368,7 +1550,10 @@ static void diag_costume_probe(void) {
+             LOG("diag-costume: slot main+%#llx = %#llx", DIAG_COSTUME_SLOT, (unsigned long long)slot);
+             if (slot) {
+                 found |= diag_costume_object(slot, m == 1 || m == 4);
+-                if (m == 1 || m == 4) found |= diag_costume_registry(slot);   // 0225b (a): follow the registry pointers
++                if (m == 1 || m == 4) {
++                    found |= diag_costume_registry(slot);   // 0225b (a): follow the registry pointers
++                    diag_costume_savedata(slot, base);   // 0225c: SaveData signature test
++                }
+             }
+         }
+         if (m == 4) LOG("diag-costume: slot path done, costume string found: %s", found ? "YES" : "no");
+@@ -1386,7 +1571,7 @@ static void diag_costume_probe(void) {
+ void dm_cheats_present(void) {
+     atomic_store(&g_present_ns, now_ns());
+     cheats_pass();
+-    diag_costume_probe();   // 0225b diagnostic only: equipped-costume field probe (read-only)
++    diag_costume_probe();   // 0225c diagnostic only: equipped-costume field probe (read-only)
+ }
+ 
+ // The fixed ~60 Hz passes when the game is not presenting (window minimized, graphics suspended or before the first
+-- 
+2.43.0
+
