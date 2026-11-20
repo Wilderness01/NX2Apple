@@ -1,0 +1,371 @@
+From 9a188ccb8721374231af03655b816de45764298d Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Fri, 20 Nov 2026 12:30:04 +0000
+Subject: [PATCH] 0228 diagnostic: headkey probe logging key/res/doc/doc_b8 at
+ the costume-head crash path
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two FRAME_STEP cuts in 0x65f520 (the model-definition loader) log the
+key-level resource lookup for every head assembly, so the next device run
+pins who fills +0xb8 for the per-costume head document (REPORT-LOOKUP-DECODE
+§7.3, REPORT-LOG107-CRASH §7.3): at 0x65f8c8 (after bl 0x747300) and at
+0x65fb50 (before bl 0x65db60). A shared stub appends a 64-byte record
+(res, doc, doc_b8, site, seq, key) to a ring in the frame-step state page
+at +0x3300; the host drains it once per present and logs only keys
+containing Head. Logging-only: no game state is written, no callee-saved
+register or flag is touched, and the replaced instruction runs before the
+branch back.
+
+The prescribed runtime guest-code hook is impossible on iOS (hle_cheats.c
+alias_setup is compiled out on the iPhone, uw.c's NOP patch is disabled
+after it crashed V1.3.5, and the lookup path has no vtable to hook), so
+this uses the build-time rewriter cut instead, following the HUD runtime
+precedent. nso_asm.py gains the encoders the stub needs (CBZ, MOVZ, LDRB/
+STRB post-index, STRB/STRW, LDXR/STXR). Temporary: remove the cuts and the
+drain once the log decides pre-register vs route-to-default-head.
+
+Verified: patch_nso.py accepts both cuts (frame_step 5, original bytes
+match); the emitted words are byte-identical to the patched image and
+disassemble cleanly (0228diag-harness.py); the ring/drain logic passes
+against the device-probed Happi/Explorer/Hakama keys (0228diag-harness.c).
+No submission, no build triggered.
+---
+ dm/games/0100000000010000/README.md  |   1 +
+ dm/games/0100000000010000/patches.py | 159 ++++++++++++++++++++++++++-
+ dm/host/hud_manual.c                 |  76 +++++++++++++
+ dm/host/hud_manual.h                 |   5 +
+ dm/host/uw.c                         |   1 +
+ dm/tools/nso_asm.py                  |  14 +++
+ 6 files changed, 254 insertions(+), 2 deletions(-)
+
+diff --git a/dm/games/0100000000010000/README.md b/dm/games/0100000000010000/README.md
+index 8357c569..6e346d3c 100644
+--- a/dm/games/0100000000010000/README.md
++++ b/dm/games/0100000000010000/README.md
+@@ -90,6 +90,7 @@ General host and tool changes first needed here; each applies to every game:
+ 
+ - Character selection in the in-game shop (0166, open): the shop rows are in (0167: Mario/Luigi/Wario at ItemList.byml 147,148,149, Luigi2D.szs icon, MSBT labels) and the title-menu picker is removed (0168: row 3 is VR again, guide taps fall through while a page is shown), but buying a row does not persist the character yet. The confirmed row cannot be identified from static code: the fs-preview route is refuted by log-64 (the shop opens every row's body file while building the list and nothing new at confirm), the 0x50a5c0 accessor's +0x70 is a float, not a row index, and NrvSelectDecideEnd (0x442980) is cleanup. The list NrvDecide hook point 0x2e8dfc is verified and can set a confirm flag, but the flag alone does not name the row.
+ - Costume hands stay stock (0222, stopgap, open): a costume's hand file is never redirected. The Mechanic form has no own hands (no `MarioMechanicHandL/R.szs` in RomFS), so it borrows the player's hands and looks `MarioHandL`/`MarioHandR` up by name; a costume hand file's FMDL is named after itself, the lookup returns NULL, and the bone-transform setup faults at NULL+0x28 (`0x6ad530`, log-93). The guard in `dm_char_redirect` keeps the stock white gloves. The proper fix, like 0220 for caps, is hand reskins with FMDL `MarioHandL`/`MarioHandR`.
++- Costume-head crash, diagnostic probe (0228, open): a pool-external costume (Happi) and a pool-internal one (Explorer) crash identically at `0x6ad530` (log-106/log-107) because `(resource->0xa0)->0xb8 == 0` for the key `"ObjectData/<name>Head"` in the model-definition loader `0x65f520` -- the pool is not the discriminator. A temporary FRAME_STEP probe (two cuts at `0x65f8c8` and `0x65fb50`, ring in the state page at +0x3300, drained once per present) logs `key/res/doc/doc_b8` for every head lookup; run once per costume (Happi, Explorer, Hakama) and compare `doc_b8`. The fix (pre-register the head document, or route the key to the default head document) waits on that log. Remove the probe once it has decided.
+ - The three thunder geometry shaders do not translate.
+ - The silent first minute of sound.
+ - development.md calls SDK 7.3.2 "the oldest so far"; Mario Kart 8 Deluxe (SDK 4.4.0) is older now.
+diff --git a/dm/games/0100000000010000/patches.py b/dm/games/0100000000010000/patches.py
+index ce282f82..d506ce3f 100644
+--- a/dm/games/0100000000010000/patches.py
++++ b/dm/games/0100000000010000/patches.py
+@@ -2,8 +2,9 @@
+ # dm/tools/patch_nso.py loads every profile's patches.py and applies those of a module's
+ # NSO build ID; CUTS, OBS and FRAME_STEP as described there ("Registered patches").
+ # Only FRAME_STEP is used here: the in-game HUD editor runtime (hud_runtime.c,
+-# 0147). There are no word cuts and no observation gates.
+-from nso_asm import ADDI, ADRP, B, CBNZ, LDP_POST, STP_PRE
++# 0147) and the 0228 diagnostic headkey probe (temporary, removed once its log
++# decides the costume-head fix). There are no word cuts and no observation gates.
++from nso_asm import ADDI, ADDR, ADRP, B, CBNZ, CBZ, LDP_POST, LDRB_POST, LDRX, LDXRW, MOV, MOVZ, RET, STP_PRE, STRB, STRB_POST, STRW, STRX, STXRW, SUBI
+ 
+ BUILD_141 = 'b424be150a8e7d78701cbe7a439d9ebf'   # main 1.4.1 (game.tsv v393216)
+ 
+@@ -216,8 +217,162 @@ def _hud_runtime_frame_step(ctx):
+     emit(B(here(), 0x909da4))                  # back to the hook site + 4
+     fs_put(0x909da0, [B(0x909da0, rstart)], 'Forced recompute 0x909d4c +0x150: the in-game HUD editor runtime, re-applied after the game\'s post-Calculate refresh (hud_runtime.c)')
+ 
++# (0228 diagnostic) The headkey probe: log the key-level resource lookup at the
++# costume-head crash path (0x65f520) so the next device run pins who fills +0xb8
++# for the per-costume head document (REPORT-LOOKUP-DECODE.md §7.3,
++# REPORT-LOG107-CRASH.md §7.3). Two FRAME_STEP cuts in 0x65f520, the
++# model-definition loader: at 0x65f8c8 (right after `bl 0x747300`, the resource
++# lookup) and at 0x65fb50 (right before `bl 0x65db60`, the joint setup where the
++# crash happens). Each cut's trampoline passes (key, res, ring, site) to one
++# shared body, which appends a 64-byte record to a ring in the frame-step state
++# page at +0x3300; the host drains the ring once per present
++# (dm_diag_headkey_frame_tick in hud_manual.c) and logs only the keys
++# containing "Head". Logging-only: the body writes nothing but the ring (never
++# game state), touches no callee-saved register and no flag (every instruction
++# is a load, store, register move/add/sub or a CBZ/CBNZ branch), and executes
++# the replaced instruction before branching back, so the game runs exactly as
++# without the probe. The ring reuses the 0129 HUD probe's region (+0x3300):
++# that probe was deleted from this profile, and its host drain only writes the
++# +0x04 slot (its enabled flag) before its magic check, so this ring's header
++# leaves +0x04 reserved. Temporary: remove the cuts and the drain once the
++# §7.3 log has decided pre-register vs route-to-default-head.
++# Ring (state +0x3300): +0x00 u32 magic "DHKY", +0x04 u32 reserved (the 0129
++# probe's enabled slot), +0x08 u32 write_seq (monotonic, atomic), +0x0C u32
++# next_off (byte offset of the next slot relative to the record area, 0..0x800,
++# atomic, wraps to 0; the record sits at ring + 0x20 + next_off, so the
++# zero-filled initial value 0 is already the first slot),
++# +0x10..+0x1F reserved, +0x20 records[32] x 64 bytes.
++# Record (64 bytes): +0 u64 res, +8 u64 doc, +16 u64 doc_b8, +24 u32 site,
++# +28 u32 seq (written LAST, the commit marker: the host only reads a record
++# whose seq is set), +32 char key[32] (the looked-up key, at most 31 chars + NUL).
++# The body guards NULLs (res==0 -> doc=doc_b8=0; doc==0 -> doc_b8=0), so a
++# missing resource is logged, never faulted on: the game's own next instruction
++# reads the same addresses, so the probe introduces no new fault mode.
++# Site facts (device-probed, log-106/log-107): at 0x65f8c8 the resource is x0
++# (the 0x747300 return) and the key string is at [sp,#0x128]; at 0x65fb50 the
++# resource is x26 and the document is x24 (reloaded at 0x65faf4), the key
++# string still at [sp,#0x128]. The replaced instructions are `ldr x22,
++# [x0,#0xa0]` at 0x65f8c8 and `ldur w3, [x29,#-0x88]` at 0x65fb50.
++DIAG_HEADKEY_RING_OFF = 0x3300
++DIAG_HEADKEY_MAGIC = 0x594B4844   # "DHKY"
++
++def _diag_headkey_frame_step(ctx):
++    here, emit, fs_site, fs_put, FS_STATE_OFF = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state
++    ring = FS_STATE_OFF + DIAG_HEADKEY_RING_OFF
++    # Assemble the shared body into a word list first: its forward branches
++    # need their targets resolved before any word is emitted.
++    body = []   # ('w', word) | ('cbz', rt, label) | ('cbnz', rt, label) | ('b', label)
++    labels = {}
++    def _w(word): body.append(('w', word))
++    def _label(name): labels[name] = len(body)
++    def _cbz(rt, label): body.append(('cbz', rt, label))
++    def _cbnz(rt, label): body.append(('cbnz', rt, label))
++    def _b(label): body.append(('b', label))
++    # x0 = key ptr, x1 = res, x2 = ring base, x8 = site. Uses x0-x14 only
++    # (all caller-saved); x19-x30 and sp are never touched, and no instruction
++    # sets the flags, so the game resumes exactly as at the cut.
++    # doc / doc_b8 with NULL guards.
++    _cbz(1, 'res_null')
++    _w(LDRX(3, 1, 0x14))          # doc = [res, #0xa0]
++    _cbz(3, 'doc_null')
++    _w(LDRX(4, 3, 0x17))          # doc_b8 = [doc, #0xb8]
++    _b('have_vals')
++    _label('res_null')
++    _w(MOV(3, 31))                # doc = 0
++    _label('doc_null')
++    _w(MOV(4, 31))                # doc_b8 = 0
++    _label('have_vals')
++    # Reserve a seq (atomic increment of write_seq at ring+8). The record's
++    # seq is the NEW value, so the first record is seq 1, never 0.
++    _w(ADDI(7, 2, 8))             # x7 = &write_seq
++    _label('seq_retry')
++    _w(LDXRW(5, 7))               # w5 = write_seq
++    _w(ADDI(6, 5, 1))             # x6 = write_seq + 1
++    _w(STXRW(14, 6, 7))           # try to store it; w14 = status (0 = ok)
++    _cbnz(14, 'seq_retry')
++    _w(MOV(12, 6))                # x12 = seq
++    # Reserve a slot (atomic advance of next_off at ring+12, wraps 0x800 -> 0).
++    # next_off is relative to the record area (0..0x800); the record sits at
++    # ring + 0x20 + next_off, so the zero-filled initial value 0 is already the
++    # first slot (a 0x20-based offset would have put the first record on the header).
++    _w(ADDI(7, 2, 12))            # x7 = &next_off
++    _label('slot_retry')
++    _w(LDXRW(5, 7))               # w5 = next_off
++    _w(SUBI(6, 5, 0x800))         # x6 = next_off - 0x800
++    _cbz(6, 'wrap')
++    _w(ADDI(6, 5, 64))            # x6 = next_off + 64
++    _b('slot_store')
++    _label('wrap')
++    _w(MOV(5, 31))                # x5 = 0 (the wrapped slot offset)
++    _w(MOVZ(6, 64))               # x6 = 64 (the new next_off)
++    _label('slot_store')
++    _w(STXRW(14, 6, 7))
++    _cbnz(14, 'slot_retry')
++    # x5 = slot offset (relative), x12 = seq.
++    _w(ADDI(5, 5, 0x20))          # x5 = 0x20 + next_off (the record's byte offset in the ring)
++    _w(ADDR(9, 2, 5))             # x9 = ring + slot (the record)
++    _w(STRX(1, 9, 0))             # res
++    _w(STRX(3, 9, 1))             # doc
++    _w(STRX(4, 9, 2))             # doc_b8
++    _w(STRW(8, 9, 6))             # site (low 32 bits of x8)
++    # Key copy: at most 31 chars + NUL into record+32.
++    _w(ADDI(10, 9, 32))           # x10 = key dst
++    _w(MOVZ(13, 31))              # x13 = 31 (chars left)
++    _label('copy')
++    _w(LDRB_POST(11, 0, 1))       # w11 = *x0++
++    _w(STRB_POST(11, 10, 1))      # *x10++ = w11
++    _cbz(11, 'copied')            # NUL copied -> done
++    _w(SUBI(13, 13, 1))           # one fewer char left
++    _cbnz(13, 'copy')
++    _label('copied')
++    _w(STRB(31, 9, 63))           # NUL at record+63 (caps the field; harmless if already terminated)
++    _w(STRW(12, 9, 7))            # seq, LAST (the commit marker)
++    _w(RET)
++    probe = here()
++    for i, item in enumerate(body):
++        pc = probe + 4 * i
++        if item[0] == 'w': emit(item[1])
++        elif item[0] == 'cbz': emit(CBZ(item[1], pc, probe + 4 * labels[item[2]]))
++        elif item[0] == 'cbnz': emit(CBNZ(item[1], pc, probe + 4 * labels[item[2]]))
++        else: emit(B(pc, probe + 4 * labels[item[1]]))
++    # The 0x65f8c8 cut: `ldr x22, [x0, #0xa0]` (the document load right after
++    # the 0x747300 lookup). At the site x0 is the resource (live: `mov x26, x0`
++    # follows), x1/x2 are dead (the lookup clobbered them; both are rewritten
++    # before any read), and the key string is at [sp,#0x128].
++    fs_site(0x65f8c8, '165040f9')
++    start_a = here()
++    emit(MOV(1, 0))                          # x1 = res (the body's 2nd arg)
++    emit(LDRX(0, 31, 0x25))                  # x0 = key ptr (the body's 1st arg)
++    emit(STP_PRE(1, 2, 31, -16))             # push res + dead x2 (the body clobbers x1/x2)
++    emit(ADRP(2, here(), ring)); emit(ADDI(2, 2, ring & 0xFFF))   # x2 = ring
++    emit(ADRP(8, here(), 0x65f8c8)); emit(ADDI(8, 8, 0x65f8c8 & 0xFFF))  # x8 = site
++    emit(B(here(), probe) | 0x80000000)       # bl probe
++    emit(LDP_POST(1, 2, 31, 16))             # restore res -> x1
++    emit(MOV(0, 1))                          # x0 = res (the replaced instruction reads x0)
++    emit(0xF9405016)                         # ldr x22, [x0, #0xa0] (the replaced instruction)
++    emit(B(here(), 0x65f8cc))                # back to the site + 4
++    fs_put(0x65f8c8, [B(0x65f8c8, start_a)], '0228 diagnostic: 0x65f520 headkey probe, lookup site (REPORT-LOOKUP-DECODE.md §7.3)')
++    # The 0x65fb50 cut: `ldur w3, [x29, #-0x88]` (right before `bl 0x65db60`,
++    # the joint setup). At the site x26 is the resource (live: `mov x2, x26`
++    # follows) and x24 is the document (live across the function; the body
++    # never touches x19-x30, the save is belt and braces), x0/x1/x2/w3 are
++    # dead (rewritten before any read), and the key string is at [sp,#0x128].
++    fs_site(0x65fb50, 'a38357b8')
++    start_b = here()
++    emit(MOV(1, 26))                         # x1 = res
++    emit(LDRX(0, 31, 0x25))                  # x0 = key ptr
++    emit(STP_PRE(26, 24, 31, -16))           # push live res + doc
++    emit(ADRP(2, here(), ring)); emit(ADDI(2, 2, ring & 0xFFF))   # x2 = ring
++    emit(ADRP(8, here(), 0x65fb50)); emit(ADDI(8, 8, 0x65fb50 & 0xFFF))  # x8 = site
++    emit(B(here(), probe) | 0x80000000)       # bl probe
++    emit(LDP_POST(26, 24, 31, 16))           # restore res + doc
++    emit(0xB85783A3)                         # ldur w3, [x29, #-0x88] (the replaced instruction)
++    emit(B(here(), 0x65fb54))                # back to the site + 4
++    fs_put(0x65fb50, [B(0x65fb50, start_b)], '0228 diagnostic: 0x65f520 headkey probe, joint-setup site (REPORT-LOOKUP-DECODE.md §7.3)')
++
+ def _frame_step_141(ctx):
+     _hud_runtime_frame_step(ctx)
++    _diag_headkey_frame_step(ctx)
+ 
+ FRAME_STEP = {BUILD_141: _frame_step_141}
+ 
+diff --git a/dm/host/hud_manual.c b/dm/host/hud_manual.c
+index 920201f2..b32d4542 100644
+--- a/dm/host/hud_manual.c
++++ b/dm/host/hud_manual.c
+@@ -295,3 +295,79 @@ void dm_hud_manual_frame_tick(void) {
+         HUD_LOG("HUD manual: settings changed, manual mask %#x, hidden mask %#x", manual, hidden);
+     }
+ }
++
++// ---- 0228 diagnostic: the headkey probe ring (dm_diag_headkey_frame_tick) ----
++// The rewriter's diag_headkey stub (patches.py FRAME_STEP, 0228) writes one
++// 64-byte record per 0x65f520 call into the frame-step state page at +0x3300
++// (the 0129 HUD probe's region, free since that probe was deleted from the
++// profile; its host drain only writes the +0x04 slot before its magic check,
++// so this ring's header leaves +0x04 reserved). This function drains the ring
++// once per present (called from uw_frame_hook, next to
++// dm_hud_manual_frame_tick) and logs only the keys containing "Head" -- the
++// per-costume head lookup the 0228 fix depends on (REPORT-LOOKUP-DECODE.md
++// §7.3). Logging-only: it never writes game state (it reads the ring, which
++// the stub owns). Temporary: remove it with the probe once the §7.3 log has
++// decided pre-register vs route-to-default-head.
++// Ring (state +0x3300): +0x00 u32 magic "DHKY", +0x04 u32 reserved (the 0129
++// probe's enabled slot), +0x08 u32 write_seq, +0x0C u32 next_off (relative to
++// the record area, 0..0x800, wraps to 0; the record sits at ring + 0x20 +
++// next_off), +0x10..+0x1F reserved, +0x20 records[32] x 64 bytes.
++// Record (64 bytes): +0 u64 res, +8 u64 doc, +16 u64 doc_b8, +24 u32 site,
++// +28 u32 seq (written LAST by the stub, the commit marker), +32 char key[32].
++// A record whose key is not a NUL-terminated printable string is a torn write
++// (the stub was mid-record when this present drained it): it is skipped, but
++// its seq is still counted, so it never blocks later records.
++#define DIAG_HEADKEY_RING_OFF  0x3300
++#define DIAG_HEADKEY_MAGIC     0x594B4844u   // "DHKY"
++#define DIAG_HEADKEY_REC_CAP   32
++#define DIAG_HEADKEY_REC_SIZE  64
++#define DIAG_HEADKEY_KEY_OFF   32
++#define DIAG_HEADKEY_KEY_MAX   32
++
++static uint32_t g_diag_last_seq;   // the highest record seq logged so far (seqs start at 1)
++static int g_diag_started;         // the identification line has been logged
++
++static int diag_headkey_key_ok(const char *key) {
++    for (int i = 0; i < DIAG_HEADKEY_KEY_MAX; i++) {
++        unsigned char c = (unsigned char)key[i];
++        if (c == '\0') return i > 0;
++        if (c < 0x20 || c > 0x7e) return 0;
++    }
++    return 0;   // no NUL within 32 bytes
++}
++
++void dm_diag_headkey_frame_tick(void) {
++    uint8_t *st = dm_fps_state;
++    if (!st) return;
++    uint8_t *ring = st + DIAG_HEADKEY_RING_OFF;
++    if (*(uint32_t *)(ring + 0x00) != DIAG_HEADKEY_MAGIC) return;   // no probe in this build, or the stub has not run yet
++    if (!g_diag_started) {
++        // Identify the run: the launcher pick (the costume the user chose for this session).
++        const char *clothes = getenv("DM_CHAR_CLOTHES");
++        const char *cap = getenv("DM_CHAR_CAP");
++        LOG("diag-headkey: probe live, launcher clothes=%s cap=%s; run one session per costume (Happi, Explorer, Hakama), enter a kingdom, send Documents/log.txt",
++            clothes ? clothes : "(unset)", cap ? cap : "(unset)");
++        g_diag_started = 1;
++    }
++    uint32_t top = g_diag_last_seq, low = 0xffffffffu;
++    for (uint32_t i = 0; i < DIAG_HEADKEY_REC_CAP; i++) {
++        uint8_t *rec = ring + 0x20 + i * DIAG_HEADKEY_REC_SIZE;
++        uint32_t seq = *(uint32_t *)(rec + 28);
++        if (seq <= g_diag_last_seq) continue;   // already logged, or not yet committed (the stub writes seq last)
++        if (seq < low) low = seq;
++        if (seq > top) top = seq;
++        const char *key = (const char *)(rec + DIAG_HEADKEY_KEY_OFF);
++        if (!diag_headkey_key_ok(key)) continue;   // torn record: skip the line, but still advance past the seq
++        if (!strstr(key, "Head")) continue;   // only head lookups decide 0228; other parts are noise
++        uint64_t res = *(uint64_t *)(rec + 0);
++        uint64_t doc = *(uint64_t *)(rec + 8);
++        uint64_t doc_b8 = *(uint64_t *)(rec + 16);
++        uint32_t site = *(uint32_t *)(rec + 24);
++        LOG("diag-headkey: site=0x%x seq=%u key=\"%s\" res=0x%016llx doc=0x%016llx doc_b8=0x%016llx",
++            site, seq, key, (unsigned long long)res, (unsigned long long)doc, (unsigned long long)doc_b8);
++    }
++    if (low != 0xffffffffu && low > g_diag_last_seq + 1)
++        LOG("diag-headkey: ring overwrote %u record(s) before this drain (seq %u..%u unseen)",
++            low - g_diag_last_seq - 1, g_diag_last_seq + 1, low - 1);
++    g_diag_last_seq = top;
++}
+diff --git a/dm/host/hud_manual.h b/dm/host/hud_manual.h
+index f710a29c..9875bfb8 100644
+--- a/dm/host/hud_manual.h
++++ b/dm/host/hud_manual.h
+@@ -16,4 +16,9 @@
+ // once per present from uw_frame_hook; writes only when something changed).
+ void dm_hud_manual_frame_tick(void);
+ 
++// Drain the 0228 diagnostic headkey probe ring (called once per present from
++// uw_frame_hook, next to dm_hud_manual_frame_tick). A no-op when the probe is
++// not in the build (the ring magic does not match).
++void dm_diag_headkey_frame_tick(void);
++
+ #endif
+diff --git a/dm/host/uw.c b/dm/host/uw.c
+index 13cc37dd..da94e132 100644
+--- a/dm/host/uw.c
++++ b/dm/host/uw.c
+@@ -734,6 +734,7 @@ void uw_frame_hook(double w, double h) {
+     uw_update_from_size(w, h);
+     uw_direct_write();
+     dm_hud_manual_frame_tick();   // (0119) the launcher HUD editor's settings into the state page (+0x200); a no-op write when unchanged
++    dm_diag_headkey_frame_tick();   // (0228) the headkey probe ring drain (+0x3300); a no-op when the probe is not in the build
+ }
+ 
+ float uw_effective_aspect(float in) {
+diff --git a/dm/tools/nso_asm.py b/dm/tools/nso_asm.py
+index 0c500a6b..f047284e 100644
+--- a/dm/tools/nso_asm.py
++++ b/dm/tools/nso_asm.py
+@@ -20,6 +20,20 @@ def ADDR(dd, n, m): return 0x8B000000 | (m << 16) | (n << 5) | dd
+ def SUBI(dd, n, imm12, sh=0): return 0xD1000000 | (sh << 22) | (imm12 << 10) | (n << 5) | dd
+ def BR(n): return 0xD61F0000 | (n << 5)
+ def CMPR(n, m): return 0xEB00001F | (m << 16) | (n << 5)   # cmp xn, xm (subs xzr)
++def MOV(dd, n): return 0xAA0003E0 | (n << 16) | dd   # mov x<dd>, x<n> (orr xd, xzr, xn)
++def MOVZ(dd, imm16, sh=0): return 0xD2800000 | (sh << 21) | ((imm16 & 0xFFFF) << 5) | dd   # movz x<dd>, #imm16 (lsl #16*sh)
++def SUBR(dd, n, m): return 0xCB000000 | (m << 16) | (n << 5) | dd   # sub x<dd>, x<n>, x<m>
++def CBZ(rt, frm, to):
++    off = to - frm; assert -(1 << 20) <= off < (1 << 20) and off % 4 == 0
++    return 0x34000000 | (((off >> 2) & 0x7FFFF) << 5) | rt   # cbz w<rt>, <to> (tests the register, not the flags; the 32-bit form, like CBNZ)
++def LDRB_POST(t, n, imm): return 0x38400400 | ((imm & 0x1FF) << 12) | (n << 5) | t   # ldrb wt,[xn],#imm (post-index; bit 10 marks the writeback -- without it this decodes as ldurb, an unscaled load that never advances the pointer)
++def STRB_POST(t, n, imm): return 0x38000400 | ((imm & 0x1FF) << 12) | (n << 5) | t   # strb wt,[xn],#imm (post-index; bit 10 marks the writeback)
++def STRB(t, n, imm12=0): return 0x39000000 | (imm12 << 10) | (n << 5) | t   # strb wt,[xn,#imm12]
++def STRW(t, n, imm12=0): return 0xB9000000 | (imm12 << 10) | (n << 5) | t   # str wt,[xn,#imm12*4]
++def LDXRW(t, n): return 0x885F7C00 | (n << 5) | t   # ldxr wt,[xn] (32-bit exclusive load)
++def STXRW(s, t, n): return 0x88007C00 | (s << 16) | (n << 5) | t   # stxr ws,wt,[xn] (32-bit exclusive store; ws = 0 on success)
++RET = 0xD65F03C0   # ret
++CLREX = 0xD503305F   # clrex
+ def BEQ(frm, to):
+     off = to - frm; assert -(1 << 20) <= off < (1 << 20) and off % 4 == 0
+     return 0x54000000 | (((off >> 2) & 0x7FFFF) << 5)
+-- 
+2.43.0
+

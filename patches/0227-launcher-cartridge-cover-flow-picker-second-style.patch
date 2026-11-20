@@ -1,0 +1,1093 @@
+From c8d088cd8efec9bfbfb1d7b3508b4cb27f9327d8 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Fri, 20 Nov 2026 12:29:48 +0000
+Subject: [PATCH] 0227: launcher cartridge cover-flow picker (second style)
+
+Keep the 0226 classic outfit grid as the default ("classic") and add
+the v4 cartridge cover-flow as a second picker ("cartridge"), chosen
+by DmLauncherUIStyle (UserDefaults, default "classic") with a switch
+in the Game tab's settings; switching takes effect immediately.
+
+Cartridge cards are retro matte brick-red game cartridges (grain tile,
+top notch, gold fingers, aged-paper label, sticker render with no
+white edge), tilted in 3D by scroll position (+-68 deg), with
+reflections below near-center cards only, spring snap-to-center, and a
+tap-to-open lid (hinged left, 103 deg, overshoot ease) revealing the
+interior page; the hero syncs and shows the gold "selected" badge
+while a lid is open. Both pickers share the DmCharSelect.* cap/clothes
+state, so switching styles never loses the pick.
+---
+ dm/games/0100000000010000/README.md           |   1 +
+ dm/ios/Sources/Launcher.swift                 | 602 +++++++++++++++++-
+ .../LauncherBackground/dm_grain_noise.png     | Bin 0 -> 20047 bytes
+ 3 files changed, 587 insertions(+), 16 deletions(-)
+ create mode 100644 dm/ios/Sources/LauncherBackground/dm_grain_noise.png
+
+diff --git a/dm/games/0100000000010000/README.md b/dm/games/0100000000010000/README.md
+index f4cf4086..8357c569 100644
+--- a/dm/games/0100000000010000/README.md
++++ b/dm/games/0100000000010000/README.md
+@@ -89,6 +89,7 @@ General host and tool changes first needed here; each applies to every game:
+ ## Open
+ 
+ - Character selection in the in-game shop (0166, open): the shop rows are in (0167: Mario/Luigi/Wario at ItemList.byml 147,148,149, Luigi2D.szs icon, MSBT labels) and the title-menu picker is removed (0168: row 3 is VR again, guide taps fall through while a page is shown), but buying a row does not persist the character yet. The confirmed row cannot be identified from static code: the fs-preview route is refuted by log-64 (the shop opens every row's body file while building the list and nothing new at confirm), the 0x50a5c0 accessor's +0x70 is a float, not a row index, and NrvSelectDecideEnd (0x442980) is cleanup. The list NrvDecide hook point 0x2e8dfc is verified and can set a confirm flag, but the flag alone does not name the row.
++- Costume hands stay stock (0222, stopgap, open): a costume's hand file is never redirected. The Mechanic form has no own hands (no `MarioMechanicHandL/R.szs` in RomFS), so it borrows the player's hands and looks `MarioHandL`/`MarioHandR` up by name; a costume hand file's FMDL is named after itself, the lookup returns NULL, and the bone-transform setup faults at NULL+0x28 (`0x6ad530`, log-93). The guard in `dm_char_redirect` keeps the stock white gloves. The proper fix, like 0220 for caps, is hand reskins with FMDL `MarioHandL`/`MarioHandR`.
+ - The three thunder geometry shaders do not translate.
+ - The silent first minute of sound.
+ - development.md calls SDK 7.3.2 "the oldest so far"; Mario Kart 8 Deluxe (SDK 4.4.0) is older now.
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index 4b831249..038f114d 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -255,6 +255,16 @@ private func dmOutfitImage(_ name: String) -> UIImage? {
+     UIImage(named: name, in: Bundle(for: LauncherModel.self), compatibleWith: nil)
+ }
+ 
++/// The grain tile for the cartridge's matte finish (0227, v4 prototype):
++/// a 140x140 noise image bundled in LauncherBackground as
++/// dm_grain_noise.png (mid-grey, so an overlay blend is neutral and a
++/// multiply blend only darkens a little). Returns nil when the tile is
++/// missing — the cartridge then renders flat, which is still the v4 look
++/// minus grain.
++private func dmGrainImage() -> UIImage? {
++    UIImage(named: "dm_grain_noise", in: Bundle(for: LauncherModel.self), compatibleWith: nil)
++}
++
+ // Caps (50)
+ private let dmOutfitCaps: [(id: String, name: String)] = [
+     ("Mario64", "64"),
+@@ -390,6 +400,15 @@ private func dmOutfitImageName(character: String, id: String) -> String {
+     return "of_\(character)_" + base
+ }
+ 
++/// The outfit's English code for the cartridge (0227, v4 prototype):
++/// the spine's vertical text and the label's typewriter subtitle, e.g.
++/// "MARIO HAKAMA"; "MARIO DEFAULT" for the default card.
++private func dmOutfitENCode(_ id: String) -> String {
++    if id == "default" { return "MARIO DEFAULT" }
++    let bare = id.hasPrefix("Mario") ? String(id.dropFirst(5)) : id
++    return "MARIO " + bare.uppercased()
++}
++
+ /// The grid's list for a character and a slot (0194, 0201, 0226). The first entry is always "default". Mario gets all 50 caps + 52 clothes; Luigi gets Mario's full set too (0226: he is a 28-bone Mario-skeleton reskin -- Mario body geometry + Luigi head -- so the Mario renders and the Mario body reskins serve him, and the host write makes the pick stick); Wario gets his 8 costumes in each slot; Peach, Pauline and Toad get default only for now. The card image is the real render of_<character>_<id>.png; the default card uses of_<character>_default (only Mario's exists — the rest fall back to a text-only card).
+ private func dmDeckItems(character: String, caps: Bool) -> [DeckItem] {
+     var items: [DeckItem] = [DeckItem(id: "default", image: "of_\(character)_default", name: "\u{9ed8}\u{8ba4}")]
+@@ -573,11 +592,515 @@ private struct OutfitGridView: View {
+     }
+ }
+ 
++/// The grain tile as a view (0227): the noise image at a low opacity
++/// with a blend mode. The caller clips it to its shape.
++private struct DmGrain: View {
++    let opacity: Double
++    let blendMode: BlendMode
++
++    var body: some View {
++        if let img = dmGrainImage() {
++            Image(uiImage: img)
++                .resizable()
++                .scaledToFill()
++                .opacity(opacity)
++                .blendMode(blendMode)
++        }
++    }
++}
++
++/// The cartridge cover-flow picker (0227, v4 prototype): the same outfits
++/// as the classic grid, but each card is a retro matte game cartridge in
++/// 3D — brick-red shell, sticker render, aged-paper label, gold fingers —
++/// in a cover-flow that tilts with scroll position, reflects below, and
++/// opens its lid on tap. The classic grid stays as the default; this is
++/// the "cartridge" style, chosen by DmLauncherUIStyle. The lid is UI
++/// state only: tapping wears the outfit (onSelect) and toggles the lid;
++/// a second tap on the same card closes it, a tap on another card moves
++/// the open lid there.
++private struct CartridgeCoverFlowView: View {
++    let characterId: String
++    let characterName: String
++    let scale: CGFloat
++    let onSelect: (DeckItem) -> Void
++    let onOpenChange: (Bool) -> Void
++    @State private var capsMode: Bool = true
++    @State private var cap: String = UserDefaults.standard.string(forKey: "DmCharSelect.cap") ?? "default"
++    @State private var clothes: String = UserDefaults.standard.string(forKey: "DmCharSelect.clothes") ?? "default"
++    @State private var centeredId: String? = nil
++    @State private var openId: String? = nil
++
++    private var items: [DeckItem] { dmDeckItems(character: characterId, caps: capsMode) }
++    private var selectedId: String { capsMode ? cap : clothes }
++    private var effectiveSelectedId: String {
++        items.contains { $0.id == selectedId } ? selectedId : "default"
++    }
++    private var effectiveItem: DeckItem {
++        items.first(where: { $0.id == effectiveSelectedId }) ?? items[0]
++    }
++    // The cartridge card is 110pt wide at scale 1 (the prototype's
++    // 150px card scaled to the launcher's picker, so the flow fits the
++    // same vertical budget as the classic grid); u converts prototype
++    // px to points. Card 150u x 212u, 40u deep; the flow adds a 5u gap
++    // and a 24u reflection below the card.
++    private var u: CGFloat { scale * 110 / 150 }
++    private var cardWidth: CGFloat { 150 * u }
++    private var cardHeight: CGFloat { 212 * u }
++    private var flowHeight: CGFloat { (212 + 5 + 24) * u }
++
++    private func select(_ item: DeckItem) {
++        if capsMode {
++            cap = item.id
++            UserDefaults.standard.set(item.id, forKey: "DmCharSelect.cap")
++        } else {
++            clothes = item.id
++            UserDefaults.standard.set(item.id, forKey: "DmCharSelect.clothes")
++        }
++        onSelect(item)
++    }
++
++    private func tap(_ item: DeckItem) {
++        select(item)
++        let willOpen = openId != item.id
++        openId = willOpen ? item.id : nil
++        onOpenChange(willOpen)
++        withAnimation(.spring(response: 0.55, dampingFraction: 0.72)) {
++            centeredId = item.id
++        }
++    }
++
++    var body: some View {
++        VStack(alignment: .leading, spacing: 8 * scale) {
++            // Header: title + subtitle + cap/clothes switch (same as classic).
++            HStack(alignment: .firstTextBaseline) {
++                VStack(alignment: .leading, spacing: 2 * scale) {
++                    Text(characterName + "\u{7684}\u{670d}\u{88c5}")
++                        .font(.system(size: 20 * scale, weight: .bold))
++                        .foregroundStyle(.white)
++                    Text("\u{53ea}\u{663e}\u{793a}" + characterName + "\u{80fd}\u{7a7f}\u{7684}\u{8863}\u{670d}")
++                        .font(.system(size: 13 * scale))
++                        .foregroundStyle(.white.opacity(0.7))
++                }
++                Spacer()
++                Picker("", selection: $capsMode) {
++                    Text("\u{5e3d}\u{5b50}").tag(true)
++                    Text("\u{8863}\u{670d}").tag(false)
++                }
++                .pickerStyle(.segmented)
++                .frame(width: 130 * scale)
++            }
++            // Cover-flow: the cartridge cards tilt in 3D with scroll
++            // position; the nearest card snaps to the center
++            // (.scrollPosition + .viewAligned). The pitch is the
++            // prototype's spacing() — clamp(width/6.4, 74, 112) in
++            // prototype px — so adjacent cards overlap like a real
++            // cover-flow; the padding centers the first and last cards.
++            GeometryReader { outer in
++                let pitch = max(74 * u, min(112 * u, outer.size.width / 6.4))
++                ScrollView(.horizontal, showsIndicators: false) {
++                    LazyHStack(spacing: pitch - cardWidth) {
++                        ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
++                            cartridgeCard(item, index: index, centerX: outer.size.width / 2, pitch: pitch)
++                                .id(item.id)
++                        }
++                    }
++                    .scrollTargetLayout()
++                    .padding(.horizontal, max(0, outer.size.width / 2 - cardWidth / 2))
++                }
++                .scrollPosition(id: $centeredId, anchor: .center)
++                .scrollTargetBehavior(.viewAligned)
++                .coordinateSpace(name: "cartridgeflow")
++                .onAppear { centeredId = effectiveSelectedId }
++            }
++            .frame(height: flowHeight)
++        }
++        .onChange(of: capsMode) { _, _ in
++            openId = nil
++            onOpenChange(false)
++            onSelect(effectiveItem)
++            centeredId = effectiveSelectedId
++        }
++        .onChange(of: characterId) { _, _ in
++            openId = nil
++            onOpenChange(false)
++            onSelect(effectiveItem)
++            centeredId = effectiveSelectedId
++        }
++        .onAppear { onSelect(effectiveItem) }
++    }
++
++    private func cartridgeCard(_ item: DeckItem, index: Int, centerX: CGFloat, pitch: CGFloat) -> some View {
++        let isOpen = openId == item.id
++        return GeometryReader { geo in
++            // Distance from the scroll view's center in card pitches:
++            // the tilt, shrink, fade and reflection all follow it.
++            // A card to the right faces left (toward the center) and
++            // vice versa, as in the classic grid.
++            let d = (geo.frame(in: .named("cartridgeflow")).midX - centerX) / max(pitch, 1)
++            let angle = max(-68, min(68, d * 50))
++            let shrink = max(0.6, 1 - abs(d) * 0.145)
++            let fade: CGFloat = abs(d) <= 2.7 ? 1 : max(0, 1 - (abs(d) - 2.7) * 0.75)
++            VStack(spacing: 5 * u) {
++                Button {
++                    tap(item)
++                } label: {
++                    cartridgeBox(item, index: index, isOpen: isOpen)
++                }
++                .buttonStyle(.plain)
++                // Reflection: a flipped copy of the front face, faded
++                // and darkened; only near the center, so 52 cards do
++                // not all render twice (LazyHStack already drops far
++                // cards from the hierarchy).
++                if abs(d) <= 3 {
++                    dmCartridgeReflection(item, index: index, d: d)
++                }
++            }
++            .rotation3DEffect(.degrees(angle), axis: (x: 0, y: 1, z: 0), perspective: 0.85)
++            .scaleEffect(shrink)
++            .opacity(fade)
++            .zIndex(Double(200 - Int(round(abs(d) * 10)) + (isOpen ? 50 : 0)))
++            .allowsHitTesting(abs(d) <= 3.6)
++        }
++        .frame(width: cardWidth, height: flowHeight)
++    }
++
++    private func cartridgeBox(_ item: DeckItem, index: Int, isOpen: Bool) -> some View {
++        ZStack {
++            // Interior (revealed when the lid opens): just behind the lid.
++            dmCartridgeInterior(item)
++            // Left spine and right side (the 40u extrusion).
++            dmCartridgeSpine(item)
++            dmCartridgeSide()
++            // Lid (the front face), hinged on the left edge.
++            cartridgeLid(item, index: index, isOpen: isOpen)
++        }
++        .frame(width: cardWidth, height: cardHeight)
++        .shadow(color: .black.opacity(0.35), radius: 10 * u, x: 0, y: 8 * u)
++    }
++
++    /// The lid (0227): the cartridge's front face on a hinge at its
++    /// left edge. Closed it is the front; open (103 degrees, past
++    /// perpendicular, with an overshoot ease) it swings out to the
++    /// left and shows its plain dark-red back, revealing the interior.
++    /// The back has no text, so showing it mirrored is harmless; it
++    /// crossfades with the front as the lid swings.
++    private func cartridgeLid(_ item: DeckItem, index: Int, isOpen: Bool) -> some View {
++        ZStack {
++            RoundedRectangle(cornerRadius: 13 * u)
++                .fill(
++                    LinearGradient(
++                        gradient: Gradient(colors: [Color(red: 0.431, green: 0.137, blue: 0.122), Color(red: 0.259, green: 0.071, blue: 0.059)]),
++                        startPoint: UnitPoint(x: 0.33, y: 0), endPoint: UnitPoint(x: 0.67, y: 1))
++                )
++                .overlay(
++                    RoundedRectangle(cornerRadius: 13 * u)
++                        .stroke(Color(red: 1, green: 0.667, blue: 0.588).opacity(0.12), lineWidth: 1 * u)
++                )
++                .opacity(isOpen ? 1 : 0)
++            dmCartridgeFront(item, index: index)
++                .opacity(isOpen ? 0 : 1)
++        }
++        .frame(width: cardWidth, height: cardHeight)
++        .rotation3DEffect(.degrees(isOpen ? 103 : 0), axis: (x: 0, y: 1, z: 0), anchor: .leading, perspective: 0.85)
++        .animation(.timingCurve(0.3, 1.35, 0.4, 1, duration: 0.68), value: isOpen)
++    }
++
++    /// The cartridge front face (0227): matte brick-red shell, top
++    /// notch, SUPER MARIO ODYSSEY band, recessed cover with the outfit
++    /// sticker, aged-paper label, gold fingers. Sizes are prototype px
++    /// scaled by u; the face is 150u x 212u. Used by the lid (its
++    /// front) and by the reflection (flipped).
++    @ViewBuilder
++    private func dmCartridgeFront(_ item: DeckItem, index: Int) -> some View {
++        ZStack {
++            // Shell: matte brick-red gradient, inset ring and bottom
++            // shadow, fine grain. No gloss anywhere (v4).
++            RoundedRectangle(cornerRadius: 13 * u)
++                .fill(
++                    LinearGradient(
++                        gradient: Gradient(stops: [
++                            .init(color: Color(red: 0.788, green: 0.251, blue: 0.235), location: 0),
++                            .init(color: Color(red: 0.690, green: 0.200, blue: 0.188), location: 0.48),
++                            .init(color: Color(red: 0.576, green: 0.188, blue: 0.173), location: 1),
++                        ]),
++                        startPoint: UnitPoint(x: 0.35, y: 0), endPoint: UnitPoint(x: 0.65, y: 1))
++                )
++                .overlay(
++                    DmGrain(opacity: 0.09, blendMode: .overlay)
++                        .clipShape(RoundedRectangle(cornerRadius: 13 * u))
++                )
++                .overlay(
++                    RoundedRectangle(cornerRadius: 13 * u)
++                        .stroke(Color(red: 0.275, green: 0.055, blue: 0.039).opacity(0.35), lineWidth: 1 * u)
++                )
++            // Bottom inner shadow (the shell darkens toward the base).
++            VStack {
++                Spacer()
++                LinearGradient(colors: [.clear, Color(red: 0.275, green: 0.047, blue: 0.031).opacity(0.30)], startPoint: .top, endPoint: .bottom)
++                    .frame(height: 22 * u)
++            }
++            .clipShape(RoundedRectangle(cornerRadius: 13 * u))
++            // Content: notch, band, cover, label, pins.
++            VStack(spacing: 0) {
++                // Top notch: the cartridge slot, flush with the top edge.
++                UnevenRoundedRectangle(cornerRadii: .init(topLeading: 0, bottomLeading: 6 * u, bottomTrailing: 6 * u, topTrailing: 0))
++                    .fill(Color(red: 0.235, green: 0.031, blue: 0.024).opacity(0.5))
++                    .frame(width: 44 * u, height: 7 * u)
++                VStack(spacing: 0) {
++                    Text("SUPER MARIO ODYSSEY")
++                        .font(.custom("Futura", size: 8 * u).weight(.bold))
++                        .tracking(8 * u * 0.14)
++                        .foregroundStyle(Color(red: 0.953, green: 0.902, blue: 0.812).opacity(0.92))
++                        .padding(.top, 4 * u)
++                    // Recessed cover with the outfit sticker: the render
++                    // as a paper sticker — no white edge (v4) — light
++                    // paper grain comes from the cover itself, a soft
++                    // drop shadow and a slight hand-placed tilt
++                    // (alternating by index).
++                    ZStack {
++                        RoundedRectangle(cornerRadius: 8 * u)
++                            .fill(
++                                RadialGradient(
++                                    gradient: Gradient(stops: [
++                                        .init(color: Color(red: 0.165, green: 0.200, blue: 0.314), location: 0),
++                                        .init(color: Color(red: 0.102, green: 0.137, blue: 0.220), location: 0.62),
++                                        .init(color: Color(red: 0.071, green: 0.102, blue: 0.173), location: 1),
++                                    ]),
++                                    center: UnitPoint(x: 0.5, y: 0.3), startRadius: 0, endRadius: 120 * u)
++                            )
++                            .overlay(
++                                RoundedRectangle(cornerRadius: 8 * u)
++                                    .stroke(Color(red: 0.745, green: 0.706, blue: 0.588).opacity(0.14), lineWidth: 1 * u)
++                            )
++                            .overlay(
++                                DmGrain(opacity: 0.07, blendMode: .overlay)
++                                    .clipShape(RoundedRectangle(cornerRadius: 8 * u))
++                            )
++                        if let img = item.image.flatMap(dmOutfitImage) {
++                            Image(uiImage: img)
++                                .resizable()
++                                .scaledToFit()
++                                .padding(.horizontal, 5 * u)
++                                .padding(.bottom, 2 * u)
++                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomCenter)
++                                .rotationEffect(.degrees(index % 2 == 0 ? -1.3 : 1.0))
++                                .shadow(color: Color(red: 0.039, green: 0.024, blue: 0.016).opacity(0.45), radius: 4 * u, x: 0, y: 4 * u)
++                        } else {
++                            Text(item.name)
++                                .font(.system(size: 18 * u, weight: .bold))
++                                .foregroundStyle(.white)
++                                .frame(maxWidth: .infinity, maxHeight: .infinity)
++                        }
++                    }
++                    .frame(maxWidth: .infinity, maxHeight: .infinity)
++                    .padding(.top, 4 * u)
++                    // Aged-paper label: the Chinese name + the English code.
++                    VStack(spacing: 1 * u) {
++                        Text(item.name)
++                            .font(.custom("Songti SC", size: 15 * u).weight(.bold))
++                            .tracking(15 * u * 0.06)
++                            .foregroundStyle(Color(red: 0.227, green: 0.173, blue: 0.110))
++                        Text(dmOutfitENCode(item.id))
++                            .font(.custom("Courier New", size: 7.5 * u).weight(.bold))
++                            .tracking(7.5 * u * 0.2)
++                            .foregroundStyle(Color(red: 0.541, green: 0.435, blue: 0.259))
++                    }
++                    .padding(EdgeInsets(top: 5 * u, leading: 4 * u, bottom: 4 * u, trailing: 4 * u))
++                    .frame(maxWidth: .infinity)
++                    .background(
++                        LinearGradient(
++                            gradient: Gradient(stops: [
++                                .init(color: Color(red: 0.965, green: 0.937, blue: 0.859), location: 0),
++                                .init(color: Color(red: 0.937, green: 0.890, blue: 0.761), location: 0.6),
++                                .init(color: Color(red: 0.906, green: 0.839, blue: 0.671), location: 1),
++                            ]),
++                            startPoint: .top, endPoint: .bottom)
++                    )
++                    .clipShape(RoundedRectangle(cornerRadius: 4 * u))
++                    .overlay(
++                        RoundedRectangle(cornerRadius: 4 * u)
++                            .stroke(Color(red: 0.573, green: 0.463, blue: 0.251).opacity(0.35), lineWidth: 1 * u)
++                    )
++                    .overlay(
++                        RoundedRectangle(cornerRadius: 3 * u)
++                            .strokeBorder(Color(red: 0.573, green: 0.431, blue: 0.204).opacity(0.45), style: StrokeStyle(lineWidth: 1 * u, dash: [3 * u, 2 * u]))
++                            .padding(2 * u)
++                    )
++                    .overlay(
++                        DmGrain(opacity: 0.12, blendMode: .multiply)
++                            .clipShape(RoundedRectangle(cornerRadius: 4 * u))
++                    )
++                    .shadow(color: Color(red: 0.196, green: 0.031, blue: 0.016).opacity(0.45), radius: 5 * u, x: 0, y: 2 * u)
++                    .rotationEffect(.degrees(-0.5))
++                    .padding(.top, 6 * u)
++                    // Gold fingers: the cartridge's edge connector.
++                    HStack(spacing: 4 * u) {
++                        ForEach(0..<9, id: \.self) { _ in
++                            RoundedRectangle(cornerRadius: 1.5 * u)
++                                .fill(
++                                    LinearGradient(colors: [Color(red: 0.812, green: 0.682, blue: 0.290), Color(red: 0.659, green: 0.518, blue: 0.184)], startPoint: .top, endPoint: .bottom)
++                                )
++                                .frame(width: 9 * u, height: 8 * u)
++                        }
++                    }
++                    .padding(.top, 6 * u)
++                }
++                .frame(maxWidth: .infinity, maxHeight: .infinity)
++                .padding(.horizontal, 7 * u)
++                .padding(.bottom, 6 * u)
++            }
++            .frame(maxWidth: .infinity, maxHeight: .infinity)
++        }
++        .frame(width: cardWidth, height: cardHeight)
++    }
++
++    /// The cartridge's left spine (0227): the 40u extrusion's left
++    /// face, with the outfit's English code running vertically. It is
++    /// a 40u-wide plane rotated 90 degrees about its trailing edge so
++    /// it spans the box's depth, flush with the front face.
++    private func dmCartridgeSpine(_ item: DeckItem) -> some View {
++        ZStack {
++            Rectangle()
++                .fill(
++                    LinearGradient(
++                        gradient: Gradient(stops: [
++                            .init(color: Color(red: 0.753, green: 0.227, blue: 0.212), location: 0),
++                            .init(color: Color(red: 0.627, green: 0.173, blue: 0.157), location: 0.26),
++                            .init(color: Color(red: 0.510, green: 0.149, blue: 0.133), location: 0.5),
++                            .init(color: Color(red: 0.404, green: 0.118, blue: 0.110), location: 0.74),
++                            .init(color: Color(red: 0.298, green: 0.082, blue: 0.075), location: 1),
++                        ]),
++                        startPoint: .leading, endPoint: .trailing)
++                )
++            Rectangle()
++                .fill(
++                    LinearGradient(colors: [.black.opacity(0.18), .clear, .clear, .black.opacity(0.18)], startPoint: .top, endPoint: .bottom)
++                )
++            Text(dmOutfitENCode(item.id))
++                .font(.system(size: 10 * u, weight: .heavy))
++                .tracking(10 * u * 0.28)
++                .foregroundStyle(Color(red: 0.953, green: 0.902, blue: 0.812))
++                .frame(width: cardHeight * 0.8, height: 10 * u, alignment: .center)
++                .rotationEffect(.degrees(90))
++        }
++        .frame(width: 40 * u, height: cardHeight)
++        .rotation3DEffect(.degrees(90), axis: (x: 0, y: 1, z: 0), anchor: .trailing, perspective: 0.85)
++        .offset(x: -(cardWidth / 2 + 20 * u))
++    }
++
++    /// The cartridge's right side (0227): the 40u extrusion's right
++    /// face, with ridge stripes across the depth. It mirrors the
++    /// spine: a 40u-wide plane rotated -90 degrees about its leading
++    /// edge, flush with the front face.
++    private func dmCartridgeSide() -> some View {
++        ZStack {
++            Rectangle()
++                .fill(
++                    LinearGradient(
++                        gradient: Gradient(stops: [
++                            .init(color: Color(red: 0.698, green: 0.204, blue: 0.188), location: 0),
++                            .init(color: Color(red: 0.576, green: 0.157, blue: 0.141), location: 0.3),
++                            .init(color: Color(red: 0.455, green: 0.125, blue: 0.114), location: 0.6),
++                            .init(color: Color(red: 0.322, green: 0.086, blue: 0.075), location: 1),
++                        ]),
++                        startPoint: .leading, endPoint: .trailing)
++                )
++            HStack(spacing: 8 * u) {
++                ForEach(0..<4, id: \.self) { _ in
++                    Rectangle()
++                        .fill(Color.black.opacity(0.16))
++                        .frame(width: 2 * u)
++                }
++            }
++            .frame(maxWidth: .infinity, maxHeight: .infinity)
++        }
++        .frame(width: 40 * u, height: cardHeight)
++        .rotation3DEffect(.degrees(-90), axis: (x: 0, y: 1, z: 0), anchor: .leading, perspective: 0.85)
++        .offset(x: cardWidth / 2 + 20 * u)
++    }
++
++    /// The cartridge interior (0227): revealed when the lid opens —
++    /// dark red, the outfit render, the Chinese name, the English code
++    /// and the gold "已选择" pill. It sits just behind the lid, so it
++    /// is hidden while the lid is closed.
++    @ViewBuilder
++    private func dmCartridgeInterior(_ item: DeckItem) -> some View {
++        ZStack {
++            RoundedRectangle(cornerRadius: 13 * u)
++                .fill(
++                    LinearGradient(
++                        gradient: Gradient(colors: [Color(red: 0.341, green: 0.114, blue: 0.102), Color(red: 0.200, green: 0.071, blue: 0.059)]),
++                        startPoint: UnitPoint(x: 0.4, y: 0), endPoint: UnitPoint(x: 0.6, y: 1))
++                )
++                .overlay(
++                    RoundedRectangle(cornerRadius: 13 * u)
++                        .stroke(Color(red: 1, green: 0.667, blue: 0.588).opacity(0.16), lineWidth: 2 * u)
++                )
++            VStack(spacing: 4 * u) {
++                if let img = item.image.flatMap(dmOutfitImage) {
++                    Image(uiImage: img)
++                        .resizable()
++                        .scaledToFit()
++                        .frame(width: cardWidth * 0.74, height: 96 * u)
++                }
++                Text(item.name)
++                    .font(.system(size: 19 * u, weight: .heavy))
++                    .foregroundStyle(Color(red: 0.965, green: 0.910, blue: 0.847))
++                Text(dmOutfitENCode(item.id))
++                    .font(.system(size: 8.5 * u, weight: .bold))
++                    .tracking(8.5 * u * 0.22)
++                    .foregroundStyle(Color(red: 0.812, green: 0.604, blue: 0.553))
++                Text("\u{5df2}\u{9009}\u{62e9}")
++                    .font(.system(size: 11 * u, weight: .bold))
++                    .foregroundStyle(Color(red: 0.910, green: 0.784, blue: 0.467))
++                    .padding(EdgeInsets(top: 4 * u, leading: 11 * u, bottom: 4 * u, trailing: 11 * u))
++                    .background(Color(red: 0.431, green: 0.314, blue: 0.039).opacity(0.28))
++                    .clipShape(Capsule())
++                    .overlay(
++                        Capsule()
++                            .stroke(Color(red: 0.910, green: 0.784, blue: 0.467).opacity(0.55), lineWidth: 1 * u)
++                    )
++                    .padding(.top, 7 * u)
++            }
++            .padding(10 * u)
++        }
++        .frame(width: cardWidth, height: cardHeight)
++    }
++
++    /// The reflection below a card (0227): a flipped copy of the
++    /// front face, faded and darkened, clipped to a short strip.
++    /// Only rendered near the center (see cartridgeCard).
++    private func dmCartridgeReflection(_ item: DeckItem, index: Int, d: CGFloat) -> some View {
++        dmCartridgeFront(item, index: index)
++            .scaleEffect(x: 1, y: -1)
++            .frame(height: 24 * u, alignment: .top)
++            .clipped()
++            .mask(
++                LinearGradient(
++                    gradient: Gradient(stops: [
++                        .init(color: .white.opacity(0.95), location: 0),
++                        .init(color: .white.opacity(0.5), location: 0.26),
++                        .init(color: .clear, location: 0.56),
++                        .init(color: .clear, location: 1),
++                    ]),
++                    startPoint: .top, endPoint: .bottom)
++            )
++            .opacity(max(0, 0.32 - abs(d) * 0.07))
++            .saturation(0.55)
++            .brightness(-0.28)
++    }
++}
++
+ /// The character picker (0194, 0201, 0209, 0226, in the box): the hero on the left and the outfit picker on the right, the six character cards in a row at the bottom. The choice is saved to DmCharSelect.character (NSUserDefaults), which dm_char_select_apply_saved reads at startup before the game starts, so the next launch plays as the picked character. The roster is Mario / Luigi / Wario / Peach / Pauline / Toad; the hero and the picker follow the pick. Pauline and Toad need their model patches (0193) to play in-game — the picker itself only writes the name. The hero is a live preview (0226): it shows the last-tapped outfit's render, and the character promo art for "default" or before any tap. Cap + clothes cannot be composited (the renders are single-item), so the hero shows one item at a time.
+ private struct CharacterPickerView: View {
+     let scale: CGFloat
+     @State private var selected: String = UserDefaults.standard.string(forKey: "DmCharSelect.character") ?? "mario"
+     @State private var heroOutfitImage: String? = nil   // nil = the character promo art; otherwise an outfit render name
++    @AppStorage("DmLauncherUIStyle") private var uiStyle: String = "classic"
++    @State private var lidOpen: Bool = false   // a cartridge lid is open (cartridge style only)
++    // The two pickers have different heights (classic ~306, cartridge
++    // ~218 + the hero badge), so the glass box shrinks in cartridge
++    // style; the hero stays top-aligned either way.
+ 
+     private struct CharEntry: Identifiable {
+         let id: String
+@@ -595,27 +1118,57 @@ private struct CharacterPickerView: View {
+ 
+     private var current: CharEntry { roster.first(where: { $0.id == selected }) ?? roster[0] }
+ 
++    /// The hero follows the last-tapped outfit (0226): "default" shows
++    /// the character promo art, otherwise the tapped outfit's render
++    /// (for Luigi, a Mario render). A nil image (no render for the
++    /// outfit) falls back to the promo art too.
++    private func didSelect(_ item: DeckItem) {
++        heroOutfitImage = item.id == "default" ? nil : item.image
++    }
++
+     var body: some View {
+         VStack(spacing: 6 * scale) {
+             // Top row (0209, 0226): the hero is back. 0201 dropped it when the stacked deck became a flat grid, but the settled design keeps the big image next to the clothes — "大图330宽" in the mockup is 330 mockup pixels, i.e. 170pt at 2x, the 0194 frame. Hero on the left in a fixed frame (so a narrow render like Peach or Pauline does not move the picker), picker on the right; both follow the picked character. The hero is a live preview (0226): it shows the last-tapped outfit's render, the promo art for "default".
+             HStack(alignment: .top, spacing: 12 * scale) {
+-                if let hero = heroOutfitImage, let img = dmOutfitImage(hero) {
+-                    Image(uiImage: img)
+-                        .resizable()
+-                        .scaledToFit()
+-                        .frame(width: 170 * scale, height: 190 * scale)
+-                } else if let img = dmCharImage(current.image) {
+-                    Image(uiImage: img)
+-                        .resizable()
+-                        .scaledToFit()
+-                        .frame(width: 170 * scale, height: 190 * scale)
++                // Hero (0226 live preview) + the cartridge badge (0227):
++                // in cartridge style a gold "已选择" pill shows under
++                // the hero while a lid is open, and a grey-blue hint
++                // pill otherwise; classic has no badge.
++                VStack(spacing: 4 * scale) {
++                    if let hero = heroOutfitImage, let img = dmOutfitImage(hero) {
++                        Image(uiImage: img)
++                            .resizable()
++                            .scaledToFit()
++                            .frame(width: 170 * scale, height: 190 * scale)
++                    } else if let img = dmCharImage(current.image) {
++                        Image(uiImage: img)
++                            .resizable()
++                            .scaledToFit()
++                            .frame(width: 170 * scale, height: 190 * scale)
++                    }
++                    if uiStyle == "cartridge" {
++                        Text(lidOpen ? "\u{5df2}\u{9009}\u{62e9}" : "\u{6ed1}\u{52a8}\u{9009}\u{62e9} \u{00b7} \u{70b9}\u{76d2}\u{5b50}\u{6253}\u{5f00}")
++                            .font(.system(size: 13 * scale, weight: .bold))
++                            .foregroundStyle(lidOpen ? Color(red: 1, green: 0.843, blue: 0.369) : Color(red: 0.663, green: 0.737, blue: 0.863))
++                            .padding(EdgeInsets(top: 5 * scale, leading: 16 * scale, bottom: 5 * scale, trailing: 16 * scale))
++                            .background(lidOpen ? Color(red: 0.471, green: 0.329, blue: 0.031).opacity(0.28) : Color(red: 0.157, green: 0.227, blue: 0.376).opacity(0.35))
++                            .clipShape(Capsule())
++                            .overlay(
++                                Capsule()
++                                    .stroke(lidOpen ? Color(red: 1, green: 0.804, blue: 0.314).opacity(0.55) : Color(red: 0.588, green: 0.686, blue: 0.843).opacity(0.3), lineWidth: 1)
++                            )
++                            .animation(.easeInOut(duration: 0.25), value: lidOpen)
++                    }
+                 }
+-                OutfitGridView(characterId: current.id, characterName: current.name, scale: scale) { item in
+-                    // "default" -> the promo art; otherwise the tapped
+-                    // outfit's render (for Luigi, a Mario render). A nil
+-                    // image (no render for the outfit) falls back to the
+-                    // promo art too.
+-                    heroOutfitImage = item.id == "default" ? nil : item.image
++                // The picker: classic (the 0226 cover-flow grid) or
++                // cartridge (the 0227 retro game-cartridge cover-flow),
++                // chosen by DmLauncherUIStyle. Both keep their own
++                // cap/clothes state from the same DmCharSelect.*
++                // defaults, so switching styles never loses the pick.
++                if uiStyle == "cartridge" {
++                    CartridgeCoverFlowView(characterId: current.id, characterName: current.name, scale: scale, onSelect: didSelect, onOpenChange: { lidOpen = $0 })
++                } else {
++                    OutfitGridView(characterId: current.id, characterName: current.name, scale: scale, onSelect: didSelect)
+                 }
+             }
+             // Cards: one row, left to right. The selected card gets a gold ring.
+@@ -659,6 +1212,7 @@ private struct GameTabContent: View {
+     @Binding var glassOpacity: Double
+     let scale: CGFloat
+     @State private var memory = os_proc_available_memory()
++    @AppStorage("DmLauncherUIStyle") private var uiStyle: String = "classic"
+ 
+     var body: some View {
+         ScrollView {
+@@ -672,6 +1226,22 @@ private struct GameTabContent: View {
+                     Slider(value: $glassOpacity, in: 0...100, step: 1)
+                         .accessibilityLabel("\u{73bb}\u{7483}\u{5f3a}\u{5ea6}")
+                 }
++                // 0227: the outfit picker's style — classic (the 0226
++                // cover-flow grid) or cartridge (the v4 retro
++                // game-cartridge cover-flow). Stored in UserDefaults
++                // DmLauncherUIStyle ("classic"/"cartridge", default
++                // "classic"); the character picker reads the same key
++                // and swaps immediately, no restart.
++                HStack {
++                    Text("\u{754c}\u{9762}\u{98ce}\u{683c}").foregroundStyle(.white)
++                    Spacer()
++                    Picker("", selection: $uiStyle) {
++                        Text("\u{7ecf}\u{5178}").tag("classic")
++                        Text("\u{5361}\u{5e26}\u{5c01}\u{9762}\u{6d41}").tag("cartridge")
++                    }
++                    .pickerStyle(.segmented)
++                    .frame(width: 210)
++                }
+                 ForEach(m.rows(in: "Game")) { SettingRow(s: $0, m: m, dark: true) }
+                 Button(LauncherText.text("ui.resetDefaults", "Reset to tested defaults")) { m.reset() }
+                     .disabled(!m.changed)
+diff --git a/dm/ios/Sources/LauncherBackground/dm_grain_noise.png b/dm/ios/Sources/LauncherBackground/dm_grain_noise.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..020e501217ef23121f9355d3aaf860dfddfa7393
+GIT binary patch
+literal 20047
+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
+CUCzn?
+
+literal 0
+HcmV?d00001
+
+-- 
+2.43.0
+
