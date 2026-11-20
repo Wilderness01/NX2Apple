@@ -1,0 +1,309 @@
+From 1c136caa06253a56a5c9599a2e7f9b51aa9d4aa9 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Fri, 20 Nov 2026 03:15:14 +0000
+Subject: [PATCH] 0225b: second diagnostic probe for the equipped-costume field
+ in memory
+
+Read-only probe (no writes to game memory), round 2 for the 0226 launcher-costume override. 0225 (log-101) showed the slot at main+0x13130a0 points at a registry object (0xB0-byte records), not at the save data, and found the save string pool in the heap without pinning the equipped field. 0225b keeps everything 0225 does and adds: (a) follow the registry pointers at frames 600 and 7200 - each record's sub-object pointers (record offsets +0x48..+0xA8, found by layout, never hardcoded) and record links (+0x30) are read and their first 0x800 bytes scanned for the costume strings and u32 27/28; (b) pointer-value scan - the heap thread identifies each name's pool copy by its alphabetical neighbour (MarioExplorer before MarioHakama, MarioCaptain before MarioExplorer), then scans the heap for 8-byte pointer values equal to those pool addresses, plus u32 27/28 around each pool string. Pool addresses are found fresh every run (ASLR); nothing from a past session is hardcoded. The heap scan now always runs at frame 7200. Everything logs as [dm] diag-costume lines into Documents/log.txt. Diagnostic only: remove before 0226, together with DM_FS=1 in the workflow env.
+---
+ dm/host/hle_cheats.c | 224 +++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 204 insertions(+), 20 deletions(-)
+
+diff --git a/dm/host/hle_cheats.c b/dm/host/hle_cheats.c
+index 9e9588e..58c5654 100644
+--- a/dm/host/hle_cheats.c
++++ b/dm/host/hle_cheats.c
+@@ -1044,7 +1044,7 @@ static void cheats_pass(void) {
+     pthread_mutex_unlock(&g_lock);
+ }
+ 
+-// ---------- 0225 diagnostic: equipped-costume field probe (DIAGNOSTIC ONLY) ----------
++// ---------- 0225b diagnostic: equipped-costume field probe, round 2 (DIAGNOSTIC ONLY) ----------
+ // Purpose: pin the in-memory equipped-costume field (GameDataHolder offset, and whether
+ // it stores a name string or an integer index) for the 0226 launcher-costume override.
+ // The save file says the equipped fields are CurrentCapName (value 27 = MarioExplorer)
+@@ -1055,11 +1055,24 @@ static void cheats_pass(void) {
+ // everything as [dm] diag-costume lines into Documents/log.txt. REMOVE before 0226:
+ // the 0226 fix replaces this probe with the host write, and DM_FS=1 (workflow env)
+ // goes away with it too.
+-// How it works: on a few presented-frame milestones it reads the u64 at main+0x13130a0
+-// (REPORT-LAUNCHER-COSTUME-OVERRIDE.md section 2.4: a 24-byte registry entry associates
+-// the GameDataHolder string with that pointer slot; the slot is file-zero .bss, filled
+-// at runtime, so it is only a CLUE). If the slot is 0 or points nowhere useful the probe
+-// says so and falls back to a background heap scan for the costume name strings.
++// 0225 (log-101) found: the slot at main+0x13130a0 stably points at a registry object
++// (an array of 0xB0-byte records, REPORT-LOG101-DIAG-COSTUME-FIELD.md section 3), not
++// at the save data itself, and the save string pool sits in the heap (MarioHakama /
++// MarioExplorer found, but no hit could be confirmed as the equipped field). 0225b
++// adds two steps on top of everything 0225 does (kept unchanged): (a) follow the
++// registry pointers - at frames 600 and 7200, read each 0xB0 record's sub-object
++// pointers (record offsets +0x48..+0xA8, found by layout, never hardcoded) and the
++// record links (record offset +0x30), and scan the first 0x800 bytes of each
++// sub-object and record for the costume strings and u32 27/28; (b) pointer-value
++// scan - the heap thread identifies each name's pool copy (the save pool packs the
++// names NUL-terminated in alphabetical order, so the string before a pool hit is a
++// known neighbour: MarioExplorer before MarioHakama, MarioCaptain before
++// MarioExplorer) and then scans the heap for 8-byte pointer values equal to those
++// pool addresses, plus the u32 27/28 in the 0x1000 bytes around each pool string.
++// The pool addresses are found fresh every run: log-101's addresses move with ASLR,
++// so NOTHING from a past session is hardcoded. The heap scan now always runs at
++// frame 7200 (0225 only ran it when the slot path found nothing), because the
++// pointer scan needs the pool addresses from the string scan.
+ // Milestones are presented frames since the first present; the save is read at boot,
+ // before the title screen, so by frame 60 the GameDataHolder exists.
+ #define DIAG_COSTUME_SLOT 0x13130a0ull   // NSO vaddr of the GameDataHolder pointer slot (clue only)
+@@ -1103,27 +1116,144 @@ static void diag_costume_hex(const uint8_t *buf, size_t len, uint64_t base) {
+     }
+ }
+ 
++// Read len bytes at guest address base into win. Bulk vm_read_overwrite first (one
++// syscall for the whole window, whatever kind of guest page it is); if that fails
++// (the window straddles an unmapped page) fall back to 8-byte mem_read steps and
++// keep what was read. Returns bytes read (0 when the first byte is unreadable).
++static size_t diag_costume_read(uint64_t base, uint8_t *win, size_t len) {
++    vm_size_t got = 0;
++    if (vm_read_overwrite(mach_task_self(), (vm_address_t)base, (vm_size_t)len, (vm_address_t)(uintptr_t)win, &got) == KERN_SUCCESS && got == len)
++        return len;
++    size_t n = 0;
++    for (size_t off = 0; off < len; off += 8) {
++        uint64_t v = 0;
++        if (mem_read(base + off, 8, &v)) break;   // unreadable page: stop, keep what was read
++        memcpy(win + off, &v, 8);
++        n += 8;
++    }
++    if (!n) LOG("diag-costume: window unreadable at %#llx", (unsigned long long)base);
++    return n;
++}
++
+ // Read the GameDataHolder object window and scan it; hex-dump the first part when
+ // asked. Returns 1 if a costume string was found in the window.
+ static int diag_costume_object(uint64_t obj, int hex) {
+     uint8_t win[DIAG_COSTUME_WIN];
+     int found = 0;
+-    for (size_t off = 0; off < DIAG_COSTUME_WIN; off += 8) {
+-        uint64_t v = 0;
+-        if (mem_read(obj + off, 8, &v)) {   // unreadable page: stop, keep what was read
+-            LOG("diag-costume: object window unreadable at %#llx (+%#zx)", (unsigned long long)(obj + off), off);
+-            return 0;
++    size_t got = diag_costume_read(obj, win, DIAG_COSTUME_WIN);
++    if (!got) return 0;
++    diag_costume_scan(win, got, obj, &found);
++    if (hex) diag_costume_hex(win, got < DIAG_COSTUME_HEX ? got : DIAG_COSTUME_HEX, obj);
++    return found;
++}
++
++// 0225b (a): follow the registry pointers. The registry object is an array of
++// 0xB0-byte records (log-101, REPORT-LOG101-DIAG-COSTUME-FIELD.md section 3); each
++// record holds the data stores' sub-object pointers at offsets +0x48..+0xA8 and a
++// record link at +0x30. Both are found by LAYOUT, never by hardcoded addresses:
++// the sub-object pointers sit in a tight band that moves with ASLR, and the record
++// links point at other records in the same registry. A collected value is only a
++// candidate when it looks like a guest pointer (non-zero, above 4 GiB); anything
++// else at those offsets is skipped, and an unreadable target is logged and skipped.
++#define DIAG_COSTUME_SUB_MAX 64   // distinct sub-object pointers collected (log-101: ~33)
++#define DIAG_COSTUME_REC_MAX 8    // record links followed
++#define DIAG_COSTUME_REC_LEN 0xB0 // registry record size
++
++// Collect candidate sub-object pointers from one registry window by layout.
++static void diag_registry_collect(const uint8_t *win, size_t len, uint64_t *subs, int *nsub) {
++    for (size_t rec = 0; rec + 0xA8 < len; rec += DIAG_COSTUME_REC_LEN) {
++        for (size_t off = 0x48; off <= 0xA8; off += 8) {
++            uint64_t v; memcpy(&v, win + rec + off, 8);
++            if (v < 0x100000000ull) continue;   // not a guest pointer
++            int dup = 0;
++            for (int i = 0; i < *nsub; i++) if (subs[i] == v) { dup = 1; break; }
++            if (!dup && *nsub < DIAG_COSTUME_SUB_MAX) subs[(*nsub)++] = v;
+         }
+-        memcpy(win + off, &v, 8);
+     }
+-    diag_costume_scan(win, DIAG_COSTUME_WIN, obj, &found);
+-    if (hex) diag_costume_hex(win, DIAG_COSTUME_HEX, obj);
++}
++
++// Collect record links from one registry window by layout (the u64 at +0x30 of
++// each record points at another record in the same registry).
++static void diag_registry_links(const uint8_t *win, uint64_t base, size_t len, uint64_t *recs, int *nrec) {
++    for (size_t rec = 0; rec + 0x38 < len; rec += DIAG_COSTUME_REC_LEN) {
++        uint64_t v; memcpy(&v, win + rec + 0x30, 8);
++        if (v <= base || v >= base + 0x10000) continue;   // must point forward inside the registry
++        int dup = 0;
++        for (int i = 0; i < *nrec; i++) if (recs[i] == v) { dup = 1; break; }
++        if (!dup && *nrec < DIAG_COSTUME_REC_MAX) recs[(*nrec)++] = v;
++    }
++}
++
++// Scan the first 0x800 bytes of each distinct sub-object and each record linked
++// from the registry object, for the costume strings and u32 27/28. A string hit
++// hex-dumps the window so the field's context is visible. Returns 1 if a costume
++// string was found anywhere.
++static int diag_costume_registry(uint64_t reg) {
++    uint8_t win[DIAG_COSTUME_WIN];
++    int found = 0;
++    size_t got = diag_costume_read(reg, win, DIAG_COSTUME_WIN);
++    if (!got) return 0;
++    uint64_t subs[DIAG_COSTUME_SUB_MAX]; int nsub = 0;
++    uint64_t recs[DIAG_COSTUME_REC_MAX]; int nrec = 0;
++    diag_registry_collect(win, got, subs, &nsub);
++    diag_registry_links(win, reg, got, recs, &nrec);
++    LOG("diag-costume: registry %#llx: %d sub-object pointer(s), %d record link(s)", (unsigned long long)reg, nsub, nrec);
++    for (int i = 0; i < nrec; i++) {   // records first: they extend coverage past the first window
++        uint8_t rwin[DIAG_COSTUME_WIN];
++        size_t rgot = diag_costume_read(recs[i], rwin, DIAG_COSTUME_WIN);
++        if (!rgot) { LOG("diag-costume: record %#llx unreadable", (unsigned long long)recs[i]); continue; }
++        int rfound = 0;
++        diag_costume_scan(rwin, rgot, recs[i], &rfound);
++        LOG("diag-costume: record %#llx: read %#zx bytes, string hit: %s", (unsigned long long)recs[i], rgot, rfound ? "YES" : "no");
++        if (rfound) { found = 1; diag_costume_hex(rwin, rgot < DIAG_COSTUME_HEX ? rgot : DIAG_COSTUME_HEX, recs[i]); }
++        diag_registry_collect(rwin, rgot, subs, &nsub);   // later records may name more sub-objects
++    }
++    for (int i = 0; i < nsub; i++) {
++        uint8_t swin[DIAG_COSTUME_WIN];
++        size_t sgot = diag_costume_read(subs[i], swin, DIAG_COSTUME_WIN);
++        if (!sgot) { LOG("diag-costume: sub-object %#llx unreadable", (unsigned long long)subs[i]); continue; }
++        int sfound = 0;
++        diag_costume_scan(swin, sgot, subs[i], &sfound);
++        LOG("diag-costume: sub-object %#llx: read %#zx bytes, string hit: %s", (unsigned long long)subs[i], sgot, sfound ? "YES" : "no");
++        if (sfound) { found = 1; diag_costume_hex(swin, sgot < DIAG_COSTUME_HEX ? sgot : DIAG_COSTUME_HEX, subs[i]); }
++    }
+     return found;
+ }
+ 
+-// Background heap scan (only when the slot path found nothing): search the opened heap
+-// for the two costume name strings and log up to 16 hit addresses each, with 32 bytes
+-// of context. Runs off the presenting thread so a multi-GB heap never stalls a frame.
++// 0225b: is the string hit at `hit` the save string pool's copy of
++// diag_costume_names[s]? The pool packs the costume names NUL-terminated in
++// alphabetical order (REPORT-SAVEFILE-COSTUME-FIELD.md: Mario, MarioCaptain,
++// MarioExplorer, MarioHakama, MarioMechanic, MarioNew3DS, MarioSwimwear), so the
++// string immediately before a pool hit is a known neighbour (MarioExplorer before
++// MarioHakama, MarioCaptain before MarioExplorer) and the byte after the name is
++// NUL. RomFS paths ("/" before, "." after) and the length-prefixed costume list
++// (a length byte before the name) fail one of these checks.
++static const char *diag_costume_prev[2] = { "MarioExplorer", "MarioCaptain" };
++static int diag_is_pool_hit(uint64_t hit, int s) {
++    const char *name = diag_costume_names[s]; size_t nl = strlen(name);
++    uint8_t buf[96]; vm_size_t got = 0;
++    if (hit < 64) return 0;
++    if (vm_read_overwrite(mach_task_self(), (vm_address_t)(hit - 64), 96, (vm_address_t)(uintptr_t)buf, &got) || got != 96) return 0;
++    size_t at = 64;   // the hit starts at buf[64]
++    if (buf[at + nl] != 0) return 0;   // the byte after the name must be NUL
++    if (buf[at - 1] != 0) return 0;    // the byte before must end the previous string
++    size_t end = at - 1, start = end;   // the previous string is buf[start..end)
++    while (start > 0 && buf[start - 1] >= 0x20 && buf[start - 1] < 0x7f) start--;
++    const char *prev = diag_costume_prev[s]; size_t pl = strlen(prev);
++    return end - start == pl && !memcmp(buf + start, prev, pl);
++}
++
++// Background heap scan, always at frame 7200 (0225b: the pointer scan needs the
++// pool addresses the string scan finds). Three phases, all read-only, off the
++// presenting thread so a multi-GB heap never stalls a frame:
++//   1. the two costume name strings, up to 16 hits each, with 32 bytes of context
++//      (0225); each hit is checked for being the save string pool's copy.
++//   2. 8-byte pointer values equal to the pool string addresses: if the equipped
++//      field stores a string pointer, this directly locates the equipped
++//      clothes/cap fields (each should have 1-2 references). One pass, 8-byte
++//      aligned (a pointer field is aligned).
++//   3. u32 27/28 in the 0x1000 bytes around each pool string, in case the field
++//      stores an integer index near the pool.
+ static void *diag_heap_scan_thread(void *arg) {
+     (void)arg;
+     uint64_t hb = 0; size_t hopen = 0;
+@@ -1133,6 +1263,7 @@ static void *diag_heap_scan_thread(void *arg) {
+     const size_t CH = 1u << 20, OV = 15;   // 1 MB chunks, 15-byte overhang so a name straddling a boundary is still found
+     uint8_t *chunk = malloc(CH + OV);
+     if (!chunk) { LOG("diag-costume: heap scan: malloc failed"); return NULL; }
++    uint64_t pool[2] = { 0, 0 };   // pool string address per name, 0 if not identified
+     for (int s = 0; s < 2; s++) {
+         const char *name = diag_costume_names[s]; size_t nl = strlen(name);
+         int hits = 0;
+@@ -1159,6 +1290,10 @@ static void *diag_heap_scan_thread(void *arg) {
+                         for (int k = 0; k < 32; k++) q += (size_t)snprintf(hx + q, sizeof hx - q, "%02x ", ctx[k]);
+                         LOG("diag-costume: heap: context %#llx: %s", (unsigned long long)cs, hx);
+                     }
++                    if (!pool[s] && diag_is_pool_hit(hit, s)) {
++                        pool[s] = hit;
++                        LOG("diag-costume: heap: pool copy of \"%s\" at %#llx", name, (unsigned long long)hit);
++                    }
+                     hits++;
+                     i += nl;
+                 } else i++;
+@@ -1166,6 +1301,51 @@ static void *diag_heap_scan_thread(void *arg) {
+         }
+         LOG("diag-costume: heap scan: \"%s\": %d hit(s)", name, hits);
+     }
++    LOG("diag-costume: heap scan: pool: Hakama %#llx, Explorer %#llx", (unsigned long long)pool[0], (unsigned long long)pool[1]);
++    if (pool[0] || pool[1]) {
++        int phits[2] = { 0, 0 };
++        for (size_t off = 0; off < hopen; off += CH) {
++            if ((pool[0] == 0 || phits[0] >= 16) && (pool[1] == 0 || phits[1] >= 16)) break;
++            size_t n = hopen - off < CH ? hopen - off : CH;
++            vm_size_t got = 0;
++            if (vm_read_overwrite(mach_task_self(), (vm_address_t)(hb + off), (vm_size_t)n, (vm_address_t)(uintptr_t)chunk, &got) || got != n)
++                continue;   // unmapped chunk: skip it
++            for (size_t i = 0; i + 8 <= n; i += 8) {
++                uint64_t v; memcpy(&v, chunk + i, 8);
++                for (int s = 0; s < 2; s++) {
++                    if (!pool[s] || phits[s] >= 16 || v != pool[s]) continue;
++                    uint64_t hit = hb + off + i;
++                    LOG("diag-costume: heap: pointer to pool \"%s\" (%#llx) at %#llx", diag_costume_names[s], (unsigned long long)pool[s], (unsigned long long)hit);
++                    uint8_t ctx[32]; vm_size_t cg = 0;   // 16 bytes before, 16 after
++                    uint64_t cs = hit >= 16 ? hit - 16 : hit;
++                    if (!vm_read_overwrite(mach_task_self(), (vm_address_t)cs, 32, (vm_address_t)(uintptr_t)ctx, &cg) && cg == 32) {
++                        char hx[100]; size_t q = 0;
++                        for (int k = 0; k < 32; k++) q += (size_t)snprintf(hx + q, sizeof hx - q, "%02x ", ctx[k]);
++                        LOG("diag-costume: heap: context %#llx: %s", (unsigned long long)cs, hx);
++                    }
++                    phits[s]++;
++                }
++            }
++        }
++        for (int s = 0; s < 2; s++)
++            LOG("diag-costume: heap scan: pointer to pool \"%s\": %d hit(s)", diag_costume_names[s], phits[s]);
++        for (int s = 0; s < 2; s++) {
++            if (!pool[s]) continue;
++            uint64_t lo = pool[s] >= 0x800 ? pool[s] - 0x800 : 0;
++            uint8_t vic[0x1000]; vm_size_t got = 0;
++            if (vm_read_overwrite(mach_task_self(), (vm_address_t)lo, 0x1000, (vm_address_t)(uintptr_t)vic, &got) || got != 0x1000) {
++                LOG("diag-costume: heap: pool vicinity %#llx unreadable", (unsigned long long)lo);
++                continue;
++            }
++            for (size_t i = 0; i + 4 <= 0x1000; i += 4) {
++                uint32_t v; memcpy(&v, vic + i, 4);
++                if (v == 27 || v == 28)
++                    LOG("diag-costume: heap: pool vicinity u32 %u at %#llx", v, (unsigned long long)(lo + i));
++            }
++        }
++    } else {
++        LOG("diag-costume: heap scan: pool not identified, pointer scan skipped");
++    }
+     free(chunk);
+     LOG("diag-costume: heap scan done");
+     return NULL;
+@@ -1186,9 +1366,13 @@ static void diag_costume_probe(void) {
+             LOG("diag-costume: slot %#llx unreadable", (unsigned long long)(base + DIAG_COSTUME_SLOT));
+         else {
+             LOG("diag-costume: slot main+%#llx = %#llx", DIAG_COSTUME_SLOT, (unsigned long long)slot);
+-            if (slot) found |= diag_costume_object(slot, m == 1 || m == 4);
++            if (slot) {
++                found |= diag_costume_object(slot, m == 1 || m == 4);
++                if (m == 1 || m == 4) found |= diag_costume_registry(slot);   // 0225b (a): follow the registry pointers
++            }
+         }
+-        if (m == 4 && !found && !scan_started) {   // last milestone, slot path found nothing: scan the heap
++        if (m == 4) LOG("diag-costume: slot path done, costume string found: %s", found ? "YES" : "no");
++        if (m == 4 && !scan_started) {   // last milestone: heap scan always (0225b: the pointer scan needs the pool addresses)
+             scan_started = 1;
+             pthread_t th; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+             if (pthread_create(&th, &a, diag_heap_scan_thread, NULL)) LOG("[RED] diag-costume: cannot start heap scan thread");
+@@ -1202,7 +1386,7 @@ static void diag_costume_probe(void) {
+ void dm_cheats_present(void) {
+     atomic_store(&g_present_ns, now_ns());
+     cheats_pass();
+-    diag_costume_probe();   // 0225 diagnostic only: equipped-costume field probe (read-only)
++    diag_costume_probe();   // 0225b diagnostic only: equipped-costume field probe (read-only)
+ }
+ 
+ // The fixed ~60 Hz passes when the game is not presenting (window minimized, graphics suspended or before the first
+-- 
+2.43.0
+
