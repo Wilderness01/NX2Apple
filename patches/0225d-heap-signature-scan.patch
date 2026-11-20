@@ -1,0 +1,302 @@
+From 4bfbfea2b8f473ead2cf909034f8ff415d566bd0 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Fri, 20 Nov 2026 07:16:43 +0000
+Subject: [PATCH] 0225d: heap-wide signature scan for the SaveData object
+
+DIAGNOSTIC ONLY - remove before 0226, with DM_FS=1.
+
+Round 4 of the equipped-costume field probe. The constructor
+disassembly (REPORT-SAVEDATA-CONSTRUCTOR-DISASM.md) pinned what the
+earlier rounds were missing: capacity is exactly 0x40 for both fields,
+and the buffers are INLINE in the SaveData object (clothes string at
+O+0x72c, cap string at O+0x784), so there is no pointer-value scan to
+do. The scan finds the two current costume names anywhere in the guest
+heap (no 16-hit cap - log-103's cap truncated the search), derives the
+candidate object directly from each hit (clothes hit at A -> O = A-0x72c,
+cap hit at A -> O = A-0x784) and tests it against the STRICT signature:
+both buffer pointers equal the inline offsets, both buffers hold the
+expected names, both capacities exactly 0x40, both vtables exactly
+[main+0x1360748]+0x10 (the vtable global is read fresh at runtime).
+The same object is reached from both its strings; that convergence is
+logged. A MATCH is the SaveData object - its address is what 0226
+needs, and after a hit the pointer chain is moot (0226 can re-run this
+scan at each launch).
+
+- diag_savedata_heap_test: strict signature test, one log line per
+  candidate with the failing field (field-unreadable /
+  buffer-pointer-mismatch / buffer-mismatch / capacity-mismatch /
+  vtable-mismatch / MATCH); on MATCH the first 0x100 bytes are
+  hex-dumped.
+- diag_savedata_heap_thread: background thread (a full-heap scan must
+  not stall the presenting thread). Stage 1 scans the whole heap for
+  the two expected names (NUL-terminated hits only); Stage 3 derives
+  and tests each candidate, deduplicated across both directions.
+  Runs at frames 600 and 7200; skipped when a scan is already running
+  or a MATCH was already found.
+- 0225/0225b/0225c behaviour kept unchanged (milestones, slot read,
+  registry walk, 0225c registry/.data signature test, frame-7200 heap
+  scan). Read-only: every read goes through the guarded mem_read /
+  vm_read_overwrite paths; the probe writes nothing to game memory.
+
+Verified on the host by extraction: gcc -fsyntax-only -Wall -Wextra
+-Wpedantic clean against stubs, and a 14-case functional harness over
+the real extracted code passes (MATCH, both-directions convergence,
+clothes/cap content mismatch, capacity 0x20, vtable mismatch,
+buffer-pointer mismatch, unreadable vtable global, no hits, env /
+default / unset expected-name resolution, pool-copy + R-suffixed
+string distractors, skip-after-MATCH, skip-while-running).
+---
+ dm/host/hle_cheats.c | 209 ++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 207 insertions(+), 2 deletions(-)
+
+diff --git a/dm/host/hle_cheats.c b/dm/host/hle_cheats.c
+index 740958a..07a1d5c 100644
+--- a/dm/host/hle_cheats.c
++++ b/dm/host/hle_cheats.c
+@@ -1044,7 +1044,7 @@ static void cheats_pass(void) {
+     pthread_mutex_unlock(&g_lock);
+ }
+ 
+-// ---------- 0225c diagnostic: equipped-costume field probe, round 3 (DIAGNOSTIC ONLY) ----------
++// ---------- 0225d diagnostic: equipped-costume field probe, round 4 (DIAGNOSTIC ONLY) ----------
+ // Purpose: pin the in-memory equipped-costume field (GameDataHolder offset, and whether
+ // it stores a name string or an integer index) for the 0226 launcher-costume override.
+ // The save file says the equipped fields are CurrentCapName (value 27 = MarioExplorer)
+@@ -1088,6 +1088,28 @@ static void cheats_pass(void) {
+ // "default"), both capacities small positive (0x10..0x100), both vtables in
+ // the main module mapping. The first MATCH is the SaveData object and the
+ // path that reached it IS the pointer chain.
++// 0225d (this round) adds the heap-wide SaveData signature scan on top of
++// everything 0225/0225b/0225c does (kept unchanged - the 0225c registry/.data
++// test is cheap and its 0/96 result is already known, so it stays as a
++// baseline): the constructor disassembly (REPORT-SAVEDATA-CONSTRUCTOR-
++// DISASM.md) PINNED what the earlier rounds were missing - the capacity is
++// exactly 0x40 for both fields, and the buffers are INLINE in the SaveData
++// object (clothes string at O+0x72c, cap string at O+0x784), so there is no
++// pointer-value scan to do (log-103 already proved no pool pointer exists).
++// The scan finds the two current costume names anywhere in the guest heap
++// (no hit cap - log-103's 16-hit cap truncated the search), derives the
++// candidate object directly from each hit (clothes hit at A -> O = A-0x72c,
++// cap hit at A -> O = A-0x784) and tests it against the STRICT signature:
++// both buffer pointers must equal the inline offsets, both buffers must hold
++// the expected names, both capacities must be exactly 0x40, and both
++// vtables must equal [main+0x1360748]+0x10 (the vtable global is read fresh
++// at runtime - it is 0 in the file, filled by the loader). The same object
++// is reached from both its strings; that convergence is logged. A MATCH is
++// the SaveData object - its address is what 0226 needs, and after a hit the
++// pointer chain is moot (0226 can re-run this scan at each launch).
++// The scan runs on a background thread at frames 600 and 7200 (a full-heap
++// scan must not stall the presenting thread); it is skipped when a scan is
++// already running or a MATCH was already found.
+ // Milestones are presented frames since the first present; the save is read at boot,
+ // before the title screen, so by frame 60 the GameDataHolder exists.
+ #define DIAG_COSTUME_SLOT 0x13130a0ull   // NSO vaddr of the GameDataHolder pointer slot (clue only)
+@@ -1402,6 +1424,188 @@ static int diag_costume_savedata(uint64_t reg, uint64_t base) {
+     return matched;
+ }
+ 
++// 0225d: heap-wide SaveData signature scan (REPORT-SAVEDATA-CONSTRUCTOR-
++// DISASM.md section 5). The constructor pinned the exact layout: capacity
++// 0x40 for both fields, buffers INLINE (clothes O+0x72c, cap O+0x784), final
++// vtable [main+0x1360748]+0x10 for both. Stage 1 scans the whole guest heap
++// for the two current costume names (NUL-terminated hits only - a name that
++// is a prefix of a longer string, e.g. "MarioHakamaR", is not a buffer);
++// Stage 3 derives the candidate object from each hit and tests the STRICT
++// signature below. No pointer-value scan: the strings live inside the
++// object, so finding a string IS finding the object.
++#define DIAG_SAVEDATA_VT_GLOB   0x1360748ull   // .data global holding the capacity-0x40 string-class vtable base
++#define DIAG_SAVEDATA_CAP_EXACT 0x40           // capacity pinned by the ctor disassembly (both fields)
++#define DIAG_SAVEDATA_BUF_CLOTHES 0x72c        // inline clothes buffer offset (field +0x14)
++#define DIAG_SAVEDATA_BUF_CAP     0x784        // inline cap buffer offset (field +0x14)
++#define DIAG_SAVEDATA_HEAP_HIT_MAX 256         // string hits collected per name (the full count is still logged)
++
++// Test one candidate object O against the STRICT SaveData signature. Logs
++// one line with every field and the verdict, so every miss is diagnosable.
++// Returns 1 on MATCH (all of: both buffer pointers equal the inline
++// offsets, both buffers hold the expected names, both capacities exactly
++// 0x40, both vtables exactly [main+0x1360748]+0x10). On MATCH the first
++// 0x100 bytes of the object are hex-dumped: the object address IS the pin
++// 0226 needs.
++static int diag_savedata_heap_test(uint64_t o, const char *path, uint64_t base,
++                                   const char *exp_c, const char *exp_p, uint64_t exp_vt) {
++    (void)base;
++    uint64_t vt_c = 0, buf_c = 0, vt_p = 0, buf_p = 0, v = 0;
++    int32_t cap_c = 0, cap_p = 0;
++    int r_vt_c = mem_read(o + DIAG_SAVEDATA_OFF_CLOTHES, 8, &vt_c) == 0;
++    int r_buf_c = mem_read(o + DIAG_SAVEDATA_OFF_CLOTHES + 8, 8, &buf_c) == 0;
++    int r_cap_c = mem_read(o + DIAG_SAVEDATA_OFF_CLOTHES + 0x10, 4, &v) == 0;
++    if (r_cap_c) cap_c = (int32_t)(uint32_t)v;
++    int r_vt_p = mem_read(o + DIAG_SAVEDATA_OFF_CAP, 8, &vt_p) == 0;
++    int r_buf_p = mem_read(o + DIAG_SAVEDATA_OFF_CAP + 8, 8, &buf_p) == 0;
++    int r_cap_p = mem_read(o + DIAG_SAVEDATA_OFF_CAP + 0x10, 4, &v) == 0;
++    if (r_cap_p) cap_p = (int32_t)(uint32_t)v;
++    char sc[40] = "<n/a>", sp[40] = "<n/a>";
++    int ptr_c = r_buf_c && buf_c == o + DIAG_SAVEDATA_BUF_CLOTHES;
++    int ptr_p = r_buf_p && buf_p == o + DIAG_SAVEDATA_BUF_CAP;
++    int eq_c = ptr_c && diag_savedata_buf(buf_c, exp_c, sc, sizeof sc);
++    int eq_p = ptr_p && diag_savedata_buf(buf_p, exp_p, sp, sizeof sp);
++    int cap_ok = r_cap_c && r_cap_p && cap_c == DIAG_SAVEDATA_CAP_EXACT && cap_p == DIAG_SAVEDATA_CAP_EXACT;
++    int vt_ok = r_vt_c && r_vt_p && vt_c == exp_vt && vt_p == exp_vt;
++    const char *why;
++    int match = 0;
++    if (!r_vt_c || !r_buf_c || !r_cap_c || !r_vt_p || !r_buf_p || !r_cap_p) why = "field-unreadable";
++    else if (!ptr_c || !ptr_p) why = "buffer-pointer-mismatch";
++    else if (!eq_c || !eq_p) why = "buffer-mismatch";
++    else if (!cap_ok) why = "capacity-mismatch";
++    else if (!vt_ok) why = "vtable-mismatch";
++    else { why = "MATCH"; match = 1; }
++    LOG("diag-costume: savedata-heap %s O=%#llx vt_c=%#llx buf_c=%#llx \"%s\" cap_c=%d vt_p=%#llx buf_p=%#llx \"%s\" cap_p=%d exp_vt=%#llx -> %s",
++        path, (unsigned long long)o, (unsigned long long)vt_c, (unsigned long long)buf_c, sc, cap_c,
++        (unsigned long long)vt_p, (unsigned long long)buf_p, sp, cap_p, (unsigned long long)exp_vt, why);
++    if (match) {
++        uint8_t win[0x100];
++        size_t got = diag_costume_read(o, win, sizeof win);
++        if (got) diag_costume_hex(win, got, o);
++    }
++    return match;
++}
++
++static _Atomic int diag_savedata_heap_matched;   // a MATCH was found in an earlier run: later runs skip
++static _Atomic int diag_savedata_heap_running;   // a scan thread is running: do not start a second one
++
++// Background heap-wide signature scan: find the two expected names in the
++// guest heap, derive each candidate object from its hit, test the strict
++// signature. Read-only, off the presenting thread. arg is the main module
++// base (passed as a pointer-sized integer).
++static void *diag_savedata_heap_thread(void *arg) {
++    uint64_t base = (uint64_t)(uintptr_t)arg;
++    const char *exp_c, *exp_p, *src_c, *src_p;
++    diag_savedata_expected(&exp_c, &exp_p, &src_c, &src_p);
++    LOG("diag-costume: savedata-heap expected clothes=\"%s\" (%s) cap=\"%s\" (%s)", exp_c, src_c, exp_p, src_p);
++    uint64_t g748 = 0;
++    if (mem_read(base + DIAG_SAVEDATA_VT_GLOB, 8, &g748)) {
++        LOG("diag-costume: savedata-heap: vtable global %#llx unreadable", (unsigned long long)(base + DIAG_SAVEDATA_VT_GLOB));
++        atomic_store(&diag_savedata_heap_running, 0);
++        return NULL;
++    }
++    uint64_t exp_vt = g748 + 0x10;
++    LOG("diag-costume: savedata-heap: [main+%#llx] = %#llx, expected vtable %#llx",
++        DIAG_SAVEDATA_VT_GLOB, (unsigned long long)g748, (unsigned long long)exp_vt);
++    uint64_t hb = 0; size_t hopen = 0;
++    dm_guest_heap_range(&hb, &hopen);
++    if (!hb || !hopen) {
++        LOG("diag-costume: savedata-heap: no heap yet");
++        atomic_store(&diag_savedata_heap_running, 0);
++        return NULL;
++    }
++    LOG("diag-costume: savedata-heap scan: %#llx + %#zx", (unsigned long long)hb, hopen);
++    // Stage 1: heap-wide string scan for both expected names. Same chunk
++    // machine as the 0225b heap scan (1 MB chunks, 15-byte overhang so a
++    // name straddling a boundary is still found), but WITHOUT the 16-hit
++    // cap: every NUL-terminated hit is collected (up to the per-name cap
++    // below) and the full count is logged.
++    const size_t CH = 1u << 20, OV = 15;
++    uint8_t *chunk = malloc(CH + OV);
++    if (!chunk) {
++        LOG("diag-costume: savedata-heap: malloc failed");
++        atomic_store(&diag_savedata_heap_running, 0);
++        return NULL;
++    }
++    uint64_t hits[2][DIAG_SAVEDATA_HEAP_HIT_MAX];
++    int nhit[2] = { 0, 0 }, total[2] = { 0, 0 };
++    for (int s = 0; s < 2; s++) {
++        const char *name = s == 0 ? exp_c : exp_p; size_t nl = strlen(name);
++        for (size_t off = 0; off < hopen; off += CH) {
++            size_t n = hopen - off < CH ? hopen - off : CH;
++            size_t want = n + OV < hopen - off ? n + OV : hopen - off;
++            vm_size_t got = 0;
++            if (vm_read_overwrite(mach_task_self(), (vm_address_t)(hb + off), (vm_size_t)want, (vm_address_t)(uintptr_t)chunk, &got) || got != want) {
++                if (vm_read_overwrite(mach_task_self(), (vm_address_t)(hb + off), (vm_size_t)n, (vm_address_t)(uintptr_t)chunk, &got) || got != n)
++                    continue;   // unmapped chunk (heap grew/shrank): skip it
++                want = n;
++            }
++            for (size_t i = 0; i + nl + 1 <= want && i < n; ) {
++                uint8_t *p = memchr(chunk + i, (unsigned char)name[0], want - i);
++                if (!p) break;
++                i = (size_t)(p - chunk);
++                if (i < n && i + nl + 1 <= want && !memcmp(p, name, nl) && p[nl] == 0) {
++                    total[s]++;
++                    if (nhit[s] < DIAG_SAVEDATA_HEAP_HIT_MAX) hits[s][nhit[s]++] = hb + off + i;
++                    i += nl + 1;
++                } else i++;
++            }
++        }
++        LOG("diag-costume: savedata-heap: \"%s\": %d hit(s)%s", name, total[s],
++            total[s] > nhit[s] ? " (collection capped, hits beyond the cap untested)" : "");
++    }
++    // Stage 3: derive the candidate object from each hit and test the strict
++    // signature. A clothes hit at A gives O = A - 0x72c; a cap hit at A gives
++    // O = A - 0x784. The same object is reached from both its strings: test
++    // it once, and log the convergence (both directions landing on the same
++    // O is itself strong evidence).
++    uint64_t seen[2 * DIAG_SAVEDATA_HEAP_HIT_MAX]; int nseen = 0, tested = 0, matched = 0;
++    for (int s = 0; s < 2; s++) {
++        for (int i = 0; i < nhit[s]; i++) {
++            uint64_t o = hits[s][i] - (s == 0 ? DIAG_SAVEDATA_BUF_CLOTHES : DIAG_SAVEDATA_BUF_CAP);
++            int dup = 0;
++            for (int k = 0; k < nseen; k++) if (seen[k] == o) { dup = 1; break; }
++            if (dup) {
++                LOG("diag-costume: savedata-heap: O=%#llx reached from both the clothes and the cap hit (converged)", (unsigned long long)o);
++                continue;
++            }
++            if (nseen < 2 * DIAG_SAVEDATA_HEAP_HIT_MAX) seen[nseen++] = o;
++            char path[64];
++            snprintf(path, sizeof path, "heap-%s[%d]", s == 0 ? "clothes" : "cap", i);
++            tested++;
++            matched += diag_savedata_heap_test(o, path, base, exp_c, exp_p, exp_vt);
++        }
++    }
++    LOG("diag-costume: savedata-heap: tested %d candidate(s), %d match(es)", tested, matched);
++    if (matched) {
++        atomic_store(&diag_savedata_heap_matched, 1);
++        LOG("diag-costume: savedata-heap: MATCHED - SaveData object pinned, no further scan needed");
++    }
++    free(chunk);
++    atomic_store(&diag_savedata_heap_running, 0);
++    return NULL;
++}
++
++// Start the heap-wide SaveData signature scan on a background thread (a
++// full-heap scan must not stall the presenting thread). Called at frames
++// 600 and 7200; skipped when a scan is already running or a MATCH was
++// already found (the object address does not move within a session).
++static void diag_savedata_heap_start(uint64_t base) {
++    if (atomic_load(&diag_savedata_heap_matched)) {
++        LOG("diag-costume: savedata-heap: already matched, skipping");
++        return;
++    }
++    if (atomic_exchange(&diag_savedata_heap_running, 1)) {
++        LOG("diag-costume: savedata-heap: scan already running, skipping");
++        return;
++    }
++    pthread_t th; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
++    if (pthread_create(&th, &a, diag_savedata_heap_thread, (void *)(uintptr_t)base)) {
++        LOG("[RED] diag-costume: cannot start savedata heap scan thread");
++        atomic_store(&diag_savedata_heap_running, 0);
++    }
++    pthread_attr_destroy(&a);
++}
++
+ // 0225b: is the string hit at `hit` the save string pool's copy of
+ // diag_costume_names[s]? The pool packs the costume names NUL-terminated in
+ // alphabetical order (REPORT-SAVEFILE-COSTUME-FIELD.md: Mario, MarioCaptain,
+@@ -1553,6 +1757,7 @@ static void diag_costume_probe(void) {
+                 if (m == 1 || m == 4) {
+                     found |= diag_costume_registry(slot);   // 0225b (a): follow the registry pointers
+                     diag_costume_savedata(slot, base);   // 0225c: SaveData signature test
++                    diag_savedata_heap_start(base);      // 0225d: heap-wide signature scan (background thread)
+                 }
+             }
+         }
+@@ -1571,7 +1776,7 @@ static void diag_costume_probe(void) {
+ void dm_cheats_present(void) {
+     atomic_store(&g_present_ns, now_ns());
+     cheats_pass();
+-    diag_costume_probe();   // 0225c diagnostic only: equipped-costume field probe (read-only)
++    diag_costume_probe();   // 0225d diagnostic only: equipped-costume field probe (read-only)
+ }
+ 
+ // The fixed ~60 Hz passes when the game is not presenting (window minimized, graphics suspended or before the first
+-- 
+2.43.0
+
