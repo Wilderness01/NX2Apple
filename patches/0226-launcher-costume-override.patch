@@ -1,0 +1,937 @@
+From 5660fd74b55971f0f387f04b9057da6f6ec65eb7 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Fri, 20 Nov 2026 10:13:37 +0000
+Subject: [PATCH] 0226: launcher costume override (host per-frame write) +
+ Luigi full set + cover-flow picker + hero live preview
+
+---
+ dm/host/dm.h                  |   2 +
+ dm/host/hle_cheats.c          | 565 ++++++++++++++++++++++++++++++++++
+ dm/host/hle_fs.c              |  58 +++-
+ dm/ios/Sources/Launcher.swift | 152 ++++++---
+ 4 files changed, 727 insertions(+), 50 deletions(-)
+
+diff --git a/dm/host/dm.h b/dm/host/dm.h
+index 985a305..42a4bb2 100644
+--- a/dm/host/dm.h
++++ b/dm/host/dm.h
+@@ -155,6 +155,8 @@ void dm_guest_write_prepare(void *addr, size_t len);
+ void dm_guest_heap_range(uint64_t *base, size_t *open_len);   // hle_svc.c: the guest heap's base and opened length (guest addresses), 0 / 0 when none
+ int dm_guest_heap_read(uint64_t addr, void *out, size_t len);    // hle_svc.c: hole-free guest heap read for the cheat VM (under the memory lock); 0 = ok, 1 = a byte outside the opened span
+ int dm_guest_heap_write(uint64_t addr, const void *src, size_t len);   // hle_svc.c: hole-free guest heap write (the dirty tracking sees it first)
++int dm_fs_host_path(const char *guest, char *out, size_t n);   // hle_fs.c: host path for a guest path through the game's own resolver (the transactional work directory for a save mount)
++int dm_fs_save_file1_read_seen(void);   // hle_fs.c: the game opened save:/File1.bin for reading (0226 costume-locate trigger)
+ // Cheats (hle_cheats.c): Atmosphère-format cheat code files applied to the running game (docs/development.md "Cheats")
+ void dm_cheats_init(void);            // Called once in host_preload after loading the modules (main.c): reads DM_CHEATS and friends, loads the build's file
+ void dm_cheats_present(void);         // Per presented frame (hle_nvn.c presents): applies the enabled cheats once
+diff --git a/dm/host/hle_cheats.c b/dm/host/hle_cheats.c
+index b728052..54be0ac 100644
+--- a/dm/host/hle_cheats.c
++++ b/dm/host/hle_cheats.c
+@@ -1044,11 +1044,576 @@ static void cheats_pass(void) {
+     pthread_mutex_unlock(&g_lock);
+ }
+ 
++// ---------- 0226: launcher costume override (host per-frame write) ----------
++// The launcher pick (DM_CHAR_CAP / DM_CHAR_CLOTHES, set by CharSelectPersist.m
++// from DmCharSelect.cap / .clothes) is written into the game's equipped-costume
++// fields every presented frame, so the outfit the launcher picked is the outfit
++// the game loads -- no shop visit needed. This replaces the 0225/0225b/0225c/
++// 0225d read-only probes (deleted here) and the DM_FS=1 workflow env (deleted
++// from the workflow): the SaveData object is pinned, the probes are done.
++//
++// Pinned layout (constructor disassembly REPORT-SAVEDATA-CONSTRUCTOR-DISASM.md,
++// confirmed live by log-105's 0225d MATCH -- 20 candidates, 1 match):
++//   clothes field SaveData+0x718, cap field SaveData+0x770; each a string
++//   object {+0x00 vtable, +0x08 buffer, +0x10 s32 capacity}; buffers INLINE
++//   (clothes O+0x72c, cap O+0x784); capacity exactly 0x40 (64); both fields'
++//   vtable = [main+0x1360748]+0x10 (the global is 0 in the file, read live).
++//   Load (NSO 0x4c3c04) writes the buffers from the save file; commit (NSO
++//   0x4d1978) re-reads them and writes them back, so a host write persists to
++//   the save on the next commit without the host ever touching the file.
++//   The fields are plain strings: a pool-external name (Happi, Doctor,
++//   Gunman, 64) writes fine; whether the model lookup accepts it is decided
++//   by the device test (first round: pick a pool-external name).
++//
++// Location -- the gap the probes left: the object holds the SAVE's equipped
++// names at scan time, and the launcher pick is usually different, so the scan
++// cannot use the env names. It reads the save file instead: the host parses
++// save:/File1.bin (proper key-table walk -- the keys CurrentCapName /
++// CurrentClothName are resolved through the 180-entry key table, the value
++// entries are found by key index, the string is decoded through the pool;
++// REPORT-SAVEFILE-COSTUME-FIELD.md) and scans the heap for THOSE names. If
++// the save cannot be read or parsed (or a slot is empty), it falls back to
++// the env names (the launcher==save case the probes used). The scan starts
++// when the game opens save:/File1.bin for reading (hle_fs.c sets a flag on
++// that open -- the load fills the buffers right after it, and the costume
++// files are not opened until the kingdom load, ~30 s later, so there is
++// ample margin) and retries until it finds exactly one full match or a
++// 150 s deadline, with frame 600 as a backstop trigger if the flag never
++// fires. 0 or >=2 full matches means log and write nothing. The heap holds
++// at least three SaveData-shaped objects (log-105: two decoys pass every
++// check except name content), so the scan requires BOTH buffers to hold the
++// current names plus the full strict signature, tests every candidate, and
++// never trusts a single name or heap-address proximity.
++//
++// Write: every presented frame, once located, the launcher pick is copied as
++// name+NUL into the EXISTING inline buffers (clamped to capacity-1 = 63
++// chars), clothes and cap both; buffer pointers are never replaced, the save
++// file is never touched. Env semantics (CharSelectPersist.m): unset = follow
++// the save (do not write); "default" = the character's own default part,
++// which in the save's Mario namespace is the bare name "Mario" (the redirect
++// serves the character's own default file for it); otherwise a costume name
++// from the launcher's lists (validated against the whitelist below -- an
++// unknown value is logged and not written).
++// Only Super Mario Odyssey (program 0x0100000000010000) runs this: the
++// layout is that game's binary.
++#define COSTUME_SMO_PROGRAM   0x0100000000010000ull   // Super Mario Odyssey title ID
++#define COSTUME_OFF_CLOTHES   0x718   // clothes string object in SaveData
++#define COSTUME_OFF_CAP       0x770   // cap string object in SaveData
++#define COSTUME_BUF_CLOTHES   0x72c   // inline clothes buffer (field +0x14)
++#define COSTUME_BUF_CAP       0x784   // inline cap buffer (field +0x14)
++#define COSTUME_CAPACITY      0x40    // capacity pinned by the ctor (both fields)
++#define COSTUME_NAME_MAX      63      // capacity-1: longest name written
++#define COSTUME_VT_GLOBAL     0x1360748ull   // .data global: capacity-0x40 string-class vtable base
++#define COSTUME_HEAP_HIT_MAX  256     // string hits collected per name (the full count is still logged)
++#define COSTUME_LOCATE_NS     (150ull * 1000000000ull)   // locate-thread deadline: 150 s from its start
++#define COSTUME_FRAME_BACKSTOP 600     // start the locate thread at this presented frame at the latest
++
++static _Atomic uint64_t g_costume_obj;       // SaveData object address once located (0 = not yet)
++static _Atomic int g_costume_started;        // the locate thread was started (never restarted)
++static _Atomic int g_costume_locating;       // a locate thread is running now
++static _Atomic int g_costume_smo = -1;       // -1 unknown, 0 not Odyssey, 1 Odyssey
++
++// The launcher's costume ids (dm/ios/Sources/Launcher.swift dmOutfitCaps /
++// dmOutfitClothes, generated from there -- keep in sync). A pick that is not
++// in its slot's list is never written: a stale or mistyped UserDefaults value
++// must not reach the game's model lookup.
++static const char *costume_cap_names[50] = {
++    "Mario64", "Mario64Metal", "MarioAloha", "MarioArmor", "MarioArmorWestern", "MarioBandman",
++    "MarioBatter", "MarioClown", "MarioColorClassic", "MarioColorGold", "MarioColorLuigi", "MarioColorWaluigi",
++    "MarioColorWario", "MarioConductor", "MarioCook", "MarioDiddyKong", "MarioDoctor", "MarioDot3d",
++    "MarioExplorer", "MarioFootball", "MarioGolf", "MarioGunman", "MarioHappi", "MarioHariet",
++    "MarioKoopa", "MarioMaker", "MarioMechanic", "MarioNew3DS", "MarioPainter", "MarioPeach",
++    "MarioPilot", "MarioPirate", "MarioPoncho", "MarioPrimitiveMan", "MarioRacer", "MarioRango",
++    "MarioSailor", "MarioSanta", "MarioSatellite", "MarioScientist", "MarioShopman", "MarioSnowSuit",
++    "MarioSpaceSuit", "MarioSpewart", "MarioSuit", "MarioSunshine", "MarioSwimwear", "MarioTailCoat",
++    "MarioTopper", "MarioZombie",
++};
++static const char *costume_clothes_names[52] = {
++    "Mario64", "Mario64Metal", "MarioAloha", "MarioArmor", "MarioArmorWestern", "MarioBandman",
++    "MarioBatter", "MarioBone", "MarioClown", "MarioColorClassic", "MarioColorGold", "MarioColorLuigi",
++    "MarioColorWaluigi", "MarioColorWario", "MarioConductor", "MarioCook", "MarioDiddyKong", "MarioDoctor",
++    "MarioExplorer", "MarioFootball", "MarioGolf", "MarioGunman", "MarioHakama", "MarioHappi",
++    "MarioHariet", "MarioKoopa", "MarioMaker", "MarioMechanic", "MarioNew3DS", "MarioPainter",
++    "MarioPeach", "MarioPilot", "MarioPirate", "MarioPoncho", "MarioPrimitiveMan", "MarioRacer",
++    "MarioRango", "MarioSailor", "MarioSanta", "MarioSatellite", "MarioScientist", "MarioShopman",
++    "MarioSnowSuit", "MarioSpaceSuit", "MarioSpewart", "MarioSuit", "MarioSunshine", "MarioSwimwear",
++    "MarioTailCoat", "MarioTopper", "MarioUnderwear", "MarioZombie",
++};
++
++static int costume_name_ok(const char *name, int is_cap) {
++    if (!name || !*name) return 0;
++    // The bare name "Mario" is the default outfit for both slots (the
++    // "default" pick maps to it, and a save holding the default holds it).
++    // It is not a launcher list entry, so it is accepted here, not in the
++    // arrays below (which mirror Launcher.swift exactly).
++    if (!strcmp(name, "Mario")) return 1;
++    const char **list = is_cap ? costume_cap_names : costume_clothes_names;
++    size_t n = is_cap ? sizeof costume_cap_names / sizeof *costume_cap_names
++                      : sizeof costume_clothes_names / sizeof *costume_clothes_names;
++    for (size_t i = 0; i < n; i++) if (!strcmp(name, list[i])) return 1;
++    return 0;
++}
++
++// ---------- save file: the object's current names ----------
++// File1.bin format (REPORT-SAVEFILE-COSTUME-FIELD.md, read-only here -- the
++// host never writes the file): [CRC32(bytes[4..]) @0x00][version=1 @0x04]
++// [size @0x08][key table: 180 u32 @0x24, each a string offset relative to
++// 0x20][string pool][value entries: 8 bytes [key:u24][type:u8][value:u32],
++// type 0xa0 = string, value = pool index - 176, 0 = empty]. The pool is
++// stored as TWO runs of NUL-terminated strings, not one contiguous run:
++// the key names right after the key table (179 strings), then -- after a
++// binary offset table -- the value strings (232 strings). The pool index
++// counts across both runs in file order, and the value strings start two
++// strings into the second run (the run's first two strings sort before the
++// pool's value strings), so a string value v decodes to the second run's
++// (v-1)-th string. Verified against four anchors on the real save:
++// value 16 -> ForestWorldHomeStage, 25 -> Mario, 27 -> MarioExplorer,
++// 28 -> MarioHakama. The parser walks the key table by NAME (never by
++// assumed key index or file offset -- the value offsets 0x59b4/0x59bc from
++// the report are this save's, not the format's), finds each value entry by
++// key index, and decodes the string through the value run. A decoded name
++// must be a valid costume name for its slot, or the parse fails (a wrong
++// run or index decodes to some other game string, never a costume name).
++// Returns 1 when both names were resolved (each may be "" = empty slot).
++//
++// Find the value-string run: the second maximal run of back-to-back
++// NUL-terminated printable strings (each 1..64 chars) in the file. The
++// first run is the key names; the second is the value strings. Returns 1
++// and fills *start (file offset of the run's first string) and *count.
++static int costume_find_value_run(const uint8_t *data, size_t len, size_t *start, size_t *count) {
++    size_t runs[4][2]; int nruns = 0;
++    size_t i = 0;
++    while (i < len) {
++        size_t k = i, c = 0;
++        while (k < len) {
++            if (data[k] < 0x20 || data[k] > 0x7e) break;   // NUL or non-printable ends the run
++            size_t j = k;
++            while (j < len && j - k < 64 && data[j] >= 0x20 && data[j] <= 0x7e) j++;
++            if (j >= len || data[j] != 0) break;   // no NUL terminator within 64 bytes
++            c++;
++            k = j + 1;
++        }
++        if (c >= 3 && nruns < 4) { runs[nruns][0] = i; runs[nruns][1] = c; nruns++; }
++        i = k > i ? k : i + 1;
++    }
++    if (nruns < 2) return 0;
++    *start = runs[1][0]; *count = runs[1][1];
++    return 1;
++}
++
++// Decode a string value to its name through the value-string run.
++// value 0 = empty (not decoded here); a value above 232 cannot be a pool
++// index (the pool has 409 strings, value = pool index - 176, so the largest
++// value string is 409 - 176 = 232). Returns 1 on success.
++static int costume_value_string(const uint8_t *data, size_t len, uint32_t value, char *out, size_t outn) {
++    if (value == 0 || value > 232) return 0;
++    size_t start, count;
++    if (!costume_find_value_run(data, len, &start, &count)) return 0;
++    size_t idx = (size_t)value - 1;   // the run starts two strings before the pool's value section
++    if (idx >= count) return 0;
++    size_t p = start;
++    for (size_t i = 0; i < idx; i++) {   // walk to the idx-th string in the run
++        while (p < len && data[p]) p++;
++        if (p >= len) return 0;
++        p++;
++    }
++    if (p >= len || !data[p]) return 0;
++    size_t k = 0;
++    while (p < len && data[p] && k + 1 < outn) out[k++] = (char)data[p++];
++    out[k] = 0;
++    if (p >= len || data[p]) return 0;   // ran off the end, or the string did not fit
++    return 1;
++}
++
++static int costume_save_key_index(const uint8_t *data, size_t len, const char *want) {
++    if (len < 0x24 + 180u * 4u) return -1;
++    for (int i = 0; i < 180; i++) {
++        uint32_t off;
++        memcpy(&off, data + 0x24 + (size_t)i * 4, 4);
++        size_t at = 0x20 + (size_t)off;   // key-name offsets are relative to 0x20
++        if (at >= len) continue;
++        size_t k = 0;
++        while (want[k] && at + k < len && data[at + k] == (uint8_t)want[k]) k++;
++        if (!want[k] && at + k < len && !data[at + k]) return i;
++    }
++    return -1;
++}
++
++static int costume_save_entry_value(const uint8_t *data, size_t len, int key, uint32_t *value) {
++    // Find the value entry for `key`: 8 bytes [key:u24 LE][type:u8][value:u32 LE].
++    // The entries live after the string pool, but their segment offset is not
++    // part of the format's fixed skeleton, so they are found by scanning for
++    // the key+type pattern (one byte at a time -- the entries are 8-byte
++    // aligned from the file start, but the scan does not assume it). There
++    // must be exactly one string entry per key with a plausible value (0 =
++    // empty, 1..232 = a pool index): a second one, or a value outside that
++    // range, means the file is not shaped like the parsed format.
++    uint8_t pat[4] = { (uint8_t)(key & 0xff), (uint8_t)((key >> 8) & 0xff),
++                       (uint8_t)((key >> 16) & 0xff), 0xa0 };
++    int found = 0; uint32_t v = 0;
++    if (len < 8) return 0;
++    for (size_t i = 0; i + 8 <= len; i++) {
++        if (!memcmp(data + i, pat, 4)) {
++            uint32_t val; memcpy(&val, data + i + 4, 4);
++            if (val > 232) continue;   // not a plausible string value: a chance pattern, not an entry
++            if (found) return 0;
++            found = 1; v = val;
++        }
++    }
++    if (!found) return 0;
++    *value = v;
++    return 1;
++}
++
++static int costume_save_parse(const uint8_t *data, size_t len, char *cap, size_t capn, char *clothes, size_t clothesn) {
++    if (len < 0x24 + 180u * 4u) return 0;
++    uint32_t version; memcpy(&version, data + 4, 4);
++    if (version != 1) return 0;
++    int ki_cap = costume_save_key_index(data, len, "CurrentCapName");
++    int ki_clothes = costume_save_key_index(data, len, "CurrentClothName");
++    if (ki_cap < 0 || ki_clothes < 0) return 0;
++    uint32_t v_cap, v_clothes;
++    if (!costume_save_entry_value(data, len, ki_cap, &v_cap)) return 0;
++    if (!costume_save_entry_value(data, len, ki_clothes, &v_clothes)) return 0;
++    // Value 0 = empty slot. Otherwise decode through the value-string run
++    // and require a valid costume name for the slot: a wrong run or index
++    // decodes to some other game string, which the whitelist rejects.
++    cap[0] = 0; clothes[0] = 0;
++    if (v_cap) {
++        if (!costume_value_string(data, len, v_cap, cap, capn)) return 0;
++        if (!costume_name_ok(cap, 1)) return 0;
++    }
++    if (v_clothes) {
++        if (!costume_value_string(data, len, v_clothes, clothes, clothesn)) return 0;
++        if (!costume_name_ok(clothes, 0)) return 0;
++    }
++    return 1;
++}
++
++// Read save:/File1.bin through the host path the game itself reads (the
++// transactional work directory, not the committed one) and parse it.
++// Returns 1 when both equipped names were resolved.
++static int costume_save_read(char *cap, size_t capn, char *clothes, size_t clothesn) {
++    char host[1024];
++    if (!dm_fs_host_path("save:/File1.bin", host, sizeof host)) return 0;
++    FILE *f = fopen(host, "rb");
++    if (!f) return 0;
++    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
++    long end = ftell(f);
++    if (end <= 0 || end > (long)(4u << 20)) { fclose(f); return 0; }   // a save file is ~2 MB
++    size_t len = (size_t)end;
++    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return 0; }
++    uint8_t *data = malloc(len);
++    if (!data) { fclose(f); return 0; }
++    size_t got = fread(data, 1, len, f);
++    fclose(f);
++    int ok = got == len && costume_save_parse(data, len, cap, capn, clothes, clothesn);
++    free(data);
++    return ok;
++}
++
++// ---------- location: heap scan for the SaveData object ----------
++// The strict signature (0225d's, unchanged in substance): O is the SaveData
++// object iff both buffer pointers are exactly the inline offsets, both
++// buffers hold the expected names, both capacities are exactly 0x40, and
++// both vtables equal the runtime-read [main+0x1360748]+0x10. The fields are
++// reported back for the MATCH log line.
++typedef struct {
++    uint64_t vt_c, buf_c, vt_p, buf_p;
++    int32_t cap_c, cap_p;
++    char str_c[64], str_p[64];
++} costume_fields_t;
++
++static int costume_buf_read(uint64_t buf, char *out, size_t outn) {
++    uint8_t win[COSTUME_CAPACITY];
++    if (guest_page_read(buf, win, sizeof win) != 0) return 0;
++    size_t k = 0;
++    while (k < sizeof win && win[k]) k++;
++    if (k >= sizeof win) return 0;   // no NUL in the whole buffer: not a costume name
++    size_t n = k < outn - 1 ? k : outn - 1;
++    memcpy(out, win, n); out[n] = 0;
++    return 1;
++}
++
++static int costume_object_test(uint64_t o, const char *exp_c, const char *exp_p, uint64_t exp_vt, costume_fields_t *f) {
++    uint64_t v = 0;
++    memset(f, 0, sizeof *f);
++    int r_vt_c = mem_read(o + COSTUME_OFF_CLOTHES, 8, &f->vt_c) == 0;
++    int r_buf_c = mem_read(o + COSTUME_OFF_CLOTHES + 8, 8, &f->buf_c) == 0;
++    int r_cap_c = mem_read(o + COSTUME_OFF_CLOTHES + 0x10, 4, &v) == 0;
++    if (r_cap_c) f->cap_c = (int32_t)(uint32_t)v;
++    int r_vt_p = mem_read(o + COSTUME_OFF_CAP, 8, &f->vt_p) == 0;
++    int r_buf_p = mem_read(o + COSTUME_OFF_CAP + 8, 8, &f->buf_p) == 0;
++    int r_cap_p = mem_read(o + COSTUME_OFF_CAP + 0x10, 4, &v) == 0;
++    if (r_cap_p) f->cap_p = (int32_t)(uint32_t)v;
++    int ptr_c = r_buf_c && f->buf_c == o + COSTUME_BUF_CLOTHES;
++    int ptr_p = r_buf_p && f->buf_p == o + COSTUME_BUF_CAP;
++    int eq_c = ptr_c && costume_buf_read(f->buf_c, f->str_c, sizeof f->str_c) && !strcmp(f->str_c, exp_c);
++    int eq_p = ptr_p && costume_buf_read(f->buf_p, f->str_p, sizeof f->str_p) && !strcmp(f->str_p, exp_p);
++    int cap_ok = r_cap_c && r_cap_p && f->cap_c == COSTUME_CAPACITY && f->cap_p == COSTUME_CAPACITY;
++    int vt_ok = r_vt_c && r_vt_p && f->vt_c == exp_vt && f->vt_p == exp_vt;
++    return ptr_c && ptr_p && eq_c && eq_p && cap_ok && vt_ok;
++}
++
++// One heap scan pass: find both expected names in the guest heap, derive a
++// candidate object from each hit, test the strict signature. Returns the
++// number of full matches (0, 1, or more; -1 when there is no heap yet);
++// when exactly 1, *match is the object address. The same chunk machine as
++// the 0225d probe (1 MB chunks, 15-byte overhang so a name straddling a
++// boundary is still found), without its 16-hit cap: every NUL-terminated
++// hit is collected (up to the per-name cap) and the full count is logged.
++static int costume_heap_scan(const char *exp_c, const char *exp_p, uint64_t exp_vt,
++                             uint64_t *match, int *tested) {
++    *match = 0; *tested = 0;
++    uint64_t hb = 0; size_t hopen = 0;
++    dm_guest_heap_range(&hb, &hopen);
++    if (!hb || !hopen) return -1;
++    const size_t CH = 1u << 20, OV = 15;
++    uint8_t *chunk = malloc(CH + OV);
++    if (!chunk) return -1;
++    uint64_t hits[2][COSTUME_HEAP_HIT_MAX];
++    int nhit[2] = { 0, 0 }, total[2] = { 0, 0 };
++    for (int s = 0; s < 2; s++) {
++        const char *name = s == 0 ? exp_c : exp_p; size_t nl = strlen(name);
++        for (size_t off = 0; off < hopen; off += CH) {
++            size_t n = hopen - off < CH ? hopen - off : CH;
++            size_t want = n + OV < hopen - off ? n + OV : hopen - off;
++            vm_size_t got = 0;
++            if (vm_read_overwrite(mach_task_self(), (vm_address_t)(hb + off), (vm_size_t)want, (vm_address_t)(uintptr_t)chunk, &got) || got != want) {
++                if (vm_read_overwrite(mach_task_self(), (vm_address_t)(hb + off), (vm_size_t)n, (vm_address_t)(uintptr_t)chunk, &got) || got != n)
++                    continue;   // unmapped chunk (heap grew/shrank): skip it
++                want = n;
++            }
++            for (size_t i = 0; i + nl + 1 <= want && i < n; ) {
++                uint8_t *p = memchr(chunk + i, (unsigned char)name[0], want - i);
++                if (!p) break;
++                i = (size_t)(p - chunk);
++                if (i < n && i + nl + 1 <= want && !memcmp(p, name, nl) && p[nl] == 0) {
++                    total[s]++;
++                    if (nhit[s] < COSTUME_HEAP_HIT_MAX) hits[s][nhit[s]++] = hb + off + i;
++                    i += nl + 1;
++                } else i++;
++            }
++        }
++        if (total[s] > nhit[s])
++            LOG("[dm] costume: locate: \"%s\": %d hit(s) (collection capped at %d, hits beyond the cap untested)",
++                name, total[s], nhit[s]);
++    }
++    uint64_t seen[2 * COSTUME_HEAP_HIT_MAX]; int nseen = 0, nmatch = 0;
++    uint64_t first = 0;
++    for (int s = 0; s < 2; s++) {
++        for (int i = 0; i < nhit[s]; i++) {
++            uint64_t o = hits[s][i] - (s == 0 ? COSTUME_BUF_CLOTHES : COSTUME_BUF_CAP);
++            int dup = 0;
++            for (int k = 0; k < nseen; k++) if (seen[k] == o) { dup = 1; break; }
++            if (dup) continue;   // reached from both its strings: test once
++            if (nseen < 2 * COSTUME_HEAP_HIT_MAX) seen[nseen++] = o;
++            costume_fields_t f;
++            (*tested)++;
++            if (costume_object_test(o, exp_c, exp_p, exp_vt, &f)) {
++                nmatch++;
++                if (!first) first = o;
++                LOG("[dm] costume: locate: MATCH O=%#llx vt_c=%#llx buf_c=%#llx \"%s\" cap_c=%d vt_p=%#llx buf_p=%#llx \"%s\" cap_p=%d exp_vt=%#llx",
++                    (unsigned long long)o, (unsigned long long)f.vt_c, (unsigned long long)f.buf_c, f.str_c, f.cap_c,
++                    (unsigned long long)f.vt_p, (unsigned long long)f.buf_p, f.str_p, f.cap_p, (unsigned long long)exp_vt);
++            }
++        }
++    }
++    LOG("[dm] costume: locate: \"%s\" %d hit(s), \"%s\" %d hit(s); tested %d candidate(s), %d match(es)",
++        exp_c, total[0], exp_p, total[1], *tested, nmatch);
++    if (nmatch == 1) *match = first;
++    free(chunk);
++    return nmatch;
++}
++
++// Resolve one env value to a scannable name: "default" is the bare name
++// "Mario"; a whitelisted costume name is itself; unset (or an unknown
++// value) resolves to nothing. Used only by the locate fallback.
++static int costume_env_to_name(const char *env, int is_cap, char *out, size_t outn) {
++    if (!env || !*env) return 0;
++    if (!strcmp(env, "default")) { snprintf(out, outn, "Mario"); return 1; }
++    if (!costume_name_ok(env, is_cap)) return 0;
++    snprintf(out, outn, "%s", env);
++    return 1;
++}
++
++// Resolve the two names to scan for this pass. Returns 1 when both are
++// known. Source 1 is the save file (the object's actual contents); source
++// 2 is the env (the launcher pick; "default" means the bare name "Mario").
++// A slot with no known name blocks the scan -- a single name is not enough
++// (log-105's decoys: one holds the current clothes name with an empty cap,
++// the other the current cap name with a different clothes name).
++static int costume_expected_names(char *exp_c, size_t exp_cn, char *exp_p, size_t exp_pn, const char **src) {
++    char save_cap[64] = "", save_clothes[64] = "";
++    if (costume_save_read(save_cap, sizeof save_cap, save_clothes, sizeof save_clothes)
++        && save_cap[0] && save_clothes[0]) {
++        snprintf(exp_c, exp_cn, "%s", save_clothes);
++        snprintf(exp_p, exp_pn, "%s", save_cap);
++        *src = "save";
++        return 1;
++    }
++    char rc[64], rp[64];
++    if (!costume_env_to_name(getenv("DM_CHAR_CLOTHES"), 0, rc, sizeof rc)) return 0;
++    if (!costume_env_to_name(getenv("DM_CHAR_CAP"), 1, rp, sizeof rp)) return 0;
++    snprintf(exp_c, exp_cn, "%s", rc);
++    snprintf(exp_p, exp_pn, "%s", rp);
++    *src = "env";
++    return 1;
++}
++
++// Background locate thread: retry the heap scan until exactly one full
++// match is found or the deadline passes. arg is the main module base
++// (passed as a pointer-sized integer). The object does not move within a
++// session, so one MATCH is enough; the address is cached and the thread
++// never runs again.
++static void *costume_locate_thread(void *arg) {
++    uint64_t base = (uint64_t)(uintptr_t)arg;
++    uint64_t deadline = now_ns() + COSTUME_LOCATE_NS;
++    int pass = 0;
++    char last_src[16] = "";
++    for (;;) {
++        pass++;
++        char exp_c[64], exp_p[64]; const char *src = NULL;
++        if (!costume_expected_names(exp_c, sizeof exp_c, exp_p, sizeof exp_p, &src)) {
++            if (pass == 1)
++                LOG("[dm] costume: locate: no scannable names yet (save unreadable or a slot empty, env unset/invalid); retrying");
++            if (now_ns() >= deadline) break;
++            usleep(1000000);
++            continue;
++        }
++        if (strcmp(src, last_src)) {
++            snprintf(last_src, sizeof last_src, "%s", src);
++            LOG("[dm] costume: locate: expected clothes=\"%s\" cap=\"%s\" (from %s)", exp_c, exp_p, src);
++        }
++        uint64_t g748 = 0;
++        if (mem_read(base + COSTUME_VT_GLOBAL, 8, &g748) || !g748) {
++            if (pass == 1) LOG("[dm] costume: locate: vtable global unreadable/zero; retrying");
++            if (now_ns() >= deadline) break;
++            usleep(1000000);
++            continue;
++        }
++        uint64_t exp_vt = g748 + 0x10;
++        uint64_t match = 0; int tested = 0;
++        int nmatch = costume_heap_scan(exp_c, exp_p, exp_vt, &match, &tested);
++        if (nmatch < 0) {
++            if (pass == 1) LOG("[dm] costume: locate: no heap yet; retrying");
++        } else if (nmatch == 1) {
++            atomic_store(&g_costume_obj, match);
++            LOG("[dm] costume: located SaveData object %#llx (clothes=\"%s\" cap=\"%s\", tested %d candidate(s))",
++                (unsigned long long)match, exp_c, exp_p, tested);
++            break;
++        } else {
++            LOG("[dm] costume: locate: %d match(es) (tested %d) -- not writing", nmatch, tested);
++        }
++        if (now_ns() >= deadline) break;
++        usleep(1000000);
++    }
++    if (!atomic_load(&g_costume_obj))
++        LOG("[dm] costume: locate: deadline reached, object not located; no writes this session");
++    atomic_store(&g_costume_locating, 0);
++    return NULL;
++}
++
++// Start the locate thread on a background thread (a full-heap scan must not
++// stall the presenting thread). Runs at most once per launch.
++static void costume_locate_start(uint64_t base) {
++    if (atomic_load(&g_costume_started)) return;
++    atomic_store(&g_costume_started, 1);
++    if (atomic_exchange(&g_costume_locating, 1)) return;
++    pthread_t th; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
++    if (pthread_create(&th, &a, costume_locate_thread, (void *)(uintptr_t)base)) {
++        LOG("[RED] costume: cannot start locate thread");
++        atomic_store(&g_costume_locating, 0);
++    }
++    pthread_attr_destroy(&a);
++}
++
++// ---------- write: the launcher pick, every presented frame ----------
++// Resolve one env value to a write target. Returns 1 and fills `out` when
++// the value says to write a name; 0 when unset (follow the save) or invalid
++// (logged once per distinct bad value, never written).
++static int costume_pick_target(const char *env, int is_cap, char *out, size_t outn) {
++    static char bad_cap[64], bad_clothes[64];   // last invalid value logged per slot
++    if (!env || !*env) return 0;   // unset: follow the save
++    if (!strcmp(env, "default")) { snprintf(out, outn, "Mario"); return 1; }
++    if (!costume_name_ok(env, is_cap)) {
++        char *bad = is_cap ? bad_cap : bad_clothes;
++        if (strcmp(env, bad)) {
++            snprintf(bad, sizeof bad_cap, "%s", env);
++            LOG("[dm] costume: ignoring unknown %s pick \"%s\" (not a costume name); following the save",
++                is_cap ? "cap" : "clothes", env);
++        }
++        return 0;
++    }
++    snprintf(out, outn, "%s", env);
++    return 1;
++}
++
++// Copy name+NUL into the inline buffer at `buf` (capacity COSTUME_CAPACITY,
++// clamped to capacity-1). The write itself runs every presented frame; the
++// log fires once per distinct value written.
++static void costume_write_buf(uint64_t buf, const char *name, int is_cap) {
++    static char wrote_cap[64], wrote_clothes[64];   // last value written per slot
++    static int write_failed_logged;
++    char *wrote = is_cap ? wrote_cap : wrote_clothes;
++    size_t nl = strlen(name);
++    if (nl > COSTUME_NAME_MAX) nl = COSTUME_NAME_MAX;   // clamp to capacity-1 (63)
++    char tmp[COSTUME_CAPACITY];
++    memcpy(tmp, name, nl); tmp[nl] = 0;
++    if (guest_page_write(buf, tmp, nl + 1) != 0) {
++        if (!write_failed_logged) {
++            write_failed_logged = 1;
++            LOG("[RED] costume: write to %#llx failed", (unsigned long long)buf);
++        }
++        return;
++    }
++    write_failed_logged = 0;
++    if (strcmp(name, wrote)) {
++        snprintf(wrote, sizeof wrote_cap, "%s", name);
++        LOG("[dm] costume: wrote %s \"%s\" into %#llx", is_cap ? "cap" : "clothes", name, (unsigned long long)buf);
++    }
++}
++
++static void costume_override_write(uint64_t obj) {
++    char want_c[64], want_p[64];
++    if (costume_pick_target(getenv("DM_CHAR_CLOTHES"), 0, want_c, sizeof want_c))
++        costume_write_buf(obj + COSTUME_BUF_CLOTHES, want_c, 0);
++    if (costume_pick_target(getenv("DM_CHAR_CAP"), 1, want_p, sizeof want_p))
++        costume_write_buf(obj + COSTUME_BUF_CAP, want_p, 1);
++}
++
++// Per presented frame (called from dm_cheats_present, replacing the 0225d
++// probe): start the locate thread once the save has been read (or at the
++// frame-600 backstop), then apply the launcher pick every frame once the
++// object is located. Runs for Odyssey only.
++static void costume_override_present(void) {
++    int smo = atomic_load(&g_costume_smo);
++    if (smo < 0) {
++        smo = dm_profile() && dm_profile()->program_id == COSTUME_SMO_PROGRAM ? 1 : 0;
++        atomic_store(&g_costume_smo, smo);
++        if (!smo) return;
++    } else if (!smo) return;
++    static uint64_t frame;
++    frame++;
++    uint64_t obj = atomic_load(&g_costume_obj);
++    if (!obj) {
++        if (!atomic_load(&g_costume_started) &&
++            (dm_fs_save_file1_read_seen() || frame >= COSTUME_FRAME_BACKSTOP)) {
++            uint64_t base = 0;
++            if (g_main_mod) base = (uint64_t)(uintptr_t)g_main_mod->base;
++            if (base) costume_locate_start(base);
++        }
++        return;
++    }
++    costume_override_write(obj);
++}
++
+ // Per presented frame (hle_nvn.c dump_frame): apply the cheats and note the present, so the idle thread stands down
+ // (brief: once per presented frame; the idle thread only when it is not presenting)
+ void dm_cheats_present(void) {
+     atomic_store(&g_present_ns, now_ns());
+     cheats_pass();
++    costume_override_present();   // 0226: launcher costume override (host per-frame write)
+ }
+ 
+ // The fixed ~60 Hz passes when the game is not presenting (window minimized, graphics suspended or before the first
+diff --git a/dm/host/hle_fs.c b/dm/host/hle_fs.c
+index 557b20c..132ab92 100644
+--- a/dm/host/hle_fs.c
++++ b/dm/host/hle_fs.c
+@@ -456,6 +456,17 @@ static int host_path_ex(const char *p, char *out, size_t n, int *ro, int create)
+     errno = ENOENT; return 0;
+ }
+ static int host_path(const char *p, char *out, size_t n, int *ro) { return host_path_ex(p, out, n, ro, 0); }
++// 0226: the host path for a guest path, through the same resolver the game
++// reads through (the transactional work directory for a save mount, not the
++// committed one). The costume locate thread (hle_cheats.c) reads
++// save:/File1.bin through this to get the equipped names the SaveData
++// object holds at scan time.
++int dm_fs_host_path(const char *guest, char *out, size_t n) { return host_path(guest, out, n, NULL); }
++// 0226: set when the game opens save:/File1.bin for reading on a
++// transactional save mount: the SaveData object is filled from it right
++// after, so the costume locate thread can start (hle_cheats.c reads it).
++static _Atomic int g_costume_save_read;
++int dm_fs_save_file1_read_seen(void) { return atomic_load(&g_costume_save_read); }
+ static int set_guest_name(const char *hp, const char *path) {
+     char fwd[1024]; path = fwd_slashes(path, fwd, sizeof fwd);
+     const char *end = path + strlen(path); while (end > path && end[-1] == '/') end--;
+@@ -1008,7 +1019,10 @@ static int dm_char_redirect(const char *p, char *out, size_t n) {
+     // ToadCap in the overlay) ARE safe -- their FMDL is "MarioCap" with
+     // the full byml set -- so the character swap (ch + "Cap") keeps
+     // working.
+-    char cand[2][256];
++    // 0226: four candidates at most -- a slot candidate, up to two Mario
++    // fallbacks for a non-Mario character (body reskin + stock body), and
++    // the character default.
++    char cand[4][256];
+     int ncand = 0;
+     if (is_family) {
+         // 0216 (log-84): a part-less file with a non-body core (see
+@@ -1103,6 +1117,31 @@ static int dm_char_redirect(const char *p, char *out, size_t n) {
+             else
+                 snprintf(cand[ncand], sizeof cand[0], "%s%s%s", ch, slot + 5, part);
+             ncand++;
++            // 0226: for a non-Mario character, the Mario body/cap/2D reskins
++            // are the fallback after the character's own slot file (Luigi
++            // ships no Mario-costume files, so ch+slot never hits for him
++            // and the pick was silently dropped). The body takes the reskin
++            // first, then the stock costume body -- the base body loader
++            // accepts a Mario FMDL in a Mario file (log-69: Mario.szs ->
++            // LuigiColorWario.szs, inner MarioColorLuigi, worked). Cap and
++            // 2D take the reskin ONLY, never the stock file: the stock cap
++            // crashes the base request (0218, log-84/85: the cap loader
++            // looks "MarioCap" up by name, NULL+8 at main+0x66d6d8) and the
++            // stock 2D reintroduces Path C (0224, log-97: the 2D loader
++            // looks "Mario2D" up by name). Other parts take no Mario
++            // candidate: the ch+part fallback below keeps the character's
++            // own head/face (LuigiHead.szs is in the overlay). Hands never
++            // reach here (0222 guard above).
++            if (strcmp(ch, "Mario")) {
++                if (!plen) {
++                    snprintf(cand[ncand], sizeof cand[0], "Mario%sR", slot + 5); ncand++;
++                    snprintf(cand[ncand], sizeof cand[0], "Mario%s", slot + 5); ncand++;
++                } else if (!strcmp(part, "Cap")) {
++                    snprintf(cand[ncand], sizeof cand[0], "Mario%s%sR", slot + 5, part); ncand++;
++                } else if (!strcmp(part, "2D")) {
++                    snprintf(cand[ncand], sizeof cand[0], "Mario%s%sR", slot + 5, part); ncand++;
++                }
++            }
+         }
+         snprintf(cand[ncand], sizeof cand[0], "%s%s", ch, part); ncand++;
+     } else if (core_len) {
+@@ -1169,6 +1208,23 @@ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Re
+     { const char *c = strchr(path, ':'); size_t ln = c ? (size_t)(c - path) : 0; uint16_t token = 0;
+       for (int i = 0; c && i < g_nmnt; i++) if (mnt_is(&g_mnt[i], path, ln) && g_mnt[i].txn_root >= 0) { token = (uint16_t)(g_mnt[i].txn_root + 1); break; }
+       atomic_store(&g_ftxn[fd], token); }
++    // 0226: the game opened its save file for reading on a transactional
++    // save mount. The SaveData object is filled from it right after, so
++    // the costume locate thread (hle_cheats.c) can start; the load fills
++    // the buffers long before the costume files are opened at the kingdom
++    // load, so the margin is ample. The mount name is matched, not
++    // assumed -- the path names it ("save:/File1.bin", log-105).
++    if (!(mode & (MODE_WRITE | MODE_APPEND))) {
++        const char *c = strchr(path, ':');
++        size_t ln = c ? (size_t)(c - path) : 0;
++        for (int i = 0; c && i < g_nmnt; i++) {
++            if (mnt_is(&g_mnt[i], path, ln) && g_mnt[i].txn_root >= 0 &&
++                (!strcmp(c + 1, "/File1.bin") || !strcmp(c + 1, "File1.bin"))) {
++                atomic_store(&g_costume_save_read, 1);
++                break;
++            }
++        }
++    }
+     fslog_init();
+     if (g_fslog && fd < 4096) { pthread_mutex_lock(&g_fslog_lock); free(g_fdpath[fd]); g_fdpath[fd] = strdup(path); pthread_mutex_unlock(&g_fslog_lock); }
+     if (g_flag.fs) LOG("fs open [%.2fs] %s mode=%d → fd %d", (now_ns() - g_t0_ns) / 1e9, path, mode, fd);
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index 2b0df7b..4b83124 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -377,13 +377,6 @@ private let dmWarioOutfits: [(id: String, name: String)] = [
+     ("MarioPrimitiveMan", "\u{539f}\u{59cb}\u{4eba}"),
+ ]
+ 
+-// Luigi's clothes (0194): 3. He has no cap files at all, so his cap is always the default.
+-private let dmLuigiClothes: [(id: String, name: String)] = [
+-    ("MarioColorLuigi", "\u{8def}\u{6613}\u{5409}"),
+-    ("MarioColorWaluigi", "\u{74e6}\u{8def}\u{6613}\u{5409}"),
+-    ("MarioColorWario", "\u{74e6}\u{529b}\u{6b27}"),
+-]
+-
+ /// One outfit in the grid (0194, 0201): `id` is the value written to DmCharSelect.cap / DmCharSelect.clothes (a Mario-prefixed ItemName, or "default" for the character's own default part); `image` is the bundled real-render filename (of_<character>_<id>.png, nil when no render exists — the card then shows the name in text); `name` is the Chinese label on the card (the game's own ItemCloth.msbt name, suffix stripped).
+ private struct DeckItem: Identifiable {
+     let id: String
+@@ -397,17 +390,15 @@ private func dmOutfitImageName(character: String, id: String) -> String {
+     return "of_\(character)_" + base
+ }
+ 
+-/// The grid's list for a character and a slot (0194, 0201). The first entry is always "default". Mario gets all 50 caps + 52 clothes; Luigi gets his 3 clothes and default-only caps; Wario gets his 8 costumes in each slot; Peach, Pauline and Toad get default only for now. The card image is the real render of_<character>_<id>.png; the default card uses of_<character>_default (only Mario's exists — the rest fall back to a text-only card).
++/// The grid's list for a character and a slot (0194, 0201, 0226). The first entry is always "default". Mario gets all 50 caps + 52 clothes; Luigi gets Mario's full set too (0226: he is a 28-bone Mario-skeleton reskin -- Mario body geometry + Luigi head -- so the Mario renders and the Mario body reskins serve him, and the host write makes the pick stick); Wario gets his 8 costumes in each slot; Peach, Pauline and Toad get default only for now. The card image is the real render of_<character>_<id>.png; the default card uses of_<character>_default (only Mario's exists — the rest fall back to a text-only card).
+ private func dmDeckItems(character: String, caps: Bool) -> [DeckItem] {
+     var items: [DeckItem] = [DeckItem(id: "default", image: "of_\(character)_default", name: "\u{9ed8}\u{8ba4}")]
+     switch character {
+-    case "mario":
++    case "mario", "luigi":
++        // Luigi uses Mario's renders (of_luigi_* has only 3 files; of_mario_*
++        // has all 53): the card faces are the same Mario renders for both.
+         let src = caps ? dmOutfitCaps : dmOutfitClothes
+         items += src.map { DeckItem(id: $0.id, image: dmOutfitImageName(character: "mario", id: $0.id), name: $0.name) }
+-    case "luigi":
+-        if !caps {
+-            items += dmLuigiClothes.map { DeckItem(id: $0.id, image: dmOutfitImageName(character: "luigi", id: $0.id), name: $0.name) }
+-        }
+     case "wario":
+         items += dmWarioOutfits.map { DeckItem(id: $0.id, image: dmOutfitImageName(character: "wario", id: $0.id), name: $0.name) }
+     default:
+@@ -441,11 +432,21 @@ private struct FoilBackground: View {
+     }
+ }
+ 
+-/// The outfit grid (0201, flat — replaces the 0194 stacked deck): a scrollable grid of cards, one per outfit the character can wear, laid out like the user's flat-grid mockup — title "<character>的服装", subtitle "只显示<character>能穿的衣服", four columns, foil background on every card, a real 3D render above the Chinese name, gold border on the worn one. No stacking: the deck's swipe-to-cycle hid the outfits, and its tap-to-select never fired — DragGesture's default minimumDistance is 10pt, so a stationary tap never activated the gesture and selectFront() never ran, which is why the user could never change clothes and it always stayed default. A plain Button tap selects now, and the worn card is visible in the grid at all times.
++/// The outfit picker (0201 flat grid, 0226 cover-flow): a horizontal scroll
++/// of cards in the MNG Launcher style -- the center card is large and
++/// front-facing, the side cards rotate in 3D with perspective and carry a
++/// reflection below the render, and a tap wears the outfit and scrolls it to
++/// the center. Title "<character>的服装", subtitle "只显示<character>能穿的衣服",
++/// with a cap/clothes switch. No rotation/turntable (cancelled 2026-11-20):
++/// the cards tilt with scroll position only, they never spin. The hero
++/// preview lives in CharacterPickerView: every tap, tab switch and character
++/// change reports the current item through onSelect, so the hero shows the
++/// last-tapped outfit's render.
+ private struct OutfitGridView: View {
+     let characterId: String
+     let characterName: String
+     let scale: CGFloat
++    let onSelect: (DeckItem) -> Void
+     @State private var capsMode: Bool = true
+     @State private var cap: String = UserDefaults.standard.string(forKey: "DmCharSelect.cap") ?? "default"
+     @State private var clothes: String = UserDefaults.standard.string(forKey: "DmCharSelect.clothes") ?? "default"
+@@ -455,6 +456,9 @@ private struct OutfitGridView: View {
+     private var effectiveSelectedId: String {
+         items.contains { $0.id == selectedId } ? selectedId : "default"
+     }
++    private var effectiveItem: DeckItem {
++        items.first(where: { $0.id == effectiveSelectedId }) ?? items[0]
++    }
+ 
+     private func select(_ item: DeckItem) {
+         if capsMode {
+@@ -464,6 +468,7 @@ private struct OutfitGridView: View {
+             clothes = item.id
+             UserDefaults.standard.set(item.id, forKey: "DmCharSelect.clothes")
+         }
++        onSelect(item)
+     }
+ 
+     var body: some View {
+@@ -486,55 +491,93 @@ private struct OutfitGridView: View {
+                 .pickerStyle(.segmented)
+                 .frame(width: 130 * scale)
+             }
+-            // Grid: four columns, scrollable; a tap on a card wears it.
+-            ScrollView {
+-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8 * scale), count: 4), spacing: 8 * scale) {
+-                    ForEach(items) { item in
+-                        gridCard(item)
++            // Cover-flow: horizontal scroll; the center card is large and
++            // front-facing, the side cards tilt in 3D. A tap wears the
++            // outfit and scrolls it to the center. The leading/trailing
++            // padding is half the visible width minus half a card, so the
++            // first and last cards can be scrolled to the center too.
++            GeometryReader { outer in
++                ScrollViewReader { proxy in
++                    ScrollView(.horizontal, showsIndicators: false) {
++                        HStack(spacing: 10 * scale) {
++                            ForEach(items) { item in
++                                coverCard(item, proxy: proxy, centerX: outer.size.width / 2)
++                                    .id(item.id)
++                            }
++                        }
++                        .padding(.horizontal, max(0, outer.size.width / 2 - 65 * scale))
+                     }
++                    .coordinateSpace(name: "coverflow")
++                    .onAppear { proxy.scrollTo(effectiveSelectedId, anchor: .center) }
+                 }
+             }
++            .frame(height: 178 * scale)
+         }
++        .onChange(of: capsMode) { _, _ in onSelect(effectiveItem) }
++        .onChange(of: characterId) { _, _ in onSelect(effectiveItem) }
++        .onAppear { onSelect(effectiveItem) }
+     }
+ 
+-    private func gridCard(_ item: DeckItem) -> some View {
++    private func coverCard(_ item: DeckItem, proxy: ScrollViewProxy, centerX: CGFloat) -> some View {
+         let selected = item.id == effectiveSelectedId
+-        return Button { select(item) } label: {
+-            ZStack {
+-                RoundedRectangle(cornerRadius: 14 * scale)
+-                    .fill(Color(red: 0.15, green: 0.19, blue: 0.26))
+-                FoilBackground(animated: false)
+-                VStack(spacing: 4 * scale) {
+-                    if let img = item.image.flatMap(dmOutfitImage) {
+-                        Image(uiImage: img)
+-                            .resizable()
+-                            .scaledToFit()
+-                            .frame(maxHeight: 78 * scale)
++        return GeometryReader { geo in
++            // Distance from the scroll view's center, -1 (left edge) to +1
++            // (right edge): the tilt and the shrink both follow it. A card
++            // to the right faces left (toward the center) and vice versa.
++            let delta = (geo.frame(in: .named("coverflow")).midX - centerX) / max(centerX, 1)
++            let angle = max(-35, min(35, delta * 35))
++            let shrink = 1 - min(abs(delta) * 0.22, 0.22)
++            Button {
++                select(item)
++                withAnimation { proxy.scrollTo(item.id, anchor: .center) }
++            } label: {
++                ZStack {
++                    RoundedRectangle(cornerRadius: 14 * scale)
++                        .fill(Color(red: 0.15, green: 0.19, blue: 0.26))
++                    FoilBackground(animated: false)
++                    VStack(spacing: 2 * scale) {
++                        if let img = item.image.flatMap(dmOutfitImage) {
++                            Image(uiImage: img)
++                                .resizable()
++                                .scaledToFit()
++                                .frame(maxHeight: 92 * scale)
++                            // Reflection: the render flipped vertically, fading out.
++                            Image(uiImage: img)
++                                .resizable()
++                                .scaledToFit()
++                                .frame(maxHeight: 26 * scale)
++                                .scaleEffect(x: 1, y: -1)
++                                .mask(LinearGradient(colors: [.white.opacity(0.35), .clear], startPoint: .top, endPoint: .bottom))
++                        }
++                        Text(item.name)
++                            .font(.system(size: 14 * scale, weight: .semibold))
++                            .foregroundStyle(.white)
++                            .lineLimit(1)
++                            .minimumScaleFactor(0.7)
+                     }
+-                    Text(item.name)
+-                        .font(.system(size: 14 * scale, weight: .semibold))
+-                        .foregroundStyle(.white)
+-                        .lineLimit(1)
+-                        .minimumScaleFactor(0.7)
++                    .padding(.vertical, 8 * scale)
++                    .padding(.horizontal, 4 * scale)
+                 }
+-                .padding(.vertical, 8 * scale)
+-                .padding(.horizontal, 4 * scale)
++                .frame(height: 178 * scale)
++                .clipShape(RoundedRectangle(cornerRadius: 14 * scale))
++                .overlay(
++                    RoundedRectangle(cornerRadius: 14 * scale)
++                        .stroke(selected ? Color(red: 0.95, green: 0.75, blue: 0.25) : Color.white.opacity(0.15), lineWidth: selected ? 3 * scale : 1)
++                )
+             }
+-            .frame(height: 118 * scale)
+-            .clipShape(RoundedRectangle(cornerRadius: 14 * scale))
+-            .overlay(
+-                RoundedRectangle(cornerRadius: 14 * scale)
+-                    .stroke(selected ? Color(red: 0.95, green: 0.75, blue: 0.25) : Color.white.opacity(0.15), lineWidth: selected ? 3 * scale : 1)
+-            )
++            .buttonStyle(.plain)
++            .rotation3DEffect(.degrees(angle), axis: (x: 0, y: 1, z: 0), perspective: 0.6)
++            .scaleEffect(shrink)
+         }
+-        .buttonStyle(.plain)
++        .frame(width: 130 * scale, height: 178 * scale)
+     }
+ }
+ 
+-/// The character picker (0194, 0201, 0209, in the box): the hero on the left and the flat outfit grid on the right, the six character cards in a row at the bottom. The choice is saved to DmCharSelect.character (NSUserDefaults), which dm_char_select_apply_saved reads at startup before the game starts, so the next launch plays as the picked character. The roster is Mario / Luigi / Wario / Peach / Pauline / Toad; the hero and the grid follow the pick. Pauline and Toad need their model patches (0193) to play in-game — the picker itself only writes the name.
++/// The character picker (0194, 0201, 0209, 0226, in the box): the hero on the left and the outfit picker on the right, the six character cards in a row at the bottom. The choice is saved to DmCharSelect.character (NSUserDefaults), which dm_char_select_apply_saved reads at startup before the game starts, so the next launch plays as the picked character. The roster is Mario / Luigi / Wario / Peach / Pauline / Toad; the hero and the picker follow the pick. Pauline and Toad need their model patches (0193) to play in-game — the picker itself only writes the name. The hero is a live preview (0226): it shows the last-tapped outfit's render, and the character promo art for "default" or before any tap. Cap + clothes cannot be composited (the renders are single-item), so the hero shows one item at a time.
+ private struct CharacterPickerView: View {
+     let scale: CGFloat
+     @State private var selected: String = UserDefaults.standard.string(forKey: "DmCharSelect.character") ?? "mario"
++    @State private var heroOutfitImage: String? = nil   // nil = the character promo art; otherwise an outfit render name
+ 
+     private struct CharEntry: Identifiable {
+         let id: String
+@@ -554,15 +597,26 @@ private struct CharacterPickerView: View {
+ 
+     var body: some View {
+         VStack(spacing: 6 * scale) {
+-            // Top row (0209): the hero is back. 0201 dropped it when the stacked deck became a flat grid, but the settled design keeps the big image next to the clothes — "大图330宽" in the mockup is 330 mockup pixels, i.e. 170pt at 2x, the 0194 frame. Hero on the left in a fixed frame (so a narrow render like Peach or Pauline does not move the grid), grid on the right; both follow the picked character. The grid keeps 4 columns and scrolls; the character cards stay pinned at the bottom.
++            // Top row (0209, 0226): the hero is back. 0201 dropped it when the stacked deck became a flat grid, but the settled design keeps the big image next to the clothes — "大图330宽" in the mockup is 330 mockup pixels, i.e. 170pt at 2x, the 0194 frame. Hero on the left in a fixed frame (so a narrow render like Peach or Pauline does not move the picker), picker on the right; both follow the picked character. The hero is a live preview (0226): it shows the last-tapped outfit's render, the promo art for "default".
+             HStack(alignment: .top, spacing: 12 * scale) {
+-                if let img = dmCharImage(current.image) {
++                if let hero = heroOutfitImage, let img = dmOutfitImage(hero) {
+                     Image(uiImage: img)
+                         .resizable()
+                         .scaledToFit()
+                         .frame(width: 170 * scale, height: 190 * scale)
++                } else if let img = dmCharImage(current.image) {
++                    Image(uiImage: img)
++                        .resizable()
++                        .scaledToFit()
++                        .frame(width: 170 * scale, height: 190 * scale)
++                }
++                OutfitGridView(characterId: current.id, characterName: current.name, scale: scale) { item in
++                    // "default" -> the promo art; otherwise the tapped
++                    // outfit's render (for Luigi, a Mario render). A nil
++                    // image (no render for the outfit) falls back to the
++                    // promo art too.
++                    heroOutfitImage = item.id == "default" ? nil : item.image
+                 }
+-                OutfitGridView(characterId: current.id, characterName: current.name, scale: scale)
+             }
+             // Cards: one row, left to right. The selected card gets a gold ring.
+             HStack(spacing: 8 * scale) {
+-- 
+2.43.0
+
