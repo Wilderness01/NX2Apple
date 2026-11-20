@@ -1,4 +1,4 @@
-From c8d088cd8efec9bfbfb1d7b3508b4cb27f9327d8 Mon Sep 17 00:00:00 2001
+From 3534297e8825e8ecaefdcbfe123ac75bcd43fdbd Mon Sep 17 00:00:00 2001
 From: seedds <seedds@gmail.com>
 Date: Fri, 20 Nov 2026 12:29:48 +0000
 Subject: [PATCH] 0227: launcher cartridge cover-flow picker (second style)
@@ -36,7 +36,7 @@ index f4cf4086..8357c569 100644
  - The silent first minute of sound.
  - development.md calls SDK 7.3.2 "the oldest so far"; Mario Kart 8 Deluxe (SDK 4.4.0) is older now.
 diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
-index 4b831249..038f114d 100644
+index 4b831249..730ba1ad 100644
 --- a/dm/ios/Sources/Launcher.swift
 +++ b/dm/ios/Sources/Launcher.swift
 @@ -255,6 +255,16 @@ private func dmOutfitImage(_ name: String) -> UIImage? {
@@ -366,7 +366,7 @@ index 4b831249..038f114d 100644
 +                                .scaledToFit()
 +                                .padding(.horizontal, 5 * u)
 +                                .padding(.bottom, 2 * u)
-+                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomCenter)
++                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
 +                                .rotationEffect(.degrees(index % 2 == 0 ? -1.3 : 1.0))
 +                                .shadow(color: Color(red: 0.039, green: 0.024, blue: 0.016).opacity(0.45), radius: 4 * u, x: 0, y: 4 * u)
 +                        } else {
