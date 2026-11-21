@@ -1,0 +1,184 @@
+From b0127d34fd9402855a9bd62f3cdc3bbee4666352 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Sat, 21 Nov 2026 05:54:26 +0000
+Subject: [PATCH] 0231: cartridge cover-flow tap on the card frame; one-card
+ detents with haptic tick
+
+---
+ dm/ios/Sources/Launcher.swift | 123 ++++++++++++++++++++++++++--------
+ 1 file changed, 94 insertions(+), 29 deletions(-)
+
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index 24c8f6e0..f3d614c1 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -629,6 +629,37 @@ private struct DmGrain: View {
+ /// state only: tapping wears the outfit (onSelect) and toggles the lid;
+ /// a second tap on the same card closes it, a tap on another card moves
+ /// the open lid there.
++///
++/// (0231) Switch-like detents for the cartridge flow: one flick moves
++/// at most one card, with a haptic tick per step. `.viewAligned` snaps
++/// to the nearest card but lets a hard flick fly past several; a toggle
++/// switch never does that. A slow release keeps the nearest snap — the
++/// content is already where the finger left it, so clamping it back
++/// would fight the drag. Only a real flick (release velocity above the
++/// threshold) is clamped to one step from the card centered at release.
++/// `startX` is the content x of item 0's center: the leading padding
++/// centers the first card too, so it is max(cardWidth/2, viewport/2).
++private struct DmCartridgeDetentBehavior: ScrollTargetBehavior {
++    let pitch: CGFloat
++    let cardWidth: CGFloat
++    let itemCount: Int
++    let startX: CGFloat
++    let centeredIndex: Int
++
++    func updateTarget(_ target: inout ScrollTarget, context: TargetContext) {
++        guard itemCount > 1, pitch > 0 else { return }
++        let proposed = min(max(Int(round((target.rect.midX - startX) / pitch)), 0), itemCount - 1)
++        guard abs(context.velocity.x) > 250 else { return }
++        guard abs(proposed - centeredIndex) > 1 else { return }
++        let step = proposed > centeredIndex ? 1 : -1
++        let next = min(max(centeredIndex + step, 0), itemCount - 1)
++        let cx = startX + CGFloat(next) * pitch
++        target.rect = CGRect(x: cx - cardWidth / 2, y: target.rect.origin.y,
++                             width: cardWidth, height: target.rect.height)
++        target.anchor = .center
++    }
++}
++
+ private struct CartridgeCoverFlowView: View {
+     let characterId: String
+     let characterName: String
+@@ -684,6 +715,17 @@ private struct CartridgeCoverFlowView: View {
+         }
+     }
+ 
++    /// (0231) Sibling paint order for the cover-flow: the centered
++    /// card paints above its neighbours. This must sit on the
++    /// LazyHStack child (the card's frame) — the zIndex that used to
++    /// sit on the rotated stack inside the card only ordered views
++    /// within that card and did nothing for the siblings.
++    private func cardZIndex(_ item: DeckItem) -> Double {
++        let center = items.firstIndex(where: { $0.id == (centeredId ?? effectiveSelectedId) }) ?? 0
++        let idx = items.firstIndex(where: { $0.id == item.id }) ?? 0
++        return Double(200 - abs(idx - center) * 10)
++    }
++
+     var body: some View {
+         VStack(alignment: .leading, spacing: 8 * scale) {
+             // Header: title + subtitle + cap/clothes switch (same as classic).
+@@ -713,31 +755,42 @@ private struct CartridgeCoverFlowView: View {
+             }
+             // Cover-flow: the cartridge cards tilt in 3D with scroll
+             // position; the nearest card snaps to the center
+-            // (.scrollPosition + .viewAligned). The pitch is at least a
+-            // card wide plus a gap (0229): the old clamp(width/6.4, 74,
+-            // 112) put adjacent centers closer than the card width, so
+-            // the neighbors covered the centered cartridge's edges and
+-            // it could not be tapped — the zIndex on the inner stack
+-            // cannot order the GeometryReader siblings, and the 3D
+-            // rotation swings the neighbors' near edges forward. With
+-            // no frame overlap the centered card is fully visible and
+-            // tappable across its whole area; the tilt, shrink and fade
+-            // still follow d (measured in pitches), so the cover-flow
+-            // look is kept. The padding centers the first and last cards.
++            // (.scrollPosition + detent behavior). The pitch is at
++            // least a card wide plus a gap (0229): the old
++            // clamp(width/6.4, 74, 112) put adjacent centers closer
++            // than the card width, so the neighbors covered the
++            // centered cartridge's edges and it could not be tapped.
++            // Widening the pitch was not enough (0231, device report
++            // 2026-11-21: tapping the middle card still selected the
++            // right one): the tap lived on a Button inside the
++            // 3D-rotated stack, so its hit area followed the rotation
++            // and perspective — the neighbors' near edges swing
++            // forward and their spine/side planes stick out past
++            // their frames — and the zIndex on the inner stack cannot
++            // order the GeometryReader siblings, so the right card
++            // wins any overlap. The tap now lives on an overlay over
++            // the card's untransformed frame (see cartridgeCard), and
++            // the zIndex sits on the LazyHStack child, so a tap can
++            // only ever land on the card whose frame contains it.
++            // The padding centers the first and last cards.
+             GeometryReader { outer in
+                 let pitch = max(cardWidth + 16 * u, outer.size.width / 4.5)
++                let startX = max(cardWidth / 2, outer.size.width / 2)
++                let centeredIndex = items.firstIndex(where: { $0.id == (centeredId ?? effectiveSelectedId) }) ?? 0
+                 ScrollView(.horizontal, showsIndicators: false) {
+                     LazyHStack(spacing: pitch - cardWidth) {
+                         ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                             cartridgeCard(item, index: index, centerX: outer.size.width / 2, pitch: pitch)
+                                 .id(item.id)
++                                .zIndex(cardZIndex(item))
+                         }
+                     }
+                     .scrollTargetLayout()
+                     .padding(.horizontal, max(0, outer.size.width / 2 - cardWidth / 2))
+                 }
+                 .scrollPosition(id: $centeredId, anchor: .center)
+-                .scrollTargetBehavior(.viewAligned)
++                .scrollTargetBehavior(DmCartridgeDetentBehavior(pitch: pitch, cardWidth: cardWidth, itemCount: items.count, startX: startX, centeredIndex: centeredIndex))
++                .sensoryFeedback(.selection, trigger: centeredId)
+                 .coordinateSpace(name: "cartridgeflow")
+                 .onAppear { centeredId = effectiveSelectedId }
+             }
+@@ -769,26 +822,38 @@ private struct CartridgeCoverFlowView: View {
+             let angle = max(-68, min(68, d * 50))
+             let shrink = max(0.6, 1 - abs(d) * 0.145)
+             let fade: CGFloat = abs(d) <= 2.7 ? 1 : max(0, 1 - (abs(d) - 2.7) * 0.75)
+-            VStack(spacing: 5 * u) {
+-                Button {
+-                    tap(item)
+-                } label: {
++            // (0231) The tap target is the card's frame, not the
++            // rotated Button: the visual stack (tilt, shrink, lid,
++            // spine/side planes) is hit-dead, and a clear overlay
++            // over the frame owns every tap. The overlay is a sibling
++            // of the rotated stack, so it is never transformed; the
++            // frames tile without overlap (pitch >= cardWidth + 16u),
++            // so a tap can only land on the card whose frame holds
++            // it — no neighbor can steal the middle card's taps any
++            // more. The |d| gate keeps near-invisible far cards
++            // untappable, as before.
++            ZStack {
++                VStack(spacing: 5 * u) {
+                     cartridgeBox(item, index: index, isOpen: isOpen)
++                    // Reflection: a flipped copy of the front face, faded
++                    // and darkened; only near the center, so 52 cards do
++                    // not all render twice (LazyHStack already drops far
++                    // cards from the hierarchy).
++                    if abs(d) <= 3 {
++                        dmCartridgeReflection(item, index: index, d: d)
++                    }
+                 }
+-                .buttonStyle(.plain)
+-                // Reflection: a flipped copy of the front face, faded
+-                // and darkened; only near the center, so 52 cards do
+-                // not all render twice (LazyHStack already drops far
+-                // cards from the hierarchy).
+-                if abs(d) <= 3 {
+-                    dmCartridgeReflection(item, index: index, d: d)
+-                }
++                .rotation3DEffect(.degrees(angle), axis: (x: 0, y: 1, z: 0), perspective: 0.85)
++                .scaleEffect(shrink)
++                .opacity(fade)
++                .allowsHitTesting(false)
++                Color.clear
++                    .frame(width: cardWidth, height: flowHeight)
++                    .contentShape(Rectangle())
++                    .onTapGesture {
++                        if abs(d) <= 3.6 { tap(item) }
++                    }
+             }
+-            .rotation3DEffect(.degrees(angle), axis: (x: 0, y: 1, z: 0), perspective: 0.85)
+-            .scaleEffect(shrink)
+-            .opacity(fade)
+-            .zIndex(Double(200 - Int(round(abs(d) * 10)) + (isOpen ? 50 : 0)))
+-            .allowsHitTesting(abs(d) <= 3.6)
+         }
+         .frame(width: cardWidth, height: flowHeight)
+     }
+-- 
+2.43.0
+

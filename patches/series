@@ -177,3 +177,5 @@
 0228-diagnostic-headkey-probe.patch
 0229-launcher-style-switch-in-picker-header-cartridge-spacing-fix.patch
 0230-diagnostic-allocator-grow-probe.patch
+0232-diagnostic-probe-write-filter-and-abort-dump.patch
+0231-launcher-cartridge-tap-frame-detents.patch
