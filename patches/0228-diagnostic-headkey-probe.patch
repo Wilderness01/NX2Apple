@@ -1,4 +1,4 @@
-From b8bfafc1992a159b75320a59d28849fe6aa8c0fb Mon Sep 17 00:00:00 2001
+From 8f9736c3ed1b41c5c3bb3dabad468999e99b6ae0 Mon Sep 17 00:00:00 2001
 From: seedds <seedds@gmail.com>
 Date: Fri, 20 Nov 2026 12:30:04 +0000
 Subject: [PATCH] 0228 diagnostic: headkey probe logging key/res/doc/doc_b8 at
@@ -33,12 +33,12 @@ against the device-probed Happi/Explorer/Hakama keys (0228diag-harness.c).
 No submission, no build triggered.
 ---
  dm/games/0100000000010000/README.md  |   1 +
- dm/games/0100000000010000/patches.py | 159 ++++++++++++++++++++++++++-
- dm/host/hud_manual.c                 |  76 +++++++++++++
+ dm/games/0100000000010000/patches.py | 167 ++++++++++++++++++++++++++-
+ dm/host/hud_manual.c                 |  76 ++++++++++++
  dm/host/hud_manual.h                 |   5 +
  dm/host/uw.c                         |   1 +
- dm/tools/nso_asm.py                  |  14 +++
- 6 files changed, 254 insertions(+), 2 deletions(-)
+ dm/tools/nso_asm.py                  |  15 +++
+ 6 files changed, 263 insertions(+), 2 deletions(-)
 
 diff --git a/dm/games/0100000000010000/README.md b/dm/games/0100000000010000/README.md
 index 8357c569..6e346d3c 100644
@@ -53,7 +53,7 @@ index 8357c569..6e346d3c 100644
  - The silent first minute of sound.
  - development.md calls SDK 7.3.2 "the oldest so far"; Mario Kart 8 Deluxe (SDK 4.4.0) is older now.
 diff --git a/dm/games/0100000000010000/patches.py b/dm/games/0100000000010000/patches.py
-index ce282f82..d506ce3f 100644
+index ce282f82..0eafd6b2 100644
 --- a/dm/games/0100000000010000/patches.py
 +++ b/dm/games/0100000000010000/patches.py
 @@ -2,8 +2,9 @@
@@ -64,11 +64,11 @@ index ce282f82..d506ce3f 100644
 -from nso_asm import ADDI, ADRP, B, CBNZ, LDP_POST, STP_PRE
 +# 0147) and the 0228 diagnostic headkey probe (temporary, removed once its log
 +# decides the costume-head fix). There are no word cuts and no observation gates.
-+from nso_asm import ADDI, ADDR, ADRP, B, CBNZ, CBZ, LDP_POST, LDRB_POST, LDRX, LDXRW, MOV, MOVZ, RET, STP_PRE, STRB, STRB_POST, STRW, STRX, STXRW, SUBI
++from nso_asm import ADDI, ADDR, ADRP, B, CBNZ, CBZ, LDP_POST, LDRB_POST, LDRX, LDXRW, MOV, MOVK, MOVZ, RET, STP_PRE, STRB, STRB_POST, STRW, STRX, STXRW, SUBI
  
  BUILD_141 = 'b424be150a8e7d78701cbe7a439d9ebf'   # main 1.4.1 (game.tsv v393216)
  
-@@ -216,8 +217,162 @@ def _hud_runtime_frame_step(ctx):
+@@ -216,8 +217,170 @@ def _hud_runtime_frame_step(ctx):
      emit(B(here(), 0x909da4))                  # back to the hook site + 4
      fs_put(0x909da0, [B(0x909da0, rstart)], 'Forced recompute 0x909d4c +0x150: the in-game HUD editor runtime, re-applied after the game\'s post-Calculate refresh (hud_runtime.c)')
  
@@ -123,9 +123,17 @@ index ce282f82..d506ce3f 100644
 +    def _cbz(rt, label): body.append(('cbz', rt, label))
 +    def _cbnz(rt, label): body.append(('cbnz', rt, label))
 +    def _b(label): body.append(('b', label))
-+    # x0 = key ptr, x1 = res, x2 = ring base, x8 = site. Uses x0-x14 only
++    # x0 = key ptr, x1 = res, x2 = ring base, x8 = site. Uses x0-x15 only
 +    # (all caller-saved); x19-x30 and sp are never touched, and no instruction
 +    # sets the flags, so the game resumes exactly as at the cut.
++    # Write the ring magic first: the host drain gates on it, and nothing
++    # else writes it (the state page starts zero-filled) — without this the
++    # drain returns on every present and the probe is silent (log-108/109/
++    # 110: three runs, zero diag-headkey lines). Idempotent (same value
++    # every call); x15 is free in the body.
++    _w(MOVZ(15, 0x4844))          # x15 = 0x4844 ("HK")
++    _w(MOVK(15, 0x594B, 1))       # x15 = 0x594B4844 ("DHKY")
++    _w(STRW(15, 2, 0))            # [ring, #0] = magic
 +    # doc / doc_b8 with NULL guards.
 +    _cbz(1, 'res_null')
 +    _w(LDRX(3, 1, 0x14))          # doc = [res, #0xa0]
@@ -342,15 +350,16 @@ index 13cc37dd..da94e132 100644
  
  float uw_effective_aspect(float in) {
 diff --git a/dm/tools/nso_asm.py b/dm/tools/nso_asm.py
-index 0c500a6b..f047284e 100644
+index 0c500a6b..0b346303 100644
 --- a/dm/tools/nso_asm.py
 +++ b/dm/tools/nso_asm.py
-@@ -20,6 +20,20 @@ def ADDR(dd, n, m): return 0x8B000000 | (m << 16) | (n << 5) | dd
+@@ -20,6 +20,21 @@ def ADDR(dd, n, m): return 0x8B000000 | (m << 16) | (n << 5) | dd
  def SUBI(dd, n, imm12, sh=0): return 0xD1000000 | (sh << 22) | (imm12 << 10) | (n << 5) | dd
  def BR(n): return 0xD61F0000 | (n << 5)
  def CMPR(n, m): return 0xEB00001F | (m << 16) | (n << 5)   # cmp xn, xm (subs xzr)
 +def MOV(dd, n): return 0xAA0003E0 | (n << 16) | dd   # mov x<dd>, x<n> (orr xd, xzr, xn)
 +def MOVZ(dd, imm16, sh=0): return 0xD2800000 | (sh << 21) | ((imm16 & 0xFFFF) << 5) | dd   # movz x<dd>, #imm16 (lsl #16*sh)
++def MOVK(dd, imm16, sh=0): return 0xF2800000 | (sh << 21) | ((imm16 & 0xFFFF) << 5) | dd   # movk x<dd>, #imm16 (lsl #16*sh) — keeps the other halfwords, unlike movz
 +def SUBR(dd, n, m): return 0xCB000000 | (m << 16) | (n << 5) | dd   # sub x<dd>, x<n>, x<m>
 +def CBZ(rt, frm, to):
 +    off = to - frm; assert -(1 << 20) <= off < (1 << 20) and off % 4 == 0

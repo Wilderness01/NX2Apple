@@ -1,0 +1,136 @@
+From 9ba89fc7aa4450124a6bcc0fd63b87417f8d2877 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Fri, 20 Nov 2026 15:04:23 +0000
+Subject: [PATCH] 0229: launcher style switch moves to the outfit picker
+ header; cartridge cover-flow spacing fix
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+(a) The Interface Style switch moves out of the Game tab settings and
+into the outfit picker header, next to the cap/clothes switch, in both
+styles (classic grid + cartridge flow) — same @AppStorage
+DmLauncherUIStyle key, immediate effect, no restart.
+(b) Cartridge cover-flow: the old pitch clamp put adjacent card centers
+closer than the card width, so the neighbors covered the centered
+cartridge's edges and it could not be tapped. The pitch is now at
+least a card wide plus a gap, so the centered cartridge is fully
+visible and tappable across its whole area; tilt/shrink/fade still
+follow d (measured in pitches).
+---
+ dm/ios/Sources/Launcher.swift | 56 +++++++++++++++++++++--------------
+ 1 file changed, 34 insertions(+), 22 deletions(-)
+
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index 730ba1ad..24c8f6e0 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -466,6 +466,10 @@ private struct OutfitGridView: View {
+     let characterName: String
+     let scale: CGFloat
+     let onSelect: (DeckItem) -> Void
++    // 0229: the interface-style switch lives in this header now (moved
++    // from the Game tab settings); same DmLauncherUIStyle key as the
++    // parent, so tapping it swaps the picker immediately, no restart.
++    @AppStorage("DmLauncherUIStyle") private var uiStyle: String = "classic"
+     @State private var capsMode: Bool = true
+     @State private var cap: String = UserDefaults.standard.string(forKey: "DmCharSelect.cap") ?? "default"
+     @State private var clothes: String = UserDefaults.standard.string(forKey: "DmCharSelect.clothes") ?? "default"
+@@ -503,6 +507,13 @@ private struct OutfitGridView: View {
+                         .foregroundStyle(.white.opacity(0.7))
+                 }
+                 Spacer()
++                // 0229: the style switch, next to the cap/clothes switch.
++                Picker("", selection: $uiStyle) {
++                    Text("\u{7ecf}\u{5178}").tag("classic")
++                    Text("\u{5361}\u{5e26}").tag("cartridge")
++                }
++                .pickerStyle(.segmented)
++                .frame(width: 120 * scale)
+                 Picker("", selection: $capsMode) {
+                     Text("\u{5e3d}\u{5b50}").tag(true)
+                     Text("\u{8863}\u{670d}").tag(false)
+@@ -624,6 +635,10 @@ private struct CartridgeCoverFlowView: View {
+     let scale: CGFloat
+     let onSelect: (DeckItem) -> Void
+     let onOpenChange: (Bool) -> Void
++    // 0229: the interface-style switch lives in this header now (moved
++    // from the Game tab settings); same DmLauncherUIStyle key as the
++    // parent, so tapping it swaps the picker immediately, no restart.
++    @AppStorage("DmLauncherUIStyle") private var uiStyle: String = "classic"
+     @State private var capsMode: Bool = true
+     @State private var cap: String = UserDefaults.standard.string(forKey: "DmCharSelect.cap") ?? "default"
+     @State private var clothes: String = UserDefaults.standard.string(forKey: "DmCharSelect.clothes") ?? "default"
+@@ -682,6 +697,13 @@ private struct CartridgeCoverFlowView: View {
+                         .foregroundStyle(.white.opacity(0.7))
+                 }
+                 Spacer()
++                // 0229: the style switch, next to the cap/clothes switch.
++                Picker("", selection: $uiStyle) {
++                    Text("\u{7ecf}\u{5178}").tag("classic")
++                    Text("\u{5361}\u{5e26}").tag("cartridge")
++                }
++                .pickerStyle(.segmented)
++                .frame(width: 120 * scale)
+                 Picker("", selection: $capsMode) {
+                     Text("\u{5e3d}\u{5b50}").tag(true)
+                     Text("\u{8863}\u{670d}").tag(false)
+@@ -691,12 +713,19 @@ private struct CartridgeCoverFlowView: View {
+             }
+             // Cover-flow: the cartridge cards tilt in 3D with scroll
+             // position; the nearest card snaps to the center
+-            // (.scrollPosition + .viewAligned). The pitch is the
+-            // prototype's spacing() — clamp(width/6.4, 74, 112) in
+-            // prototype px — so adjacent cards overlap like a real
+-            // cover-flow; the padding centers the first and last cards.
++            // (.scrollPosition + .viewAligned). The pitch is at least a
++            // card wide plus a gap (0229): the old clamp(width/6.4, 74,
++            // 112) put adjacent centers closer than the card width, so
++            // the neighbors covered the centered cartridge's edges and
++            // it could not be tapped — the zIndex on the inner stack
++            // cannot order the GeometryReader siblings, and the 3D
++            // rotation swings the neighbors' near edges forward. With
++            // no frame overlap the centered card is fully visible and
++            // tappable across its whole area; the tilt, shrink and fade
++            // still follow d (measured in pitches), so the cover-flow
++            // look is kept. The padding centers the first and last cards.
+             GeometryReader { outer in
+-                let pitch = max(74 * u, min(112 * u, outer.size.width / 6.4))
++                let pitch = max(cardWidth + 16 * u, outer.size.width / 4.5)
+                 ScrollView(.horizontal, showsIndicators: false) {
+                     LazyHStack(spacing: pitch - cardWidth) {
+                         ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+@@ -1212,7 +1241,6 @@ private struct GameTabContent: View {
+     @Binding var glassOpacity: Double
+     let scale: CGFloat
+     @State private var memory = os_proc_available_memory()
+-    @AppStorage("DmLauncherUIStyle") private var uiStyle: String = "classic"
+ 
+     var body: some View {
+         ScrollView {
+@@ -1226,22 +1254,6 @@ private struct GameTabContent: View {
+                     Slider(value: $glassOpacity, in: 0...100, step: 1)
+                         .accessibilityLabel("\u{73bb}\u{7483}\u{5f3a}\u{5ea6}")
+                 }
+-                // 0227: the outfit picker's style — classic (the 0226
+-                // cover-flow grid) or cartridge (the v4 retro
+-                // game-cartridge cover-flow). Stored in UserDefaults
+-                // DmLauncherUIStyle ("classic"/"cartridge", default
+-                // "classic"); the character picker reads the same key
+-                // and swaps immediately, no restart.
+-                HStack {
+-                    Text("\u{754c}\u{9762}\u{98ce}\u{683c}").foregroundStyle(.white)
+-                    Spacer()
+-                    Picker("", selection: $uiStyle) {
+-                        Text("\u{7ecf}\u{5178}").tag("classic")
+-                        Text("\u{5361}\u{5e26}\u{5c01}\u{9762}\u{6d41}").tag("cartridge")
+-                    }
+-                    .pickerStyle(.segmented)
+-                    .frame(width: 210)
+-                }
+                 ForEach(m.rows(in: "Game")) { SettingRow(s: $0, m: m, dark: true) }
+                 Button(LauncherText.text("ui.resetDefaults", "Reset to tested defaults")) { m.reset() }
+                     .disabled(!m.changed)
+-- 
+2.43.0
+
