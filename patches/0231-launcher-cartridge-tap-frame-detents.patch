@@ -1,4 +1,4 @@
-From b0127d34fd9402855a9bd62f3cdc3bbee4666352 Mon Sep 17 00:00:00 2001
+From 580874bfc71d65359d590ed5f26e89f1bcefecbd Mon Sep 17 00:00:00 2001
 From: seedds <seedds@gmail.com>
 Date: Sat, 21 Nov 2026 05:54:26 +0000
 Subject: [PATCH] 0231: cartridge cover-flow tap on the card frame; one-card
@@ -9,7 +9,7 @@ Subject: [PATCH] 0231: cartridge cover-flow tap on the card frame; one-card
  1 file changed, 94 insertions(+), 29 deletions(-)
 
 diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
-index 24c8f6e0..f3d614c1 100644
+index 24c8f6e0..ca579ed3 100644
 --- a/dm/ios/Sources/Launcher.swift
 +++ b/dm/ios/Sources/Launcher.swift
 @@ -629,6 +629,37 @@ private struct DmGrain: View {
@@ -36,7 +36,7 @@ index 24c8f6e0..f3d614c1 100644
 +    func updateTarget(_ target: inout ScrollTarget, context: TargetContext) {
 +        guard itemCount > 1, pitch > 0 else { return }
 +        let proposed = min(max(Int(round((target.rect.midX - startX) / pitch)), 0), itemCount - 1)
-+        guard abs(context.velocity.x) > 250 else { return }
++        guard abs(context.velocity.dx) > 250 else { return }
 +        guard abs(proposed - centeredIndex) > 1 else { return }
 +        let step = proposed > centeredIndex ? 1 : -1
 +        let next = min(max(centeredIndex + step, 0), itemCount - 1)
