@@ -1,0 +1,336 @@
+From 00011abbf2fb310b91f44ab355923c1f2b3cdad0 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Sat, 21 Nov 2026 03:49:45 +0000
+Subject: [PATCH] 0230 diagnostic: allocator grow probe logging
+ container/size/count/aligned/aux/site at the costume abort path
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The Explorer/Football/Mechanic abort is a deliberate SDK abort in the
+grow branch of allocator 0x954310 (REPORT-LOG108-LOG109.md §7): a
+container's inline buffer cannot hold the request (or a count/size
+overflows), so it calls the heap's grow virtual function V, which aborts.
+V's identity and assertion condition are not pinned by static
+disassembly, and the discriminating test (log-115) proved the trigger is
+on the BODY/clothes side, not the cap.
+
+Two FRAME_STEP cuts in 0x954310, one per grow entry that reaches the
+virtual call: 0x954478 (the shared tail: ldr x8, [x0], reached from the
+bump-overflow entry 0x954428 and the space-check entry 0x954468) and
+0x954390 (the overflow entry 0x954370's own ldr x8, [x0]; that entry
+calls V inline and never reaches the shared tail). Each cut's trampoline
+passes the grow parameters to one shared body, which appends a 64-byte
+record (container, size, count, aligned size, aux, site, seq written
+last) to a ring in the frame-step state page at +0x3B20 (immediately
+after the 0228 headkey ring, which ends at +0x3B20; the state page is
+0x4000 bytes). The aux field is [sp,#0x28] at the cut, which the three
+grow entries fill differently (overflow: count; bump-overflow:
+[container,#0x90]*count; space-check: -([container,#0x90]*count)), so
+aux + count identifies which grow condition fired. The body writes the
+'GRWR' magic at ring+0 first (the 0228 DHKY bug: the stub never wrote
+its magic, so eight device runs logged zero lines). The host drains the
+ring once per present (dm_diag_grow_frame_tick, tag 'diag-grow') and
+logs every record. Logging-only: the body writes nothing but the ring,
+touches no callee-saved register and no flag, and executes the replaced
+instruction before branching back. Temporary: remove the cuts and the
+drain once the abort trigger is pinned.
+---
+ dm/games/0100000000010000/patches.py | 151 ++++++++++++++++++++++++++-
+ dm/host/hud_manual.c                 |  70 +++++++++++++
+ dm/host/hud_manual.h                 |   5 +
+ dm/host/uw.c                         |   1 +
+ dm/tools/nso_asm.py                  |   1 +
+ 5 files changed, 227 insertions(+), 1 deletion(-)
+
+diff --git a/dm/games/0100000000010000/patches.py b/dm/games/0100000000010000/patches.py
+index 0eafd6b2..5bbf07f0 100644
+--- a/dm/games/0100000000010000/patches.py
++++ b/dm/games/0100000000010000/patches.py
+@@ -4,7 +4,7 @@
+ # Only FRAME_STEP is used here: the in-game HUD editor runtime (hud_runtime.c,
+ # 0147) and the 0228 diagnostic headkey probe (temporary, removed once its log
+ # decides the costume-head fix). There are no word cuts and no observation gates.
+-from nso_asm import ADDI, ADDR, ADRP, B, CBNZ, CBZ, LDP_POST, LDRB_POST, LDRX, LDXRW, MOV, MOVK, MOVZ, RET, STP_PRE, STRB, STRB_POST, STRW, STRX, STXRW, SUBI
++from nso_asm import ADDI, ADDR, ADRP, B, CBNZ, CBZ, LDP_POST, LDRB_POST, LDRW, LDRX, LDXRW, MOV, MOVK, MOVZ, RET, STP_PRE, STRB, STRB_POST, STRW, STRX, STXRW, SUBI
+ 
+ BUILD_141 = 'b424be150a8e7d78701cbe7a439d9ebf'   # main 1.4.1 (game.tsv v393216)
+ 
+@@ -378,9 +378,158 @@ def _diag_headkey_frame_step(ctx):
+     emit(B(here(), 0x65fb54))                # back to the site + 4
+     fs_put(0x65fb50, [B(0x65fb50, start_b)], '0228 diagnostic: 0x65f520 headkey probe, joint-setup site (REPORT-LOOKUP-DECODE.md §7.3)')
+ 
++# (0230 diagnostic) The allocator "grow" probe: log the grow-call parameters
++# at the abort site (allocator 0x954310, REPORT-LOG108-LOG109.md §7 + the
++# abort diagnosis) so the next device run of an aborting costume pins what
++# overflows. The abort is a deliberate SDK abort (nn::diag::Abort) in the
++# grow branch of 0x954310: a container's inline buffer cannot hold the request
++# (or a count/size overflows), so it calls the heap's grow virtual function V,
++# which aborts. The chain loads a SARC archive (constructor arg "sarc"). V's
++# identity and assertion condition are not pinned by static disassembly, and
++# the discriminating test (log-115: Explorer clothes + Happi cap, still the
++# same abort) proved the trigger is on the BODY/clothes side, not the cap.
++# Two FRAME_STEP cuts in 0x954310, one per grow entry that reaches the virtual
++# call: at 0x954478 (the shared tail: `ldr x8, [x0]`, reached from the
++# bump-overflow entry 0x954428 and the space-check entry 0x954468) and at
++# 0x954390 (the overflow entry 0x954370's own `ldr x8, [x0]`; that entry calls
++# V inline and never reaches the shared tail, so one cut at 0x954478 alone
++# would miss it). Each cut's trampoline passes the grow parameters to one
++# shared body, which appends a 64-byte record to a ring in the frame-step
++# state page at +0x3B20 (immediately after the 0228 headkey ring, which ends
++# at +0x3B20; the state page is 0x4000 bytes, so the ring fits with room to
++# spare); the host drains the ring once per present
++# (dm_diag_grow_frame_tick in hud_manual.c) and logs every record. Grow calls
++# are rare (normal allocations use the inline buffer and never reach the grow
++# path), so the 16-record ring is plenty. Logging-only: the body writes
++# nothing but the ring (never game state), touches no callee-saved register
++# and no flag (every instruction is a load, store, register move/add/sub or a
++# CBZ/CBNZ branch), and executes the replaced instruction before branching
++# back, so the game runs exactly as without the probe. Temporary: remove the
++# cuts and the drain once the abort trigger is pinned.
++# Ring (state +0x3B20): +0x00 u32 magic "GRWR", +0x04 u32 reserved, +0x08 u32
++# write_seq (monotonic, atomic), +0x0C u32 next_off (byte offset of the next
++# slot relative to the record area, 0..0x400, atomic, wraps to 0; the record
++# sits at ring + 0x20 + next_off, so the zero-filled initial value 0 is
++# already the first slot), +0x10..+0x1F reserved, +0x20 records[16] x 64 bytes.
++# Record (64 bytes): +0 u64 container, +8 u64 size, +16 u64 count, +24 u64
++# aligned size, +32 u32 aux, +36 u32 site, +40 u32 seq (written LAST, the
++# commit marker: the host only reads a record whose seq is set), +44..+63
++# reserved. The aux field is [sp,#0x28] at the cut, which the three grow
++# entries fill differently (overflow: w20 = count; bump-overflow: w8 =
++# [container,#0x90] * count; space-check: w9 = -([container,#0x90] * count)),
++# so aux + count identifies which grow condition fired.
++# Site facts (verified in the disassembly, 0x954310..0x9544d0): at both cuts
++# x21 is the container, x22 the size, w20 the count, x24 the aligned size
++# (align_up(max(size,8),8)), x25 the heap object, x0 the heap interface
++# pointer ([x25,#0x10], read by the replaced instruction), and the stack args
++# are [sp,#8]=container/size, [sp,#0x18]=count, [sp,#0x20]=aligned size,
++# [sp,#0x28]=aux. x0 is the only live caller-saved register at the cuts (x1
++# is rewritten before any read after either cut); x19-x25 and sp are never
++# touched by the body, and the flags are dead at both cuts (the last flag
++# read is the branch that entered the grow path). The replaced instruction
++# is `ldr x8, [x0]` at both cuts (original bytes '080040f9', verified
++# against the NSO).
++DIAG_GROW_RING_OFF = 0x3B20
++DIAG_GROW_MAGIC = 0x52575247   # "GRWR"
++DIAG_GROW_REC_CAP = 16
++DIAG_GROW_REC_BYTES = DIAG_GROW_REC_CAP * 64   # 0x400: next_off wraps here
++
++def _diag_grow_frame_step(ctx):
++    here, emit, fs_site, fs_put, FS_STATE_OFF = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state
++    ring = FS_STATE_OFF + DIAG_GROW_RING_OFF
++    # Assemble the shared body into a word list first: its forward branches
++    # need their targets resolved before any word is emitted.
++    body = []   # ('w', word) | ('cbz', rt, label) | ('cbnz', rt, label) | ('b', label)
++    labels = {}
++    def _w(word): body.append(('w', word))
++    def _label(name): labels[name] = len(body)
++    def _cbz(rt, label): body.append(('cbz', rt, label))
++    def _cbnz(rt, label): body.append(('cbnz', rt, label))
++    def _b(label): body.append(('b', label))
++    # x0 = container, x1 = size, x2 = ring base, x3 = count, x4 = aligned
++    # size, x13 = aux, x8 = site. Uses x0-x15 only (all caller-saved);
++    # x19-x30 and sp are never touched, and no instruction sets the flags,
++    # so the game resumes exactly as at the cut. x13 holds aux through the
++    # seq/slot reservation (the reservation uses x5/x6/x7/x12/x14, never x13).
++    # Write the ring magic first: the host drain gates on it, and nothing
++    # else writes it (the state page starts zero-filled) — without this the
++    # drain returns on every present and the probe is silent (the 0228
++    # headkey probe's DHKY bug: log-108..115, eight runs, zero lines).
++    # Idempotent (same value every call).
++    _w(MOVZ(15, 0x5247))          # x15 = 0x5247 ("GR")
++    _w(MOVK(15, 0x5257, 1))       # x15 = 0x52575247 ("GRWR")
++    _w(STRW(15, 2, 0))            # [ring, #0] = magic
++    # Reserve a seq (atomic increment of write_seq at ring+8). The record's
++    # seq is the NEW value, so the first record is seq 1, never 0.
++    _w(ADDI(7, 2, 8))             # x7 = &write_seq
++    _label('seq_retry')
++    _w(LDXRW(5, 7))               # w5 = write_seq
++    _w(ADDI(6, 5, 1))             # x6 = write_seq + 1
++    _w(STXRW(14, 6, 7))           # try to store it; w14 = status (0 = ok)
++    _cbnz(14, 'seq_retry')
++    _w(MOV(12, 6))                # x12 = seq
++    # Reserve a slot (atomic advance of next_off at ring+12, wraps 0x400 -> 0).
++    # next_off is relative to the record area (0..0x400); the record sits at
++    # ring + 0x20 + next_off, so the zero-filled initial value 0 is already the
++    # first slot (a 0x20-based offset would have put the first record on the header).
++    _w(ADDI(7, 2, 12))            # x7 = &next_off
++    _label('slot_retry')
++    _w(LDXRW(5, 7))               # w5 = next_off
++    _w(SUBI(6, 5, DIAG_GROW_REC_BYTES))   # x6 = next_off - 0x400
++    _cbz(6, 'wrap')
++    _w(ADDI(6, 5, 64))            # x6 = next_off + 64
++    _b('slot_store')
++    _label('wrap')
++    _w(MOV(5, 31))                # x5 = 0 (the wrapped slot offset)
++    _w(MOVZ(6, 64))               # x6 = 64 (the new next_off)
++    _label('slot_store')
++    _w(STXRW(14, 6, 7))
++    _cbnz(14, 'slot_retry')
++    # x5 = slot offset (relative), x12 = seq.
++    _w(ADDI(5, 5, 0x20))          # x5 = 0x20 + next_off (the record's byte offset in the ring)
++    _w(ADDR(9, 2, 5))             # x9 = ring + slot (the record)
++    _w(STRX(0, 9, 0))             # container
++    _w(STRX(1, 9, 1))             # size
++    _w(STRX(3, 9, 2))             # count
++    _w(STRX(4, 9, 3))             # aligned size
++    _w(STRW(13, 9, 8))            # aux
++    _w(STRW(8, 9, 9))             # site (low 32 bits of x8)
++    _w(STRW(12, 9, 10))           # seq, LAST (the commit marker)
++    _w(RET)
++    probe = here()
++    for i, item in enumerate(body):
++        pc = probe + 4 * i
++        if item[0] == 'w': emit(item[1])
++        elif item[0] == 'cbz': emit(CBZ(item[1], pc, probe + 4 * labels[item[2]]))
++        elif item[0] == 'cbnz': emit(CBNZ(item[1], pc, probe + 4 * labels[item[2]]))
++        else: emit(B(pc, probe + 4 * labels[item[1]]))
++    # The two cuts share one trampoline shape (only the site value and the
++    # return address differ). At each cut x0 is the heap interface pointer
++    # (live: the replaced instruction reads it), x1 is dead (rewritten before
++    # any read after either cut), and x21/x22/w20/x24 hold container/size/
++    # count/aligned size. The aux load runs BEFORE the push, while sp is
++    # still the allocator's frame base.
++    for site in (0x954478, 0x954390):
++        fs_site(site, '080040f9')
++        start = here()
++        emit(LDRW(13, 31, 0xa))              # w13 = aux = [sp, #0x28]
++        emit(STP_PRE(0, 1, 31, -16))         # push x0 (iface ptr) + dead x1
++        emit(MOV(0, 21))                     # x0 = container (the body's 1st arg)
++        emit(MOV(1, 22))                     # x1 = size (the body's 2nd arg)
++        emit(MOV(3, 20))                     # x3 = count (the body's 3rd arg)
++        emit(MOV(4, 24))                     # x4 = aligned size (the body's 4th arg)
++        emit(ADRP(2, here(), ring)); emit(ADDI(2, 2, ring & 0xFFF))   # x2 = ring
++        emit(ADRP(8, here(), site)); emit(ADDI(8, 8, site & 0xFFF))   # x8 = site
++        emit(B(here(), probe) | 0x80000000)   # bl probe
++        emit(LDP_POST(0, 1, 31, 16))         # restore x0 (iface ptr); x1 restored too (dead)
++        emit(0xF9400008)                     # ldr x8, [x0] (the replaced instruction)
++        emit(B(here(), site + 4))            # back to the site + 4
++        fs_put(site, [B(site, start)], '0230 diagnostic: 0x954310 allocator grow probe, grow-call parameters (REPORT-LOG108-LOG109.md §7)')
++
+ def _frame_step_141(ctx):
+     _hud_runtime_frame_step(ctx)
+     _diag_headkey_frame_step(ctx)
++    _diag_grow_frame_step(ctx)
+ 
+ FRAME_STEP = {BUILD_141: _frame_step_141}
+ 
+diff --git a/dm/host/hud_manual.c b/dm/host/hud_manual.c
+index b32d4542..b78eb9f4 100644
+--- a/dm/host/hud_manual.c
++++ b/dm/host/hud_manual.c
+@@ -371,3 +371,73 @@ void dm_diag_headkey_frame_tick(void) {
+             low - g_diag_last_seq - 1, g_diag_last_seq + 1, low - 1);
+     g_diag_last_seq = top;
+ }
++
++// ---- 0230 diagnostic: the allocator grow probe ring (dm_diag_grow_frame_tick) ----
++// The rewriter's diag_grow stub (patches.py FRAME_STEP, 0230) writes one
++// 64-byte record per 0x954310 grow call into the frame-step state page at
++// +0x3B20 (immediately after the 0228 headkey ring, which ends at +0x3B20;
++// the state page is 0x4000 bytes, so the 16-record ring fits with room to
++// spare). This function drains the ring once per present (called from
++// uw_frame_hook, next to dm_diag_headkey_frame_tick) and logs every record
++// -- the grow-call parameters (container, size, count, aligned size, aux,
++// site) of the allocator grow that precedes the Explorer/Football/Mechanic
++// abort (REPORT-LOG108-LOG109.md §7). The abort is a deliberate SDK abort
++// in the grow branch of allocator 0x954310; the stub records what the
++// container was asked to grow to, so the next device run of an aborting
++// costume pins which grow condition fired (overflow vs bump-overflow vs
++// space-check, from the aux field) and how big the request was. Logging-only:
++// it never writes game state (it reads the ring, which the stub owns).
++// Temporary: remove it with the probe once the abort trigger is pinned.
++// Ring (state +0x3B20): +0x00 u32 magic "GRWR", +0x04 u32 reserved, +0x08 u32
++// write_seq, +0x0C u32 next_off (relative to the record area, 0..0x400,
++// wraps to 0; the record sits at ring + 0x20 + next_off), +0x10..+0x1F
++// reserved, +0x20 records[16] x 64 bytes.
++// Record (64 bytes): +0 u64 container, +8 u64 size, +16 u64 count, +24 u64
++// aligned size, +32 u32 aux, +36 u32 site, +40 u32 seq (written LAST by the
++// stub, the commit marker), +44..+63 reserved. A record whose seq is not set
++// is an uncommitted (or torn) write: it is skipped, but its seq is still
++// counted, so it never blocks later records.
++#define DIAG_GROW_RING_OFF  0x3B20
++#define DIAG_GROW_MAGIC     0x52575247u   // "GRWR"
++#define DIAG_GROW_REC_CAP   16
++#define DIAG_GROW_REC_SIZE  64
++#define DIAG_GROW_SEQ_OFF   40
++
++static uint32_t g_diag_grow_last_seq;   // the highest record seq logged so far (seqs start at 1)
++static int g_diag_grow_started;         // the identification line has been logged
++
++void dm_diag_grow_frame_tick(void) {
++    uint8_t *st = dm_fps_state;
++    if (!st) return;
++    uint8_t *ring = st + DIAG_GROW_RING_OFF;
++    if (*(uint32_t *)(ring + 0x00) != DIAG_GROW_MAGIC) return;   // no probe in this build, or the stub has not run yet
++    if (!g_diag_grow_started) {
++        // Identify the run: the launcher pick (the costume the user chose for this session).
++        const char *clothes = getenv("DM_CHAR_CLOTHES");
++        const char *cap = getenv("DM_CHAR_CAP");
++        LOG("diag-grow: probe live, launcher clothes=%s cap=%s; run one session per aborting costume (Explorer, Football, Mechanic), enter a kingdom, send Documents/log.txt",
++            clothes ? clothes : "(unset)", cap ? cap : "(unset)");
++        g_diag_grow_started = 1;
++    }
++    uint32_t top = g_diag_grow_last_seq, low = 0xffffffffu;
++    for (uint32_t i = 0; i < DIAG_GROW_REC_CAP; i++) {
++        uint8_t *rec = ring + 0x20 + i * DIAG_GROW_REC_SIZE;
++        uint32_t seq = *(uint32_t *)(rec + DIAG_GROW_SEQ_OFF);
++        if (seq <= g_diag_grow_last_seq) continue;   // already logged, or not yet committed (the stub writes seq last)
++        if (seq < low) low = seq;
++        if (seq > top) top = seq;
++        uint64_t container = *(uint64_t *)(rec + 0);
++        uint64_t size = *(uint64_t *)(rec + 8);
++        uint64_t count = *(uint64_t *)(rec + 16);
++        uint64_t aligned = *(uint64_t *)(rec + 24);
++        uint32_t aux = *(uint32_t *)(rec + 32);
++        uint32_t site = *(uint32_t *)(rec + 36);
++        LOG("diag-grow: site=0x%x seq=%u container=0x%016llx size=%llu count=%llu aligned=%llu aux=0x%08x",
++            site, seq, (unsigned long long)container, (unsigned long long)size,
++            (unsigned long long)count, (unsigned long long)aligned, aux);
++    }
++    if (low != 0xffffffffu && low > g_diag_grow_last_seq + 1)
++        LOG("diag-grow: ring overwrote %u record(s) before this drain (seq %u..%u unseen)",
++            low - g_diag_grow_last_seq - 1, g_diag_grow_last_seq + 1, low - 1);
++    g_diag_grow_last_seq = top;
++}
+diff --git a/dm/host/hud_manual.h b/dm/host/hud_manual.h
+index 9875bfb8..5e40133c 100644
+--- a/dm/host/hud_manual.h
++++ b/dm/host/hud_manual.h
+@@ -21,4 +21,9 @@ void dm_hud_manual_frame_tick(void);
+ // not in the build (the ring magic does not match).
+ void dm_diag_headkey_frame_tick(void);
+ 
++// Drain the 0230 diagnostic allocator grow probe ring (called once per present
++// from uw_frame_hook, next to dm_diag_headkey_frame_tick). A no-op when the
++// probe is not in the build (the ring magic does not match).
++void dm_diag_grow_frame_tick(void);
++
+ #endif
+diff --git a/dm/host/uw.c b/dm/host/uw.c
+index da94e132..058c2b58 100644
+--- a/dm/host/uw.c
++++ b/dm/host/uw.c
+@@ -735,6 +735,7 @@ void uw_frame_hook(double w, double h) {
+     uw_direct_write();
+     dm_hud_manual_frame_tick();   // (0119) the launcher HUD editor's settings into the state page (+0x200); a no-op write when unchanged
+     dm_diag_headkey_frame_tick();   // (0228) the headkey probe ring drain (+0x3300); a no-op when the probe is not in the build
++    dm_diag_grow_frame_tick();   // (0230) the allocator grow probe ring drain (+0x3B20); a no-op when the probe is not in the build
+ }
+ 
+ float uw_effective_aspect(float in) {
+diff --git a/dm/tools/nso_asm.py b/dm/tools/nso_asm.py
+index 0b346303..33fcd4bf 100644
+--- a/dm/tools/nso_asm.py
++++ b/dm/tools/nso_asm.py
+@@ -23,6 +23,7 @@ def CMPR(n, m): return 0xEB00001F | (m << 16) | (n << 5)   # cmp xn, xm (subs xz
+ def MOV(dd, n): return 0xAA0003E0 | (n << 16) | dd   # mov x<dd>, x<n> (orr xd, xzr, xn)
+ def MOVZ(dd, imm16, sh=0): return 0xD2800000 | (sh << 21) | ((imm16 & 0xFFFF) << 5) | dd   # movz x<dd>, #imm16 (lsl #16*sh)
+ def MOVK(dd, imm16, sh=0): return 0xF2800000 | (sh << 21) | ((imm16 & 0xFFFF) << 5) | dd   # movk x<dd>, #imm16 (lsl #16*sh) — keeps the other halfwords, unlike movz
++def LDRW(t, n, imm12=0): return 0xB9400000 | (imm12 << 10) | (n << 5) | t   # ldr w<t>, [x<n>, #imm12*4] (32-bit load; the upper half of x<t> is zeroed)
+ def SUBR(dd, n, m): return 0xCB000000 | (m << 16) | (n << 5) | dd   # sub x<dd>, x<n>, x<m>
+ def CBZ(rt, frm, to):
+     off = to - frm; assert -(1 << 20) <= off < (1 << 20) and off % 4 == 0
+-- 
+2.43.0
+

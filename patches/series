@@ -175,3 +175,5 @@
 0226-launcher-costume-override.patch
 0227-launcher-cartridge-cover-flow-picker-second-style.patch
 0228-diagnostic-headkey-probe.patch
+0229-launcher-style-switch-in-picker-header-cartridge-spacing-fix.patch
+0230-diagnostic-allocator-grow-probe.patch
