@@ -1,0 +1,290 @@
+From 739f28d441e52fb25d487f820ce8bd411e634c09 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Sat, 21 Nov 2026 05:44:51 +0000
+Subject: [PATCH] 0232 diagnostic: headkey probe write-time Head filter; dump
+ both probe rings on the SDK abort
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The 0228 headkey probe's ring is overwhelmed by the unfiltered 0x65f520
+stream: V1.3.58 (log-3f1647c8/96376669/71d81aef) wrote ~700 records per
+session and overwrote 430-628 per run, so every Head record was lost before
+the per-present drain saw it and §7.3 got no doc_b8. The stub now scans the
+key for 'Head' at write time (SUBI + CBZ, no flag setters, x0/x1/x2/x8
+preserved) and writes no record for any other key, so the 32-record ring
+holds only Head records; the drain's 'Head' filter is removed (the stub is
+now the filter). A new LDRB encoder (nso_asm.py) serves the scan.
+
+The 0230 grow probe's ring+drain cannot capture the aborting call: it is
+the first and only grow call in the session, and the process exits before
+the next present drains it (three V1.3.58 runs, zero diag-grow lines).
+Calling the host log function from the stub was rejected: no mechanism
+exists for a stub to call a host function (the state page holds only
+floats, no function pointers). Instead the host's SVC Break handler
+(hle_svc.c case 0x26), which provably runs after the SDK abort and before
+_exit(42) -- the V1.3.58 logs show its Break#1 line and backtrace, then the
+log ends -- now dumps both probe rings on the fatal path. The drains only
+log records newer than the last drain, so this is idempotent with the
+per-present drain. The two unit tests that include hle_svc.c stub the
+drains, as they already do for dm_backtrace.
+---
+ dm/games/0100000000010000/patches.py | 62 +++++++++++++++++++++++++---
+ dm/host/hle_svc.c                    | 15 +++++++
+ dm/host/hud_manual.c                 | 35 +++++++++++-----
+ dm/host/hud_manual.h                 | 10 +++--
+ dm/host/tests/t_heap_size.c          |  4 ++
+ dm/host/tests/t_svc_memory.c         |  4 ++
+ dm/tools/nso_asm.py                  |  1 +
+ 7 files changed, 111 insertions(+), 20 deletions(-)
+
+diff --git a/dm/games/0100000000010000/patches.py b/dm/games/0100000000010000/patches.py
+index 5bbf07f0..e6ccac01 100644
+--- a/dm/games/0100000000010000/patches.py
++++ b/dm/games/0100000000010000/patches.py
+@@ -4,7 +4,7 @@
+ # Only FRAME_STEP is used here: the in-game HUD editor runtime (hud_runtime.c,
+ # 0147) and the 0228 diagnostic headkey probe (temporary, removed once its log
+ # decides the costume-head fix). There are no word cuts and no observation gates.
+-from nso_asm import ADDI, ADDR, ADRP, B, CBNZ, CBZ, LDP_POST, LDRB_POST, LDRW, LDRX, LDXRW, MOV, MOVK, MOVZ, RET, STP_PRE, STRB, STRB_POST, STRW, STRX, STXRW, SUBI
++from nso_asm import ADDI, ADDR, ADRP, B, CBNZ, CBZ, LDP_POST, LDRB, LDRB_POST, LDRW, LDRX, LDXRW, MOV, MOVK, MOVZ, RET, STP_PRE, STRB, STRB_POST, STRW, STRX, STXRW, SUBI
+ 
+ BUILD_141 = 'b424be150a8e7d78701cbe7a439d9ebf'   # main 1.4.1 (game.tsv v393216)
+ 
+@@ -224,10 +224,15 @@ def _hud_runtime_frame_step(ctx):
+ # model-definition loader: at 0x65f8c8 (right after `bl 0x747300`, the resource
+ # lookup) and at 0x65fb50 (right before `bl 0x65db60`, the joint setup where the
+ # crash happens). Each cut's trampoline passes (key, res, ring, site) to one
+-# shared body, which appends a 64-byte record to a ring in the frame-step state
+-# page at +0x3300; the host drains the ring once per present
+-# (dm_diag_headkey_frame_tick in hud_manual.c) and logs only the keys
+-# containing "Head". Logging-only: the body writes nothing but the ring (never
++# shared body, which first scans the key for "Head" and only then appends a
++# 64-byte record to a ring in the frame-step state page at +0x3300 (write-time
++# filter, 0232: V1.3.58 proved the unfiltered stream overwhelms the 32-record
++# ring — ~700 0x65f520 calls per session, 430-628 records overwritten per run,
++# every Head record lost before the drain — so non-Head keys now earn no
++# record at all); the host drains the ring once per present
++# (dm_diag_headkey_frame_tick in hud_manual.c) and logs every committed
++# record, which by construction is a Head lookup. Logging-only: the body
++# writes nothing but the ring (never
+ # game state), touches no callee-saved register and no flag (every instruction
+ # is a load, store, register move/add/sub or a CBZ/CBNZ branch), and executes
+ # the replaced instruction before branching back, so the game runs exactly as
+@@ -279,6 +284,53 @@ def _diag_headkey_frame_step(ctx):
+     _w(MOVZ(15, 0x4844))          # x15 = 0x4844 ("HK")
+     _w(MOVK(15, 0x594B, 1))       # x15 = 0x594B4844 ("DHKY")
+     _w(STRW(15, 2, 0))            # [ring, #0] = magic
++    # Scan the key for "Head" (write-time filter): only a key containing
++    # "Head" earns a record. V1.3.58 (log-3f1647c8/96376669/71d81aef) proved
++    # the ring cannot hold the unfiltered stream: ~700 0x65f520 calls per
++    # session, bursts of 200-400 records between presents, and the 32-record
++    # ring overwrote 430-628 records per run, so every Head record was lost
++    # before the per-present drain saw it. The scan runs on the key string
++    # (x0) before any record is reserved: x10 = cursor, x13 = chars left
++    # (128, a backstop; keys are NUL-terminated, so the NUL check stops the
++    # scan first and the lookahead never reads past the terminator),
++    # x11 = byte. x0/x1/x2/x8 are preserved (the scan uses x10/x11/x13
++    # only), and no instruction sets the flags (byte equality is SUBI + CBZ,
++    # never CMP). A key with no "Head" returns without writing a record (no
++    # seq, no slot), so the ring holds only Head records and the drain logs
++    # every committed one. With the filter the write volume drops from ~700
++    # to the Head lookups only (a handful per session: the player head plus
++    # the kingdom's NPC heads), so the 32-record ring holds a whole
++    # inter-present burst; if a later run's drain still reports overwrites,
++    # that number says exactly how far the ring must grow.
++    _w(MOV(10, 0))                # x10 = key ptr (scan cursor)
++    _w(MOVZ(13, 128))             # x13 = 128 (max chars to scan)
++    _label('scan')
++    _w(LDRB(11, 10, 0))           # w11 = *cursor
++    _cbz(11, 'scan_miss')         # NUL -> end of string, no "Head"
++    _w(SUBI(11, 11, 0x48))        # w11 - 'H'
++    _cbz(11, 'scan_h')            # 'H' -> check the next three bytes
++    _label('scan_next')
++    _w(ADDI(10, 10, 1))           # cursor++
++    _w(SUBI(13, 13, 1))           # one fewer char left
++    _cbnz(13, 'scan')             # loop while chars remain
++    _b('scan_miss')               # ran out of chars -> no "Head"
++    _label('scan_h')
++    _w(LDRB(11, 10, 1))           # w11 = cursor[1]
++    _cbz(11, 'scan_miss')         # NUL -> string ends, no "Head"
++    _w(SUBI(11, 11, 0x65))        # - 'e'
++    _cbnz(11, 'scan_next')        # not 'e' -> advance one char and keep scanning
++    _w(LDRB(11, 10, 2))           # w11 = cursor[2]
++    _cbz(11, 'scan_miss')
++    _w(SUBI(11, 11, 0x61))        # - 'a'
++    _cbnz(11, 'scan_next')
++    _w(LDRB(11, 10, 3))           # w11 = cursor[3]
++    _cbz(11, 'scan_miss')
++    _w(SUBI(11, 11, 0x64))        # - 'd'
++    _cbnz(11, 'scan_next')
++    _b('scan_done')               # "Head" found -> skip the miss return
++    _label('scan_miss')
++    _w(RET)                       # no "Head" -> return without writing a record
++    _label('scan_done')
+     # doc / doc_b8 with NULL guards.
+     _cbz(1, 'res_null')
+     _w(LDRX(3, 1, 0x14))          # doc = [res, #0xa0]
+diff --git a/dm/host/hle_svc.c b/dm/host/hle_svc.c
+index 98e8334a..f7670637 100644
+--- a/dm/host/hle_svc.c
++++ b/dm/host/hle_svc.c
+@@ -1,6 +1,7 @@
+ // Horizon kernel system calls (triggered by the SDK runtime once the SDK is loaded). Only what the P1 boot chain needs is implemented: memory layout + heap + query + debug output + timing.
+ // Register convention: inputs w1.. / outputs w0=Result, x1=value (GetInfo / SetHeapSize), consistent with the public Horizon ABI.
+ #include "dm.h"
++#include "hud_manual.h"   // dm_diag_headkey/grow_frame_tick: the diagnostic probe rings, dumped on a fatal Break (0232)
+ #include <sys/mman.h>
+ #include <sys/mount.h>
+ #include <sys/resource.h>
+@@ -890,6 +891,20 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
+         LOG("Break#%d reason=%#llx Result=%#x svc at %s+%#llx", ++nb, regs[0], res, mm ? mm->name : "?", orig_addr);
+         dm_backtrace(regs[29]);
+         if (regs[0] & 0x80000000ull) return 0;   // notification only, can continue
++        // (0232) Dump the diagnostic probe rings before exiting: the host runs
++        // here after the SDK abort and before the process dies (the V1.3.58
++        // Explorer log shows this Break line and the backtrace above it, then
++        // the log ends), but no present runs after the abort, so the
++        // per-present drain never sees the aborting session's last records.
++        // The 0230 grow probe's record is the case that proves it: the
++        // aborting grow call is the first and only grow call in the session,
++        // the stub writes its record to the ring and V aborts before the next
++        // present, so three V1.3.58 runs had zero diag-grow lines. The drains
++        // only log records newer than the last drain, so calling them here as
++        // well as once per present is idempotent, and they are no-ops when the
++        // probes are not in the build (their ring magic does not match).
++        dm_diag_headkey_frame_tick();
++        dm_diag_grow_frame_tick();
+         _exit(42);
+     }
+     case 0x1E: guest_clock_read_wait(); regs[0] = 0; regs[1] = guest_ticks(); return 0;   // GetSystemTick
+diff --git a/dm/host/hud_manual.c b/dm/host/hud_manual.c
+index b78eb9f4..eae4b5bd 100644
+--- a/dm/host/hud_manual.c
++++ b/dm/host/hud_manual.c
+@@ -298,16 +298,23 @@ void dm_hud_manual_frame_tick(void) {
+ 
+ // ---- 0228 diagnostic: the headkey probe ring (dm_diag_headkey_frame_tick) ----
+ // The rewriter's diag_headkey stub (patches.py FRAME_STEP, 0228) writes one
+-// 64-byte record per 0x65f520 call into the frame-step state page at +0x3300
+-// (the 0129 HUD probe's region, free since that probe was deleted from the
++// 64-byte record per 0x65f520 Head-key call into the frame-step state page at
++// +0x3300 (the 0129 HUD probe's region, free since that probe was deleted from the
+ // profile; its host drain only writes the +0x04 slot before its magic check,
+-// so this ring's header leaves +0x04 reserved). This function drains the ring
+-// once per present (called from uw_frame_hook, next to
+-// dm_hud_manual_frame_tick) and logs only the keys containing "Head" -- the
+-// per-costume head lookup the 0228 fix depends on (REPORT-LOOKUP-DECODE.md
+-// §7.3). Logging-only: it never writes game state (it reads the ring, which
+-// the stub owns). Temporary: remove it with the probe once the §7.3 log has
+-// decided pre-register vs route-to-default-head.
++// so this ring's header leaves +0x04 reserved). The stub filters at write
++// time (0232: it scans the key for "Head" and writes no record for any other
++// key — V1.3.58 proved the unfiltered stream overwhelms the 32-record ring,
++// 430-628 records overwritten per run, every Head record lost), so every
++// record in the ring is a Head lookup and this function logs every committed
++// one. This function drains the ring once per present (called from
++// uw_frame_hook, next to dm_hud_manual_frame_tick) and once more from the
++// host's SVC Break handler when the game aborts (hle_svc.c case 0x26: the
++// aborting session's last records would otherwise die with the process
++// before the next present). The per-costume head lookup is what the 0228 fix
++// depends on (REPORT-LOOKUP-DECODE.md §7.3). Logging-only: it never writes
++// game state (it reads the ring, which the stub owns). Temporary: remove it
++// with the probe once the §7.3 log has decided pre-register vs
++// route-to-default-head.
+ // Ring (state +0x3300): +0x00 u32 magic "DHKY", +0x04 u32 reserved (the 0129
+ // probe's enabled slot), +0x08 u32 write_seq, +0x0C u32 next_off (relative to
+ // the record area, 0..0x800, wraps to 0; the record sits at ring + 0x20 +
+@@ -358,7 +365,8 @@ void dm_diag_headkey_frame_tick(void) {
+         if (seq > top) top = seq;
+         const char *key = (const char *)(rec + DIAG_HEADKEY_KEY_OFF);
+         if (!diag_headkey_key_ok(key)) continue;   // torn record: skip the line, but still advance past the seq
+-        if (!strstr(key, "Head")) continue;   // only head lookups decide 0228; other parts are noise
++        // No "Head" filter here: the stub filters at write time (0232), so
++        // every record in the ring is a Head lookup by construction.
+         uint64_t res = *(uint64_t *)(rec + 0);
+         uint64_t doc = *(uint64_t *)(rec + 8);
+         uint64_t doc_b8 = *(uint64_t *)(rec + 16);
+@@ -378,7 +386,12 @@ void dm_diag_headkey_frame_tick(void) {
+ // +0x3B20 (immediately after the 0228 headkey ring, which ends at +0x3B20;
+ // the state page is 0x4000 bytes, so the 16-record ring fits with room to
+ // spare). This function drains the ring once per present (called from
+-// uw_frame_hook, next to dm_diag_headkey_frame_tick) and logs every record
++// uw_frame_hook, next to dm_diag_headkey_frame_tick) and once more from the
++// host's SVC Break handler when the game aborts (hle_svc.c case 0x26, 0232:
++// the aborting grow call is the first and only grow call in the session, and
++// the process exits before the next present drains it, so its record would
++// otherwise die with the process — V1.3.58's three runs had zero diag-grow
++// lines for exactly this reason) and logs every record
+ // -- the grow-call parameters (container, size, count, aligned size, aux,
+ // site) of the allocator grow that precedes the Explorer/Football/Mechanic
+ // abort (REPORT-LOG108-LOG109.md §7). The abort is a deliberate SDK abort
+diff --git a/dm/host/hud_manual.h b/dm/host/hud_manual.h
+index 5e40133c..2277fa31 100644
+--- a/dm/host/hud_manual.h
++++ b/dm/host/hud_manual.h
+@@ -17,13 +17,15 @@
+ void dm_hud_manual_frame_tick(void);
+ 
+ // Drain the 0228 diagnostic headkey probe ring (called once per present from
+-// uw_frame_hook, next to dm_hud_manual_frame_tick). A no-op when the probe is
+-// not in the build (the ring magic does not match).
++// uw_frame_hook, next to dm_hud_manual_frame_tick, and once more from the
++// host's SVC Break handler when the game aborts, hle_svc.c case 0x26). A
++// no-op when the probe is not in the build (the ring magic does not match).
+ void dm_diag_headkey_frame_tick(void);
+ 
+ // Drain the 0230 diagnostic allocator grow probe ring (called once per present
+-// from uw_frame_hook, next to dm_diag_headkey_frame_tick). A no-op when the
+-// probe is not in the build (the ring magic does not match).
++// from uw_frame_hook, next to dm_diag_headkey_frame_tick, and once more from
++// the host's SVC Break handler when the game aborts, hle_svc.c case 0x26).
++// A no-op when the probe is not in the build (the ring magic does not match).
+ void dm_diag_grow_frame_tick(void);
+ 
+ #endif
+diff --git a/dm/host/tests/t_heap_size.c b/dm/host/tests/t_heap_size.c
+index 715490b2..2c5d7a2b 100644
+--- a/dm/host/tests/t_heap_size.c
++++ b/dm/host/tests/t_heap_size.c
+@@ -29,6 +29,10 @@ void hlecount_svc(int num) { (void)num; }
+ int svc_thread(int num, uint64_t *regs) { (void)num; (void)regs; return 0; }
+ module_t *module_of(const void *p) { (void)p; return NULL; }
+ void dm_backtrace(uint64_t fp) { (void)fp; }
++// hle_svc.c's Break handler (0232) dumps the diagnostic probe rings before
++// exiting; this test does not link hud_manual.c, so the drains are stubs here.
++void dm_diag_headkey_frame_tick(void) {}
++void dm_diag_grow_frame_tick(void) {}
+ void guest_clock_read_wait(void) {}
+ uint64_t guest_ns(void) { return 0; }
+ uint64_t guest_ticks(void) { return 0; }
+diff --git a/dm/host/tests/t_svc_memory.c b/dm/host/tests/t_svc_memory.c
+index f427616a..90c89bb2 100644
+--- a/dm/host/tests/t_svc_memory.c
++++ b/dm/host/tests/t_svc_memory.c
+@@ -37,6 +37,10 @@ struct dm_flags g_flag;
+ void hlecount_svc(int num) { (void)num; }
+ int svc_thread(int num, uint64_t *regs) { (void)num; (void)regs; return 0; }
+ void dm_backtrace(uint64_t fp) { (void)fp; }
++// hle_svc.c's Break handler (0232) dumps the diagnostic probe rings before
++// exiting; this test does not link hud_manual.c, so the drains are stubs here.
++void dm_diag_headkey_frame_tick(void) {}
++void dm_diag_grow_frame_tick(void) {}
+ void guest_clock_read_wait(void) {}
+ uint64_t guest_ns(void) { return 0; }
+ uint64_t guest_ticks(void) { return 0; }
+diff --git a/dm/tools/nso_asm.py b/dm/tools/nso_asm.py
+index 33fcd4bf..5aed87a0 100644
+--- a/dm/tools/nso_asm.py
++++ b/dm/tools/nso_asm.py
+@@ -31,6 +31,7 @@ def CBZ(rt, frm, to):
+ def LDRB_POST(t, n, imm): return 0x38400400 | ((imm & 0x1FF) << 12) | (n << 5) | t   # ldrb wt,[xn],#imm (post-index; bit 10 marks the writeback -- without it this decodes as ldurb, an unscaled load that never advances the pointer)
+ def STRB_POST(t, n, imm): return 0x38000400 | ((imm & 0x1FF) << 12) | (n << 5) | t   # strb wt,[xn],#imm (post-index; bit 10 marks the writeback)
+ def STRB(t, n, imm12=0): return 0x39000000 | (imm12 << 10) | (n << 5) | t   # strb wt,[xn,#imm12]
++def LDRB(t, n, imm12=0): return 0x39400000 | (imm12 << 10) | (n << 5) | t   # ldrb wt,[xn,#imm12] (unsigned offset; the load half of STRB)
+ def STRW(t, n, imm12=0): return 0xB9000000 | (imm12 << 10) | (n << 5) | t   # str wt,[xn,#imm12*4]
+ def LDXRW(t, n): return 0x885F7C00 | (n << 5) | t   # ldxr wt,[xn] (32-bit exclusive load)
+ def STXRW(s, t, n): return 0x88007C00 | (s << 16) | (n << 5) | t   # stxr ws,wt,[xn] (32-bit exclusive store; ws = 0 on success)
+-- 
+2.43.0
+
