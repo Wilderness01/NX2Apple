@@ -1,0 +1,133 @@
+From 5d095393606bd6566d199be1427d335d9b27a5c1 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Sun, 22 Nov 2026 11:46:55 +0000
+Subject: [PATCH] =?UTF-8?q?0237:=20route=20a=20NULL-doc=5Fb8=20costume-hea?=
+ =?UTF-8?q?d=20lookup=20to=20the=20shared=20high=20head=20(=C2=A77.3=20fix?=
+ =?UTF-8?q?)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ dm/games/0100000000010000/README.md  |  2 +-
+ dm/games/0100000000010000/patches.py | 84 ++++++++++++++++++++++++++++
+ 2 files changed, 85 insertions(+), 1 deletion(-)
+
+diff --git a/dm/games/0100000000010000/README.md b/dm/games/0100000000010000/README.md
+index 6e346d3c..5d8f1cc4 100644
+--- a/dm/games/0100000000010000/README.md
++++ b/dm/games/0100000000010000/README.md
+@@ -90,7 +90,7 @@ General host and tool changes first needed here; each applies to every game:
+ 
+ - Character selection in the in-game shop (0166, open): the shop rows are in (0167: Mario/Luigi/Wario at ItemList.byml 147,148,149, Luigi2D.szs icon, MSBT labels) and the title-menu picker is removed (0168: row 3 is VR again, guide taps fall through while a page is shown), but buying a row does not persist the character yet. The confirmed row cannot be identified from static code: the fs-preview route is refuted by log-64 (the shop opens every row's body file while building the list and nothing new at confirm), the 0x50a5c0 accessor's +0x70 is a float, not a row index, and NrvSelectDecideEnd (0x442980) is cleanup. The list NrvDecide hook point 0x2e8dfc is verified and can set a confirm flag, but the flag alone does not name the row.
+ - Costume hands stay stock (0222, stopgap, open): a costume's hand file is never redirected. The Mechanic form has no own hands (no `MarioMechanicHandL/R.szs` in RomFS), so it borrows the player's hands and looks `MarioHandL`/`MarioHandR` up by name; a costume hand file's FMDL is named after itself, the lookup returns NULL, and the bone-transform setup faults at NULL+0x28 (`0x6ad530`, log-93). The guard in `dm_char_redirect` keeps the stock white gloves. The proper fix, like 0220 for caps, is hand reskins with FMDL `MarioHandL`/`MarioHandR`.
+-- Costume-head crash, diagnostic probe (0228, open): a pool-external costume (Happi) and a pool-internal one (Explorer) crash identically at `0x6ad530` (log-106/log-107) because `(resource->0xa0)->0xb8 == 0` for the key `"ObjectData/<name>Head"` in the model-definition loader `0x65f520` -- the pool is not the discriminator. A temporary FRAME_STEP probe (two cuts at `0x65f8c8` and `0x65fb50`, ring in the state page at +0x3300, drained once per present) logs `key/res/doc/doc_b8` for every head lookup; run once per costume (Happi, Explorer, Hakama) and compare `doc_b8`. The fix (pre-register the head document, or route the key to the default head document) waits on that log. Remove the probe once it has decided.
++- Costume-head crash, diagnostic probe (0228, open): a pool-external costume (Happi) and a pool-internal one (Explorer) crash identically at `0x6ad530` (log-106/log-107) because `(resource->0xa0)->0xb8 == 0` for the key `"ObjectData/<name>Head"` in the model-definition loader `0x65f520` -- the pool is not the discriminator. A temporary FRAME_STEP probe (two cuts at `0x65f8c8` and `0x65fb50`, ring in the state page at +0x3300, drained once per present) logs `key/res/doc/doc_b8` for every head lookup; run once per costume (Happi, Explorer, Hakama) and compare `doc_b8`. The fix (pre-register the head document, or route the key to the default head document) waits on that log. Remove the probe once it has decided. Fixed by 0237 (REPORT-7-3-HEADKEY-LOOKUP.md): the backtrace in log-0b911672 (Football) and log-5d1c1a20 (Explorer) pins the chain 0x3e67e4 -> 0x3e7810 -> 0x6dc260 -> 0x6dc290 -> 0x660ab0 -> 0x65f520 -> 0x747300, and the head key is "ObjectData/<head>Head" with the head base name from a separate accessor (0x513760), not the clothes name and not the cap -- which is why matching caps still crash, and why the 0226 save write (which never wrote in those runs: 5 matches) cannot be the cause. The per-costume head document is not in the byml-document dictionary at assembly time (the head .szs FILE is served by the fs redirect, but the file and the document are different namespaces). A FRAME_STEP cut at 0x65f8cc (right after the 0228 probe's 0x65f8c8 cut) re-looks a NULL-doc_b8 head lookup up as the shared "ObjectData/MarioHighHead" (probe-proven valid, doc_b8 = 0x706f2c8000 in both runs) and uses that resource: the setter then reads a valid +0xb8. The costume hat is kept (geometry/texture come from the redirected head file); only the document metadata comes from the shared high head. The 0228 probe is kept: it logs the original NULL-doc_b8 lookup and the substituted valid one, and since the fix prevents the crash the drain now runs and both records reach the log.
+ - The three thunder geometry shaders do not translate.
+ - The silent first minute of sound.
+ - development.md calls SDK 7.3.2 "the oldest so far"; Mario Kart 8 Deluxe (SDK 4.4.0) is older now.
+diff --git a/dm/games/0100000000010000/patches.py b/dm/games/0100000000010000/patches.py
+index 084b9878..bd5a2c75 100644
+--- a/dm/games/0100000000010000/patches.py
++++ b/dm/games/0100000000010000/patches.py
+@@ -432,6 +432,89 @@ def _diag_headkey_frame_step(ctx):
+     emit(B(here(), 0x65fb54))                # back to the site + 4
+     fs_put(0x65fb50, [B(0x65fb50, start_b)], '0228 diagnostic: 0x65f520 headkey probe, joint-setup site (REPORT-LOOKUP-DECODE.md §7.3)')
+ 
++# (0237) Route a NULL-doc_b8 costume-head lookup to the shared high head.
++# §7.3: the setter 0x6ad4d0 faults at 0x6ad530 reading [x8,#0x28] with x8 = 0,
++# i.e. ([resource,#0xa0])->0xb8 == NULL, where resource is the 0x747300 result
++# for the key "ObjectData/<head>Head" built by 0x3e7810 from 0x513760(x25)
++# (the head base name; a separate accessor from the clothes name 0x513600).
++# The backtrace in log-0b911672 (Football) and log-5d1c1a20 (Explorer) pins
++# the chain 0x3e67e4 -> 0x3e7810 -> 0x6dc260 -> 0x6dc290 -> 0x660ab0 ->
++# 0x65f520 -> 0x747300 -> 0x65db60 -> 0x6b9af0 -> setter. The per-costume head
++# document is not in the byml-document dictionary at assembly time (the head
++# .szs FILE is served -- the [char] fs redirect MarioHead.szs ->
++# MarioFootballHead.szs works -- but the file and the document are different
++# namespaces: the fs redirect does not register the document). The shared
++# "ObjectData/MarioHighHead" document IS registered: the 0228 probe logged
++# doc_b8 = 0x706f2c8000 (non-NULL) for it in both the Explorer and Football
++# runs. So when a head lookup returns a resource whose document has a NULL
++# +0xb8, this cut re-looks the key up as "ObjectData/MarioHighHead" and uses
++# that resource instead: the setter then reads a valid +0xb8 and the joint
++# setup proceeds. The geometry/texture still come from the costume head file
++# (the fs redirect), so the costume hat is kept; only the document metadata
++# (InitModel/InitPose/InitPartsFixInfo) comes from the shared high head.
++# The cap is irrelevant to §7.3 (the head key comes from 0x513760, not the
++# cap), which is why matching caps still crash. The 0226 save write is also
++# irrelevant here: log-0b911672 shows the locate finding 5 matches and never
++# writing, yet the game still reached the head lookup with the costume name --
++# so the costume state comes from elsewhere, and the 0226 write timing cannot
++# be the cause. The 0228 probe is kept: it logs the original NULL-doc_b8
++# lookup at 0x65f8c8 and the substituted valid one at 0x65fb50, and since the
++# fix prevents the crash the once-per-present drain now runs and both records
++# reach the log, confirming the key and that the fix engaged.
++# Cut at 0x65f8cc (right after the 0228 probe's 0x65f8c8 cut, replacing
++# `mov x26, x0`): at the site x0 is the resource, x22 is the document,
++# x23 is the manager ([x20,#0xc8]) and x19 is the 0x747300 arg-4, all live.
++# The trampoline preserves x19-x30 and sp; it only writes x0-x2 and x22/x26.
++# It saves x30 across the fallback `bl 0x747300` (which clobbers it) and
++# executes the replaced instruction before branching back.
++DIAG_HEADKEY_FALLBACK_KEY = "ObjectData/MarioHighHead"
++
++def _headkey_fallback_frame_step(ctx):
++    here, emit, fs_site, fs_put, FS_STATE_OFF = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state
++    fs_site(0x65f8cc, 'fa0300aa')
++    # The fallback key string, embedded as data before the trampoline so the
++    # ADRP in the body can reach it.
++    key_addr = here()
++    key = DIAG_HEADKEY_FALLBACK_KEY.encode() + b'\x00'
++    key_words = [int.from_bytes(key[i:i+4].ljust(4, b'\x00'), 'little') for i in range(0, len(key), 4)]
++    for w in key_words: emit(w)
++    # Assemble the trampoline with a two-pass label resolution (same shape as
++    # the 0228 probe body).
++    body = []
++    labels = {}
++    def _w(word): body.append(('w', word))
++    def _label(name): labels[name] = len(body)
++    def _cbz(rt, label): body.append(('cbz', rt, label))
++    def _cbnz(rt, label): body.append(('cbnz', rt, label))
++    def _bl(target): body.append(('bl', target))
++    def _adrp(reg, target): body.append(('adrp', reg, target))
++    def _b_abs(target): body.append(('b_abs', target))
++    _w(STP_PRE(30, 31, 31, -16))   # stp x30, xzr, [sp, #-16]! (save x30: the bl clobbers it)
++    _cbz(22, 'fallback')           # if doc == 0, fallback
++    _w(LDRX(1, 22, 0x17))          # x1 = doc_b8 = [x22, #0xb8]
++    _cbnz(1, 'done')               # if doc_b8 != 0, normal path
++    _label('fallback')
++    _w(MOV(0, 23))                 # x0 = manager
++    _adrp(1, key_addr)             # x1 = page of "ObjectData/MarioHighHead"
++    _w(ADDI(1, 1, key_addr & 0xFFF))  # x1 = &"ObjectData/MarioHighHead"
++    _w(MOV(2, 19))                 # x2 = arg4
++    _bl(0x747300)                  # bl 0x747300 (fallback resource in x0)
++    _w(LDRX(22, 0, 0x14))          # x22 = [x0, #0xa0] (new doc)
++    _label('done')
++    _w(LDP_POST(30, 31, 31, 16))   # ldp x30, xzr, [sp], #16 (restore x30)
++    _w(MOV(26, 0))                 # x26 = x0 (the replaced instruction)
++    _b_abs(0x65f8d0)                # back to the site + 4
++    start = here()
++    for i, item in enumerate(body):
++        pc = start + 4 * i
++        if item[0] == 'w': emit(item[1])
++        elif item[0] == 'cbz': emit(CBZ(item[1], pc, start + 4 * labels[item[2]]))
++        elif item[0] == 'cbnz': emit(CBNZ(item[1], pc, start + 4 * labels[item[2]]))
++        elif item[0] == 'bl': emit(B(pc, item[1]) | 0x80000000)
++        elif item[0] == 'adrp': emit(ADRP(item[1], pc, item[2]))
++        elif item[0] == 'b_abs': emit(B(pc, item[1]))
++    fs_put(0x65f8cc, [B(0x65f8cc, start)], '0237: route a NULL-doc_b8 costume-head lookup to the shared high head (REPORT-7-3-HEADKEY-LOOKUP.md)')
++
+ # (0230 diagnostic) The allocator "grow" probe: log the grow-call parameters
+ # at the abort site (allocator 0x954310, REPORT-LOG108-LOG109.md §7 + the
+ # abort diagnosis) so the next device run of an aborting costume pins what
+@@ -736,6 +819,7 @@ def _diag_b_frame_step(ctx):
+ def _frame_step_141(ctx):
+     _hud_runtime_frame_step(ctx)
+     _diag_headkey_frame_step(ctx)
++    _headkey_fallback_frame_step(ctx)
+     _diag_grow_frame_step(ctx)
+     _diag_b_frame_step(ctx)
+ 
+-- 
+2.43.0
+

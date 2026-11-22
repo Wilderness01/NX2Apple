@@ -1,0 +1,38 @@
+From bab385737ae2ea0abbd9bff844b08d622681a9c3 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Sun, 22 Nov 2026 10:57:01 +0000
+Subject: [PATCH] 0236: declare one vsync when a game-set interval steps above
+ 1 (stutter guardrail)
+
+---
+ dm/gfx/nvn/hle_nvn.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/dm/gfx/nvn/hle_nvn.c b/dm/gfx/nvn/hle_nvn.c
+index 92b29346..f031d10e 100644
+--- a/dm/gfx/nvn/hle_nvn.c
++++ b/dm/gfx/nvn/hle_nvn.c
+@@ -1962,10 +1962,18 @@ static uint64_t present_period(const win_t *o) {
+ }
+ // The period the acquire thread declares to the scheduler (set_time_constraint): the present period, except that a hold the frame step raised for late frames keeps the cap's deadline.
+ // Declaring the longer hold let the performance controller move the game to the efficiency cores at half the clock (TOTK on an iPhone: 3.4 → 1.5 GHz and 65% → 5% on performance
+-// cores within 10 frames of a step to 30), where 60 fps no longer fits and every trial back to it fails. A step the game fixes itself (BotW's VFR override) is declared as it is
++// cores within 10 frames of a step to 30), where 60 fps no longer fits and every trial back to it fails. A step the game fixes itself used to be declared as it is (BotW's VFR
++// override); 0236 also clamps a game-set interval above 1 to one vsync, because the same longer-hold declaration moved Odyssey to the efficiency cores (log-91382a4f: 65-75% on
++// performance cores at the start, under 1% after, never back) and only the 60 fps deadline keeps the scheduler on the fast cores. The game's interval itself is untouched: the
++// frame still stays on screen for its own hold; only the declaration to the scheduler changes.
+ static uint64_t rt_period_ns(const win_t *o, uint64_t period) {
+     int c = fps_step_cap();
+-    if (!period || !c || !fstep_on() || (dm_fps_state && __atomic_load_n((uint32_t *)(dm_fps_state + 0x24), __ATOMIC_RELAXED))) return period;
++    if (!period || !c || !fstep_on() || (dm_fps_state && __atomic_load_n((uint32_t *)(dm_fps_state + 0x24), __ATOMIC_RELAXED))) {
++        // 0236: no frame step and no present cap, so the interval is the game's own: when it steps above 1, still declare one vsync (16.7 ms at 60 Hz).
++        // A present cap of 30 fps is not clamped: there the 33.3 ms declaration is the cap's own deadline, not a longer hold.
++        if (period && g_hz > 0 && !fstep_on() && !fps_present_cap() && present_itv(o) > 1) return 1000000000ull / (uint64_t)g_hz;
++        return period;
++    }
+     int kmin = fstep_hz() / c;
+     return present_itv(o) > kmin ? (uint64_t)kmin * 1000000000ull / (uint64_t)g_hz : period;
+ }
+-- 
+2.43.0
+
