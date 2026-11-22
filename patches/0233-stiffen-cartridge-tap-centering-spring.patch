@@ -1,0 +1,25 @@
+From cb05aa6f17008c43d03f8e799cbfa83f927a63b7 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Sat, 21 Nov 2026 20:50:15 +0800
+Subject: [PATCH] 0233: stiffen cartridge tap-centering spring
+
+---
+ dm/ios/Sources/Launcher.swift | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index ca579ed3..2225ffe7 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -710,7 +710,7 @@ private struct CartridgeCoverFlowView: View {
+         let willOpen = openId != item.id
+         openId = willOpen ? item.id : nil
+         onOpenChange(willOpen)
+-        withAnimation(.spring(response: 0.55, dampingFraction: 0.72)) {
++        withAnimation(.spring(response: 0.38, dampingFraction: 0.9)) {
+             centeredId = item.id
+         }
+     }
+-- 
+2.43.0
+
