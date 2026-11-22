@@ -1,0 +1,404 @@
+From 89e655f62e02733b511481aa87be5f4fbf4eee2e Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Sat, 21 Nov 2026 23:58:06 +0000
+Subject: [PATCH] 0234 diagnostic: B-cut probe for S/T/slot fields and grow
+ V/arena bump/end
+
+The Explorer/Football/Mechanic abort is a deliberate SDK abort in the
+grow branch of allocator 0x954310 (REPORT-GROW-ROOTCAUSE.md): the arena
+bumps past its end while loading a SARC archive, so it calls the heap's
+grow virtual function V, which aborts. Static disassembly pinned the
+container (a shared SARC-loading arena), the grow sizes (925,888 /
+946,368 / 430,272), and count Path B (4096), but four values are
+runtime-only and cannot be pinned statically: S and T (the two virtual
+returns in B that feed size and count), [x28,#0x30] (the size source,
+whose write point was not found), V (the heap grow virtual function),
+and the arena's bump/end at the abort instant.
+
+Two additions, both logging-only and both reusing the 0230/0232 grow
+ring (magic "GRWR", drained once per present and once more from the SVC
+Break handler on the abort, so the aborting records survive):
+- A B cut at 0x97e114 (`ldp w9, w8, [x28, #0x30]`, right after S (w26)
+  and T (w0) are computed) records S, T, [x28,#0x30], [x28,#0x24],
+  [x28,#0x34], [x28,#0x20] into the grow ring, write-time filtered to
+  [x28,#0x30] > 256KB (the aborting sizes are 430,272+, most B calls are
+  small) so the ring is not overwhelmed.
+- The grow body now also records V ([[heap_iface]], vtable slot 0), the
+  heap interface pointer ([x25,#0x10]), and the arena bump/end
+  ([container,#0xe0] / [container,#0xe8]) at the grow cut, so the log
+  shows V's identity and the remaining space (end - bump) at the abort.
+The grow record grows 64 -> 96 bytes and the ring shrinks 16 -> 8
+records (the state page still fits with room to spare); the drain logs
+B records and grow records with their own field names, told apart by
+site. Temporary: remove the cuts and the drain once the abort trigger
+is pinned. This build only gathers data; it does not fix the abort.
+---
+ dm/games/0100000000010000/patches.py | 184 ++++++++++++++++++++++++---
+ dm/host/hud_manual.c                 |  53 ++++++--
+ dm/host/hud_manual.h                 |   2 +
+ dm/tools/nso_asm.py                  |   3 +
+ 4 files changed, 216 insertions(+), 26 deletions(-)
+
+diff --git a/dm/games/0100000000010000/patches.py b/dm/games/0100000000010000/patches.py
+index e6ccac01..57266b80 100644
+--- a/dm/games/0100000000010000/patches.py
++++ b/dm/games/0100000000010000/patches.py
+@@ -4,7 +4,7 @@
+ # Only FRAME_STEP is used here: the in-game HUD editor runtime (hud_runtime.c,
+ # 0147) and the 0228 diagnostic headkey probe (temporary, removed once its log
+ # decides the costume-head fix). There are no word cuts and no observation gates.
+-from nso_asm import ADDI, ADDR, ADRP, B, CBNZ, CBZ, LDP_POST, LDRB, LDRB_POST, LDRW, LDRX, LDXRW, MOV, MOVK, MOVZ, RET, STP_PRE, STRB, STRB_POST, STRW, STRX, STXRW, SUBI
++from nso_asm import ADDI, ADDR, ADRP, B, BHI, CBNZ, CBZ, CMPR, LDP_POST, LDRB, LDRB_POST, LDRW, LDRX, LDXRW, MOV, MOVK, MOVZ, RET, STP_PRE, STRB, STRB_POST, STRW, STRX, STXRW, SUBI
+ 
+ BUILD_141 = 'b424be150a8e7d78701cbe7a439d9ebf'   # main 1.4.1 (game.tsv v393216)
+ 
+@@ -446,13 +446,13 @@ def _diag_headkey_frame_step(ctx):
+ # 0x954390 (the overflow entry 0x954370's own `ldr x8, [x0]`; that entry calls
+ # V inline and never reaches the shared tail, so one cut at 0x954478 alone
+ # would miss it). Each cut's trampoline passes the grow parameters to one
+-# shared body, which appends a 64-byte record to a ring in the frame-step
++# shared body, which appends a 96-byte record to a ring in the frame-step
+ # state page at +0x3B20 (immediately after the 0228 headkey ring, which ends
+ # at +0x3B20; the state page is 0x4000 bytes, so the ring fits with room to
+ # spare); the host drains the ring once per present
+ # (dm_diag_grow_frame_tick in hud_manual.c) and logs every record. Grow calls
+ # are rare (normal allocations use the inline buffer and never reach the grow
+-# path), so the 16-record ring is plenty. Logging-only: the body writes
++# path), so the 8-record ring is plenty. Logging-only: the body writes
+ # nothing but the ring (never game state), touches no callee-saved register
+ # and no flag (every instruction is a load, store, register move/add/sub or a
+ # CBZ/CBNZ branch), and executes the replaced instruction before branching
+@@ -460,13 +460,16 @@ def _diag_headkey_frame_step(ctx):
+ # cuts and the drain once the abort trigger is pinned.
+ # Ring (state +0x3B20): +0x00 u32 magic "GRWR", +0x04 u32 reserved, +0x08 u32
+ # write_seq (monotonic, atomic), +0x0C u32 next_off (byte offset of the next
+-# slot relative to the record area, 0..0x400, atomic, wraps to 0; the record
++# slot relative to the record area, 0..0x300, atomic, wraps to 0; the record
+ # sits at ring + 0x20 + next_off, so the zero-filled initial value 0 is
+-# already the first slot), +0x10..+0x1F reserved, +0x20 records[16] x 64 bytes.
+-# Record (64 bytes): +0 u64 container, +8 u64 size, +16 u64 count, +24 u64
++# already the first slot), +0x10..+0x1F reserved, +0x20 records[8] x 96 bytes.
++# Record (96 bytes): +0 u64 container, +8 u64 size, +16 u64 count, +24 u64
+ # aligned size, +32 u32 aux, +36 u32 site, +40 u32 seq (written LAST, the
+-# commit marker: the host only reads a record whose seq is set), +44..+63
+-# reserved. The aux field is [sp,#0x28] at the cut, which the three grow
++# commit marker: the host only reads a record whose seq is set), +44 u32
++# reserved, +48 u64 V (the heap grow virtual function pointer, 0234),
++# +56 u64 heap interface pointer ([x25,#0x10], 0234), +64 u64 bump
++# ([container,#0xe0] at the cut, 0234), +72 u64 end ([container,#0xe8] at
++# the cut, 0234), +80..+95 reserved. The aux field is [sp,#0x28] at the cut, which the three grow
+ # entries fill differently (overflow: w20 = count; bump-overflow: w8 =
+ # [container,#0x90] * count; space-check: w9 = -([container,#0x90] * count)),
+ # so aux + count identifies which grow condition fired.
+@@ -483,8 +486,9 @@ def _diag_headkey_frame_step(ctx):
+ # against the NSO).
+ DIAG_GROW_RING_OFF = 0x3B20
+ DIAG_GROW_MAGIC = 0x52575247   # "GRWR"
+-DIAG_GROW_REC_CAP = 16
+-DIAG_GROW_REC_BYTES = DIAG_GROW_REC_CAP * 64   # 0x400: next_off wraps here
++DIAG_GROW_REC_SIZE = 96
++DIAG_GROW_REC_CAP = 8
++DIAG_GROW_REC_BYTES = DIAG_GROW_REC_CAP * DIAG_GROW_REC_SIZE   # 0x300: next_off wraps here
+ 
+ def _diag_grow_frame_step(ctx):
+     here, emit, fs_site, fs_put, FS_STATE_OFF = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state
+@@ -520,20 +524,20 @@ def _diag_grow_frame_step(ctx):
+     _w(STXRW(14, 6, 7))           # try to store it; w14 = status (0 = ok)
+     _cbnz(14, 'seq_retry')
+     _w(MOV(12, 6))                # x12 = seq
+-    # Reserve a slot (atomic advance of next_off at ring+12, wraps 0x400 -> 0).
+-    # next_off is relative to the record area (0..0x400); the record sits at
++    # Reserve a slot (atomic advance of next_off at ring+12, wraps 0x300 -> 0).
++    # next_off is relative to the record area (0..0x300); the record sits at
+     # ring + 0x20 + next_off, so the zero-filled initial value 0 is already the
+     # first slot (a 0x20-based offset would have put the first record on the header).
+     _w(ADDI(7, 2, 12))            # x7 = &next_off
+     _label('slot_retry')
+     _w(LDXRW(5, 7))               # w5 = next_off
+-    _w(SUBI(6, 5, DIAG_GROW_REC_BYTES))   # x6 = next_off - 0x400
++    _w(SUBI(6, 5, DIAG_GROW_REC_BYTES))   # x6 = next_off - 0x300
+     _cbz(6, 'wrap')
+-    _w(ADDI(6, 5, 64))            # x6 = next_off + 64
++    _w(ADDI(6, 5, DIAG_GROW_REC_SIZE))    # x6 = next_off + 96
+     _b('slot_store')
+     _label('wrap')
+     _w(MOV(5, 31))                # x5 = 0 (the wrapped slot offset)
+-    _w(MOVZ(6, 64))               # x6 = 64 (the new next_off)
++    _w(MOVZ(6, DIAG_GROW_REC_SIZE))       # x6 = 96 (the new next_off)
+     _label('slot_store')
+     _w(STXRW(14, 6, 7))
+     _cbnz(14, 'slot_retry')
+@@ -546,6 +550,21 @@ def _diag_grow_frame_step(ctx):
+     _w(STRX(4, 9, 3))             # aligned size
+     _w(STRW(13, 9, 8))            # aux
+     _w(STRW(8, 9, 9))             # site (low 32 bits of x8)
++    # (0234) V, the heap interface pointer, and the arena bump/end at the cut.
++    # The heap interface pointer is the trampoline's pushed x0, at [sp,#0];
++    # V is its vtable slot 0 ([[heap_iface]]). The container is x0 (the body's
++    # 1st arg): bump is [container,#0xe0], end is [container,#0xe8]. x10/x11
++    # are free scratch (the reservation uses x5/x6/x7/x12/x14, never x10/x11).
++    # These are written BEFORE seq: seq stays the commit marker, written last.
++    _w(LDRX(10, 31, 0))           # x10 = heap interface pointer ([sp,#0])
++    _w(STRX(10, 9, 7))            # heap interface pointer (+56)
++    _w(LDRX(11, 10, 0))           # x11 = [heap_iface] (vtable)
++    _w(LDRX(11, 11, 0))           # x11 = [vtable] = V (vtable slot 0)
++    _w(STRX(11, 9, 6))            # V (+48)
++    _w(LDRX(10, 0, 0x1c))         # x10 = [container,#0xe0] (bump)
++    _w(STRX(10, 9, 8))            # bump (+64)
++    _w(LDRX(10, 0, 0x1d))         # x10 = [container,#0xe8] (end)
++    _w(STRX(10, 9, 9))            # end (+72)
+     _w(STRW(12, 9, 10))           # seq, LAST (the commit marker)
+     _w(RET)
+     probe = here()
+@@ -578,10 +597,145 @@ def _diag_grow_frame_step(ctx):
+         emit(B(here(), site + 4))            # back to the site + 4
+         fs_put(site, [B(site, start)], '0230 diagnostic: 0x954310 allocator grow probe, grow-call parameters (REPORT-LOG108-LOG109.md §7)')
+ 
++# (0234 diagnostic) The B-cut probe: log S, T and the slot fields at the
++# allocator call in B (0x97e278's function, REPORT-GROW-ROOTCAUSE.md), so the
++# next device run of an aborting costume pins whether the grow size is S or
++# [x28,#0x30], and whether count's 4096 is T. B computes
++# size = align_up(min(S, [x28,#0x30]), [x28,#0x34]) with S = 0x97cf30(x23)
++# (w26) and T = 0x97cf60(x23) (w0), both virtual-function returns that static
++# disassembly cannot pin; count is Path B (sign * max(T, 32) = 4096). The cut
++# is at 0x97e114 (`ldp w9, w8, [x28, #0x30]`, original bytes '89234629',
++# verified against the NSO), right after S (w26) and T (w0) are computed and
++# before either is overwritten (w26 is reloaded with T at 0x97e19c, w0 with
++# the aligned size at 0x97e26c). The trampoline pushes x0 (T) and dead x1,
++# passes (ring, site) to one shared body, which first filters on
++# [x28,#0x30] > 0x40000 (256KB, write-time: the aborting sizes are 430,272+
++# and most B calls are small, so the filter keeps the ring from being
++# overwhelmed the way the unfiltered 0x65f520 stream overwhelmed the 0228
++# ring in V1.3.58) and only then appends a 96-byte record to the SAME grow
++# ring at +0x3B20 (the 0230/0232 ring, magic "GRWR", drained once per present
++# and once more from the SVC Break handler on the abort, so the aborting
++# B record survives). The record reuses the grow record's layout, with the
++# B values in the grow fields (site 0x97e114 tells the drain it is a B
++# record): +0 u64 S, +8 u64 T, +16 u64 [x28,#0x30], +24 u64 [x28,#0x24],
++# +32 u32 [x28,#0x34], +36 u32 site, +40 u32 seq (LAST), +44 u32
++# [x28,#0x20], +48..+95 reserved. Logging-only: the body writes nothing but
++# the ring, touches no callee-saved register (w26/x28 are read, never
++# written; x19-x30 and sp are never touched) and executes the replaced
++# instruction before branching back. The flags are dead at the cut (the
++# `cmp w9, #0` at 0x97e118 re-sets them right after the cut), so the body's
++# CMPR/BHI filter is safe. Temporary: remove the cut and the drain once the
++# abort trigger is pinned.
++DIAG_B_CUT_SITE = 0x97e114
++DIAG_B_SIZE_THRESHOLD = 0x40000   # 256KB: only large B allocations earn a record
++
++def _diag_b_frame_step(ctx):
++    here, emit, fs_site, fs_put, FS_STATE_OFF = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state
++    ring = FS_STATE_OFF + DIAG_GROW_RING_OFF
++    body = []   # ('w', word) | ('cbz', rt, label) | ('cbnz', rt, label) | ('b', label) | ('bhi', label)
++    labels = {}
++    def _w(word): body.append(('w', word))
++    def _label(name): labels[name] = len(body)
++    def _cbz(rt, label): body.append(('cbz', rt, label))
++    def _cbnz(rt, label): body.append(('cbnz', rt, label))
++    def _b(label): body.append(('b', label))
++    def _bhi(label): body.append(('bhi', label))
++    # Write the ring magic first (idempotent, same value every call; the
++    # host drain gates on it).
++    _w(MOVZ(15, 0x5247))          # x15 = 0x5247 ("GR")
++    _w(MOVK(15, 0x5257, 1))       # x15 = 0x52575247 ("GRWR")
++    _w(STRW(15, 2, 0))            # [ring, #0] = magic
++    # Write-time filter: only a large [x28,#0x30] earns a record. [x28,#0x30]
++    # is the size source; min(S, [x28,#0x30]) > 256KB implies [x28,#0x30] >
++    # 256KB, so the filter never misses an aborting allocation (the three
++    # known grow sizes are 430,272+), while most B calls (small chunks) earn
++    # no record at all. w26 = S and x28 are callee-saved and are read, never
++    # written, by the body; the CMPR/BHI set and read the flags, which are
++    # dead at the cut (the `cmp w9, #0` at 0x97e118 re-sets them).
++    _w(LDRW(9, 28, 0xc))          # w9 = [x28, #0x30]
++    _w(MOVZ(10, 4, 1))            # x10 = 0x40000 (256KB)
++    _w(CMPR(9, 10))               # cmp x9, x10 (sets flags)
++    _bhi('record')                # [x28,#0x30] > 256KB -> record it
++    _w(RET)                       # else return without writing a record
++    _label('record')
++    # Save [x28,#0x30] in x10: the slot reservation below overwrites x9 with
++    # the record pointer, and x10 is free scratch (the reservation uses
++    # x5/x6/x7/x12/x14, never x10).
++    _w(MOV(10, 9))                # x10 = [x28, #0x30]
++    # Reserve a seq (atomic increment of write_seq at ring+8). Same as the
++    # grow body: the record's seq is the NEW value, so the first record is
++    # seq 1, never 0. The B and grow bodies share the ring, so their seqs
++    # are unique across both record kinds.
++    _w(ADDI(7, 2, 8))             # x7 = &write_seq
++    _label('seq_retry')
++    _w(LDXRW(5, 7))               # w5 = write_seq
++    _w(ADDI(6, 5, 1))             # x6 = write_seq + 1
++    _w(STXRW(14, 6, 7))           # try to store it; w14 = status (0 = ok)
++    _cbnz(14, 'seq_retry')
++    _w(MOV(12, 6))                # x12 = seq
++    # Reserve a slot (atomic advance of next_off at ring+12, wraps 0x300 -> 0).
++    _w(ADDI(7, 2, 12))            # x7 = &next_off
++    _label('slot_retry')
++    _w(LDXRW(5, 7))               # w5 = next_off
++    _w(SUBI(6, 5, DIAG_GROW_REC_BYTES))   # x6 = next_off - 0x300
++    _cbz(6, 'wrap')
++    _w(ADDI(6, 5, DIAG_GROW_REC_SIZE))    # x6 = next_off + 96
++    _b('slot_store')
++    _label('wrap')
++    _w(MOV(5, 31))                # x5 = 0 (the wrapped slot offset)
++    _w(MOVZ(6, DIAG_GROW_REC_SIZE))       # x6 = 96 (the new next_off)
++    _label('slot_store')
++    _w(STXRW(14, 6, 7))
++    _cbnz(14, 'slot_retry')
++    # x5 = slot offset (relative), x12 = seq.
++    _w(ADDI(5, 5, 0x20))          # x5 = 0x20 + next_off (the record's byte offset in the ring)
++    _w(ADDR(9, 2, 5))             # x9 = ring + slot (the record)
++    # Write the B record. S is w26 (read directly, never written); T is the
++    # trampoline's pushed x0 at [sp,#0]; the slot fields are read from x28.
++    _w(STRX(26, 9, 0))            # S (+0)
++    _w(LDRX(1, 31, 0))            # x1 = T ([sp,#0], the pushed x0)
++    _w(STRX(1, 9, 1))             # T (+8)
++    _w(STRX(10, 9, 2))            # [x28,#0x30] (+16)
++    _w(LDRW(3, 28, 9))            # w3 = [x28, #0x24]
++    _w(STRX(3, 9, 3))             # [x28,#0x24] (+24, zero-extended)
++    _w(LDRW(4, 28, 0xd))          # w4 = [x28, #0x34]
++    _w(STRW(4, 9, 8))             # [x28,#0x34] (+32)
++    _w(STRW(8, 9, 9))             # site (+36, low 32 bits of x8)
++    _w(LDRW(3, 28, 8))            # w3 = [x28, #0x20]
++    _w(STRW(3, 9, 11))            # [x28,#0x20] (+44)
++    _w(STRW(12, 9, 10))           # seq, LAST (the commit marker)
++    _w(RET)
++    probe = here()
++    for i, item in enumerate(body):
++        pc = probe + 4 * i
++        if item[0] == 'w': emit(item[1])
++        elif item[0] == 'cbz': emit(CBZ(item[1], pc, probe + 4 * labels[item[2]]))
++        elif item[0] == 'cbnz': emit(CBNZ(item[1], pc, probe + 4 * labels[item[2]]))
++        elif item[0] == 'bhi': emit(BHI(pc, probe + 4 * labels[item[1]]))
++        else: emit(B(pc, probe + 4 * labels[item[1]]))
++    # The cut replaces `ldp w9, w8, [x28, #0x30]` at 0x97e114. At the cut w26
++    # is S, w0 is T, and x28 is the slot object; w9/w8 are written by the
++    # replaced instruction, so the body clobbering them is harmless (the ldp
++    # reloads them). x1 is dead at the cut (B saved it into x28 at 0x97df80
++    # and does not use it again until 0x97e270). The trampoline pushes x0 (T)
++    # and dead x1, passes (ring, site) to the body, restores x0/x1, executes
++    # the replaced ldp, and branches back to 0x97e118.
++    fs_site(DIAG_B_CUT_SITE, '89234629')
++    start = here()
++    emit(STP_PRE(0, 1, 31, -16))         # push x0 (T) + dead x1
++    emit(ADRP(2, here(), ring)); emit(ADDI(2, 2, ring & 0xFFF))   # x2 = ring
++    emit(ADRP(8, here(), DIAG_B_CUT_SITE)); emit(ADDI(8, 8, DIAG_B_CUT_SITE & 0xFFF))   # x8 = site
++    emit(B(here(), probe) | 0x80000000)   # bl probe
++    emit(LDP_POST(0, 1, 31, 16))         # restore x0 (T); x1 restored too (dead)
++    emit(0x29462389)                     # ldp w9, w8, [x28, #0x30] (the replaced instruction)
++    emit(B(here(), DIAG_B_CUT_SITE + 4))  # back to the site + 4
++    fs_put(DIAG_B_CUT_SITE, [B(DIAG_B_CUT_SITE, start)], '0234 diagnostic: B-cut probe, S/T/slot fields at the allocator call (REPORT-GROW-ROOTCAUSE.md)')
++
+ def _frame_step_141(ctx):
+     _hud_runtime_frame_step(ctx)
+     _diag_headkey_frame_step(ctx)
+     _diag_grow_frame_step(ctx)
++    _diag_b_frame_step(ctx)
+ 
+ FRAME_STEP = {BUILD_141: _frame_step_141}
+ 
+diff --git a/dm/host/hud_manual.c b/dm/host/hud_manual.c
+index eae4b5bd..6b541e6a 100644
+--- a/dm/host/hud_manual.c
++++ b/dm/host/hud_manual.c
+@@ -402,19 +402,27 @@ void dm_diag_headkey_frame_tick(void) {
+ // it never writes game state (it reads the ring, which the stub owns).
+ // Temporary: remove it with the probe once the abort trigger is pinned.
+ // Ring (state +0x3B20): +0x00 u32 magic "GRWR", +0x04 u32 reserved, +0x08 u32
+-// write_seq, +0x0C u32 next_off (relative to the record area, 0..0x400,
++// write_seq, +0x0C u32 next_off (relative to the record area, 0..0x300,
+ // wraps to 0; the record sits at ring + 0x20 + next_off), +0x10..+0x1F
+-// reserved, +0x20 records[16] x 64 bytes.
+-// Record (64 bytes): +0 u64 container, +8 u64 size, +16 u64 count, +24 u64
++// reserved, +0x20 records[8] x 96 bytes.
++// Record (96 bytes): +0 u64 container, +8 u64 size, +16 u64 count, +24 u64
+ // aligned size, +32 u32 aux, +36 u32 site, +40 u32 seq (written LAST by the
+-// stub, the commit marker), +44..+63 reserved. A record whose seq is not set
+-// is an uncommitted (or torn) write: it is skipped, but its seq is still
+-// counted, so it never blocks later records.
++// stub, the commit marker), +44 u32 reserved, +48 u64 V (the heap grow
++// virtual function pointer, 0234), +56 u64 heap interface pointer ([x25,
++// #0x10], 0234), +64 u64 bump ([container,#0xe0] at the cut, 0234), +72 u64
++// end ([container,#0xe8] at the cut, 0234), +80..+95 reserved. A record
++// whose seq is not set is an uncommitted (or torn) write: it is skipped,
++// but its seq is still counted, so it never blocks later records. (0234)
++// The same ring also holds B-cut records (site 0x97e114): +0 u64 S, +8 u64
++// T, +16 u64 [x28,#0x30], +24 u64 [x28,#0x24], +32 u32 [x28,#0x34], +36
++// u32 site, +40 u32 seq (LAST), +44 u32 [x28,#0x20]. The drain tells them
++// apart by site and logs each kind with its own field names.
+ #define DIAG_GROW_RING_OFF  0x3B20
+ #define DIAG_GROW_MAGIC     0x52575247u   // "GRWR"
+-#define DIAG_GROW_REC_CAP   16
+-#define DIAG_GROW_REC_SIZE  64
++#define DIAG_GROW_REC_CAP   8
++#define DIAG_GROW_REC_SIZE  96
+ #define DIAG_GROW_SEQ_OFF   40
++#define DIAG_GROW_B_SITE    0x97e114u   // (0234) a B-cut record, not a grow record
+ 
+ static uint32_t g_diag_grow_last_seq;   // the highest record seq logged so far (seqs start at 1)
+ static int g_diag_grow_started;         // the identification line has been logged
+@@ -445,9 +453,32 @@ void dm_diag_grow_frame_tick(void) {
+         uint64_t aligned = *(uint64_t *)(rec + 24);
+         uint32_t aux = *(uint32_t *)(rec + 32);
+         uint32_t site = *(uint32_t *)(rec + 36);
+-        LOG("diag-grow: site=0x%x seq=%u container=0x%016llx size=%llu count=%llu aligned=%llu aux=0x%08x",
+-            site, seq, (unsigned long long)container, (unsigned long long)size,
+-            (unsigned long long)count, (unsigned long long)aligned, aux);
++        if (site == DIAG_GROW_B_SITE) {
++            // (0234) A B-cut record: the fields are S, T, [x28,#0x30],
++            // [x28,#0x24], [x28,#0x34], [x28,#0x20] in the grow slots.
++            // rec+0 S, rec+8 T, rec+16 slot+0xe8, rec+24 slot+0xdc,
++            // rec+32 slot+0xec, rec+44 slot+0xd8.
++            uint64_t slot_e8 = count;
++            uint64_t slot_dc = aligned;
++            uint32_t slot_ec = aux;
++            uint32_t slot_d8 = *(uint32_t *)(rec + 44);
++            LOG("diag-grow: site=0x%x seq=%u B S=%llu T=%llu slot_e8=%llu slot_dc=%llu slot_ec=%u slot_d8=%u",
++                site, seq, (unsigned long long)container, (unsigned long long)size,
++                (unsigned long long)slot_e8, (unsigned long long)slot_dc, slot_ec, slot_d8);
++        } else {
++            // A grow record (0234 adds V, the heap interface pointer, and
++            // the arena bump/end at the cut).
++            uint64_t vfunc = *(uint64_t *)(rec + 48);
++            uint64_t heap_iface = *(uint64_t *)(rec + 56);
++            uint64_t bump = *(uint64_t *)(rec + 64);
++            uint64_t end = *(uint64_t *)(rec + 72);
++            LOG("diag-grow: site=0x%x seq=%u container=0x%016llx size=%llu count=%llu aligned=%llu aux=0x%08x V=0x%016llx heap_iface=0x%016llx bump=0x%016llx end=0x%016llx remain=%lld",
++                site, seq, (unsigned long long)container, (unsigned long long)size,
++                (unsigned long long)count, (unsigned long long)aligned, aux,
++                (unsigned long long)vfunc, (unsigned long long)heap_iface,
++                (unsigned long long)bump, (unsigned long long)end,
++                (long long)(end - bump));
++        }
+     }
+     if (low != 0xffffffffu && low > g_diag_grow_last_seq + 1)
+         LOG("diag-grow: ring overwrote %u record(s) before this drain (seq %u..%u unseen)",
+diff --git a/dm/host/hud_manual.h b/dm/host/hud_manual.h
+index 2277fa31..cab2bb19 100644
+--- a/dm/host/hud_manual.h
++++ b/dm/host/hud_manual.h
+@@ -26,6 +26,8 @@ void dm_diag_headkey_frame_tick(void);
+ // from uw_frame_hook, next to dm_diag_headkey_frame_tick, and once more from
+ // the host's SVC Break handler when the game aborts, hle_svc.c case 0x26).
+ // A no-op when the probe is not in the build (the ring magic does not match).
++// (0234) The same ring also holds the B-cut records (S/T/slot fields at the
++// allocator call in B); the drain tells them apart by site.
+ void dm_diag_grow_frame_tick(void);
+ 
+ #endif
+diff --git a/dm/tools/nso_asm.py b/dm/tools/nso_asm.py
+index 5aed87a0..39884191 100644
+--- a/dm/tools/nso_asm.py
++++ b/dm/tools/nso_asm.py
+@@ -40,6 +40,9 @@ CLREX = 0xD503305F   # clrex
+ def BEQ(frm, to):
+     off = to - frm; assert -(1 << 20) <= off < (1 << 20) and off % 4 == 0
+     return 0x54000000 | (((off >> 2) & 0x7FFFF) << 5)
++def BHI(frm, to):
++    off = to - frm; assert -(1 << 20) <= off < (1 << 20) and off % 4 == 0
++    return 0x54000000 | (((off >> 2) & 0x7FFFF) << 5) | 0x8   # b.hi (unsigned higher: C=1 and Z=0)
+ def CBNZ(rt, frm, to):
+     off = to - frm; assert -(1 << 20) <= off < (1 << 20) and off % 4 == 0
+     return 0x35000000 | (((off >> 2) & 0x7FFFF) << 5) | rt   # cbnz w<rt>, <to> (tests the register, not the flags)
+-- 
+2.43.0
+

@@ -179,3 +179,6 @@
 0230-diagnostic-allocator-grow-probe.patch
 0232-diagnostic-probe-write-filter-and-abort-dump.patch
 0231-launcher-cartridge-tap-frame-detents.patch
+0234-diagnostic-b-cut-s-t-v-arena-probe.patch
+0233-stiffen-cartridge-tap-centering-spring.patch
+0235-hide-compass-red-x-picplayer.patch
