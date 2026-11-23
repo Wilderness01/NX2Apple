@@ -184,3 +184,4 @@
 0235-hide-compass-red-x-picplayer.patch
 0236-stutter-guardrail-declare-one-vsync.patch
 0237-headkey-fallback-to-high-head.patch
+0239-headkey-fallback-head-only.patch
