@@ -186,3 +186,4 @@
 0237-headkey-fallback-to-high-head.patch
 0239-headkey-fallback-head-only.patch
 0240-frameheap-arena-grow-overflow-to-expheap.patch
+0241-frameheap-expheap-lookup-fix.patch
