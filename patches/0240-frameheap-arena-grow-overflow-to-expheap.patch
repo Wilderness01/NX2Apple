@@ -1,0 +1,294 @@
+From 8cefaf70391fbcd386c996fc0566d1cd675f3636 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Tue, 24 Nov 2026 02:19:31 +0000
+Subject: [PATCH 7/7] 0240: route a FrameHeap arena-grow overflow to the global
+ ExpHeap (fix the SARC arena abort)
+
+---
+ dm/games/0100000000010000/patches.py | 243 ++++++++++-----------------
+ 1 file changed, 88 insertions(+), 155 deletions(-)
+
+diff --git a/dm/games/0100000000010000/patches.py b/dm/games/0100000000010000/patches.py
+index 03ea5686..2e1f8419 100644
+--- a/dm/games/0100000000010000/patches.py
++++ b/dm/games/0100000000010000/patches.py
+@@ -4,7 +4,7 @@
+ # Only FRAME_STEP is used here: the in-game HUD editor runtime (hud_runtime.c,
+ # 0147) and the 0228 diagnostic headkey probe (temporary, removed once its log
+ # decides the costume-head fix). There are no word cuts and no observation gates.
+-from nso_asm import ADDI, ADDR, ADRP, B, BHI, CBNZ, CBZ, CMPR, LDP_POST, LDRB, LDRB_POST, LDRW, LDRX, LDXRW, MOV, MOVK, MOVZ, RET, STP_PRE, STRB, STRB_POST, STRW, STRX, STXRW, SUBI
++from nso_asm import ADDI, ADDR, ADRP, B, BHI, BLR, CBNZ, CBZ, CMPR, LDP_POST, LDRB, LDRB_POST, LDRW, LDRX, LDXRW, MOV, MOVK, MOVZ, RET, STP_PRE, STRB, STRB_POST, STRW, STRX, STXRW, SUBI
+ 
+ BUILD_141 = 'b424be150a8e7d78701cbe7a439d9ebf'   # main 1.4.1 (game.tsv v393216)
+ 
+@@ -545,172 +545,105 @@ def _headkey_fallback_frame_step(ctx):
+         elif item[0] == 'b_abs': emit(B(pc, item[1]))
+     fs_put(0x65f8cc, [B(0x65f8cc, start)], '0239: head-only fallback -- route a NULL-doc_b8 costume-HEAD lookup to the shared high head; non-head lookups pass through (REPORT-7-3-HEAD-ONLY.md)')
+ 
+-# (0230 diagnostic) The allocator "grow" probe: log the grow-call parameters
+-# at the abort site (allocator 0x954310, REPORT-LOG108-LOG109.md §7 + the
+-# abort diagnosis) so the next device run of an aborting costume pins what
+-# overflows. The abort is a deliberate SDK abort (nn::diag::Abort) in the
+-# grow branch of 0x954310: a container's inline buffer cannot hold the request
+-# (or a count/size overflows), so it calls the heap's grow virtual function V,
+-# which aborts. The chain loads a SARC archive (constructor arg "sarc"). V's
+-# identity and assertion condition are not pinned by static disassembly, and
+-# the discriminating test (log-115: Explorer clothes + Happi cap, still the
+-# same abort) proved the trigger is on the BODY/clothes side, not the cap.
+-# Two FRAME_STEP cuts in 0x954310, one per grow entry that reaches the virtual
+-# call: at 0x954478 (the shared tail: `ldr x8, [x0]`, reached from the
+-# bump-overflow entry 0x954428 and the space-check entry 0x954468) and at
+-# 0x954390 (the overflow entry 0x954370's own `ldr x8, [x0]`; that entry calls
+-# V inline and never reaches the shared tail, so one cut at 0x954478 alone
+-# would miss it). Each cut's trampoline passes the grow parameters to one
+-# shared body, which appends a 96-byte record to a ring in the frame-step
+-# state page at +0x3B20 (immediately after the 0228 headkey ring, which ends
+-# at +0x3B20; the state page is 0x4000 bytes, so the ring fits with room to
+-# spare); the host drains the ring once per present
+-# (dm_diag_grow_frame_tick in hud_manual.c) and logs every record. Grow calls
+-# are rare (normal allocations use the inline buffer and never reach the grow
+-# path), so the 8-record ring is plenty. Logging-only: the body writes
+-# nothing but the ring (never game state), touches no callee-saved register
+-# and no flag (every instruction is a load, store, register move/add/sub or a
+-# CBZ/CBNZ branch), and executes the replaced instruction before branching
+-# back, so the game runs exactly as without the probe. Temporary: remove the
+-# cuts and the drain once the abort trigger is pinned.
+-# Ring (state +0x3B20): +0x00 u32 magic "GRWR", +0x04 u32 reserved, +0x08 u32
+-# write_seq (monotonic, atomic), +0x0C u32 next_off (byte offset of the next
+-# slot relative to the record area, 0..0x300, atomic, wraps to 0; the record
+-# sits at ring + 0x20 + next_off, so the zero-filled initial value 0 is
+-# already the first slot), +0x10..+0x1F reserved, +0x20 records[8] x 96 bytes.
+-# Record (96 bytes): +0 u64 container, +8 u64 size, +16 u64 count, +24 u64
+-# aligned size, +32 u32 aux, +36 u32 site, +40 u32 seq (written LAST, the
+-# commit marker: the host only reads a record whose seq is set), +44 u32
+-# reserved, +48 u64 V (the heap grow virtual function pointer, 0234),
+-# +56 u64 heap interface pointer ([x25,#0x10], 0234), +64 u64 bump
+-# ([container,#0xe0] at the cut, 0234), +72 u64 end ([container,#0xe8] at
+-# the cut, 0234), +80..+95 reserved. The aux field is [sp,#0x28] at the cut, which the three grow
+-# entries fill differently (overflow: w20 = count; bump-overflow: w8 =
+-# [container,#0x90] * count; space-check: w9 = -([container,#0x90] * count)),
+-# so aux + count identifies which grow condition fired.
+-# Site facts (verified in the disassembly, 0x954310..0x9544d0): at both cuts
+-# x21 is the container, x22 the size, w20 the count, x24 the aligned size
+-# (align_up(max(size,8),8)), x25 the heap object, x0 the heap interface
+-# pointer ([x25,#0x10], read by the replaced instruction), and the stack args
+-# are [sp,#8]=container/size, [sp,#0x18]=count, [sp,#0x20]=aligned size,
+-# [sp,#0x28]=aux. x0 is the only live caller-saved register at the cuts (x1
+-# is rewritten before any read after either cut); x19-x25 and sp are never
+-# touched by the body, and the flags are dead at both cuts (the last flag
+-# read is the branch that entered the grow path). The replaced instruction
+-# is `ldr x8, [x0]` at both cuts (original bytes '080040f9', verified
+-# against the NSO).
++# (0240) Route a FrameHeap arena-grow overflow to the global ExpHeap.
++# Root cause (REPORT-0234-PROBE-DATA-ANALYSIS.md, device-probed by the 0234
++# probe in V1.3.62, three runs): the SARC-loading container is a
++# sead::FrameHeap, a fixed-length frame heap (+0xe0 head, +0xe8 tail). Its
++# grow virtual function V (vtable slot 0) aborts by design when called: the
++# abort is not "out of memory", it is "grow called on a heap that cannot
++# grow" (Explorer is short by only 143 KB and still aborts). The allocator
++# 0x954310 serves only this FrameHeap; its three grow entries all call V:
++# the count/size-overflow entry at 0x954370 (inline `blr x8` at 0x954398),
++# the bump-overflow entry at 0x954428 and the space-check entry at 0x954468
++# (both reach the shared tail at 0x954478, `blr x8` at 0x954484). The SARC
++# grow goes through the shared tail (probe site 0x954478, aux 0x1000 =
++# unit*count from the bump-overflow entry), so this fix cuts the shared
++# tail's `blr x8` only; the overflow entry at 0x954398 is a separate V-call
++# site that does not fire for the SARC grow (count 4096 passes the tst
++# check at 0x954368) and is left alone.
++# The cut replaces the `blr x8` at 0x954484 with `b <trampoline>`. The
++# trampoline tries the global heap's allocate (vtable+0x30, the same
++# interface the dispatcher 0x93eb50 uses: `ldr x8,[x1]; ldr x3,[x8,#0x30];
++# br x3`, called as (allocator, size, count)) on the global heap x25, which
++# is the FrameHeap's backing store (an ExpHeap). On success it jumps to
++# 0x95448c, the unlock-if-locked branch (`cbnz x19,#0x95449c`), and the
++# epilogue returns the pointer in x23 -- NOT to 0x954488 (which zeroes x23)
++# and NOT to 0x9544a4 (which skips the unlock). On failure (ExpHeap returns
++# 0) it calls V directly from the trampoline, with the grow request rebuilt
++# (`ldr x0,[x25,#0x10]` for the heap interface, `add x1,sp,#8` for
++# &grow_request); V aborts, exactly as before. It does NOT branch back to
++# 0x954478: the cut at 0x954484 replaced the `blr x8`, so returning there
++# would re-enter the trampoline and loop forever on failure.
++# Register safety: at the cut x25 is the global heap, x22 the size, w20 the
++# count and x19 the lock flag (0, or &mutex at container+0x98), all
++# callee-saved and preserved across the trampoline's `blr` (which clobbers
++# only caller-saved registers and x30; the allocator's x30 is saved on its
++# stack and restored by the epilogue). The trampoline writes only x0/x1/x2/
++# x8 (caller-saved, dead after the V call in the original code) and x23
++# (the return value, set deliberately). sp is never touched, so the grow
++# request at [sp,#8] is intact for the fail path.
++# Cost (intentional, by design): the ExpHeap block is never freed by the
++# FrameHeap reset, so each overflowing SARC load leaks ~1 MB (925,888 /
++# 946,368 bytes); a few MB per game session at most. The SARC data is just
++# bytes, so loading it from the ExpHeap instead of the FrameHeap changes
++# nothing the loader reads.
++# The 0234 grow probe (0230 diagnostic) is REMOVED by this patch: its two
++# cuts (0x954478, 0x954390) and its body are deleted, and its mission is
++# complete (the probe data pinned the root cause). The B cut at 0x97e114
++# (0234 diagnostic) is KEPT: it writes to the same ring (state +0x3B20,
++# kept below for it) and does not conflict with this cut. The 0228 headkey
++# probe and the 0239 head-only fallback are untouched.
++# UNPINNED: the ExpHeap allocate at [x25] vtable+0x30 is inferred from the
++# dispatcher interface (0x93eb50, same `ldr x3,[x8,#0x30]` shape) and has
++# NOT been called on a real device; the mock verifies the logic on host
++# values only. Device acceptance: Explorer / Football / Mechanic enter a
++# kingdom without the abort backtrace, and the good costumes (Happi /
++# Hakama / Armor / Painter) are unaffected (they never reach the overflow
++# path, so this cut is a no-op for them).
++# The ring constants below are kept for the B cut (0234 diagnostic), which
++# writes its records to the same ring at state +0x3B20.
+ DIAG_GROW_RING_OFF = 0x3B20
+ DIAG_GROW_MAGIC = 0x52575247   # "GRWR"
+ DIAG_GROW_REC_SIZE = 96
+ DIAG_GROW_REC_CAP = 8
+ DIAG_GROW_REC_BYTES = DIAG_GROW_REC_CAP * DIAG_GROW_REC_SIZE   # 0x300: next_off wraps here
+ 
+-def _diag_grow_frame_step(ctx):
++def _arena_expheap_frame_step(ctx):
+     here, emit, fs_site, fs_put, FS_STATE_OFF = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state
+-    ring = FS_STATE_OFF + DIAG_GROW_RING_OFF
+-    # Assemble the shared body into a word list first: its forward branches
+-    # need their targets resolved before any word is emitted.
+-    body = []   # ('w', word) | ('cbz', rt, label) | ('cbnz', rt, label) | ('b', label)
++    fs_site(0x954484, '00013fd6')
++    body = []
+     labels = {}
+     def _w(word): body.append(('w', word))
+     def _label(name): labels[name] = len(body)
+     def _cbz(rt, label): body.append(('cbz', rt, label))
+-    def _cbnz(rt, label): body.append(('cbnz', rt, label))
+-    def _b(label): body.append(('b', label))
+-    # x0 = container, x1 = size, x2 = ring base, x3 = count, x4 = aligned
+-    # size, x13 = aux, x8 = site. Uses x0-x15 only (all caller-saved);
+-    # x19-x30 and sp are never touched, and no instruction sets the flags,
+-    # so the game resumes exactly as at the cut. x13 holds aux through the
+-    # seq/slot reservation (the reservation uses x5/x6/x7/x12/x14, never x13).
+-    # Write the ring magic first: the host drain gates on it, and nothing
+-    # else writes it (the state page starts zero-filled) — without this the
+-    # drain returns on every present and the probe is silent (the 0228
+-    # headkey probe's DHKY bug: log-108..115, eight runs, zero lines).
+-    # Idempotent (same value every call).
+-    _w(MOVZ(15, 0x5247))          # x15 = 0x5247 ("GR")
+-    _w(MOVK(15, 0x5257, 1))       # x15 = 0x52575247 ("GRWR")
+-    _w(STRW(15, 2, 0))            # [ring, #0] = magic
+-    # Reserve a seq (atomic increment of write_seq at ring+8). The record's
+-    # seq is the NEW value, so the first record is seq 1, never 0.
+-    _w(ADDI(7, 2, 8))             # x7 = &write_seq
+-    _label('seq_retry')
+-    _w(LDXRW(5, 7))               # w5 = write_seq
+-    _w(ADDI(6, 5, 1))             # x6 = write_seq + 1
+-    _w(STXRW(14, 6, 7))           # try to store it; w14 = status (0 = ok)
+-    _cbnz(14, 'seq_retry')
+-    _w(MOV(12, 6))                # x12 = seq
+-    # Reserve a slot (atomic advance of next_off at ring+12, wraps 0x300 -> 0).
+-    # next_off is relative to the record area (0..0x300); the record sits at
+-    # ring + 0x20 + next_off, so the zero-filled initial value 0 is already the
+-    # first slot (a 0x20-based offset would have put the first record on the header).
+-    _w(ADDI(7, 2, 12))            # x7 = &next_off
+-    _label('slot_retry')
+-    _w(LDXRW(5, 7))               # w5 = next_off
+-    _w(SUBI(6, 5, DIAG_GROW_REC_BYTES))   # x6 = next_off - 0x300
+-    _cbz(6, 'wrap')
+-    _w(ADDI(6, 5, DIAG_GROW_REC_SIZE))    # x6 = next_off + 96
+-    _b('slot_store')
+-    _label('wrap')
+-    _w(MOV(5, 31))                # x5 = 0 (the wrapped slot offset)
+-    _w(MOVZ(6, DIAG_GROW_REC_SIZE))       # x6 = 96 (the new next_off)
+-    _label('slot_store')
+-    _w(STXRW(14, 6, 7))
+-    _cbnz(14, 'slot_retry')
+-    # x5 = slot offset (relative), x12 = seq.
+-    _w(ADDI(5, 5, 0x20))          # x5 = 0x20 + next_off (the record's byte offset in the ring)
+-    _w(ADDR(9, 2, 5))             # x9 = ring + slot (the record)
+-    _w(STRX(0, 9, 0))             # container
+-    _w(STRX(1, 9, 1))             # size
+-    _w(STRX(3, 9, 2))             # count
+-    _w(STRX(4, 9, 3))             # aligned size
+-    _w(STRW(13, 9, 8))            # aux
+-    _w(STRW(8, 9, 9))             # site (low 32 bits of x8)
+-    # (0234) V, the heap interface pointer, and the arena bump/end at the cut.
+-    # The heap interface pointer is the trampoline's pushed x0, at [sp,#0];
+-    # V is its vtable slot 0 ([[heap_iface]]). The container is x0 (the body's
+-    # 1st arg): bump is [container,#0xe0], end is [container,#0xe8]. x10/x11
+-    # are free scratch (the reservation uses x5/x6/x7/x12/x14, never x10/x11).
+-    # These are written BEFORE seq: seq stays the commit marker, written last.
+-    _w(LDRX(10, 31, 0))           # x10 = heap interface pointer ([sp,#0])
+-    _w(STRX(10, 9, 7))            # heap interface pointer (+56)
+-    _w(LDRX(11, 10, 0))           # x11 = [heap_iface] (vtable)
+-    _w(LDRX(11, 11, 0))           # x11 = [vtable] = V (vtable slot 0)
+-    _w(STRX(11, 9, 6))            # V (+48)
+-    _w(LDRX(10, 0, 0x1c))         # x10 = [container,#0xe0] (bump)
+-    _w(STRX(10, 9, 8))            # bump (+64)
+-    _w(LDRX(10, 0, 0x1d))         # x10 = [container,#0xe8] (end)
+-    _w(STRX(10, 9, 9))            # end (+72)
+-    _w(STRW(12, 9, 10))           # seq, LAST (the commit marker)
+-    _w(RET)
+-    probe = here()
++    def _b_abs(target): body.append(('b_abs', target))
++    # Try the global heap's allocate (vtable+0x30) for the overflowing
++    # request. x25 = global heap, x22 = size, x20 = count, x19 = lock flag.
++    _w(LDRX(8, 25, 0))          # x8 = [x25] (global heap vtable)
++    _w(LDRX(8, 8, 6))           # x8 = [x8, #0x30] (allocate)
++    _w(MOV(0, 25))              # x0 = allocator (global heap)
++    _w(MOV(1, 22))              # x1 = size
++    _w(MOV(2, 20))              # x2 = count
++    _w(BLR(8))                  # blr x8 (ExpHeap allocate; x0 = pointer or 0)
++    _cbz(0, 'fail')             # ExpHeap returned 0 -> fall back to V
++    _w(MOV(23, 0))              # x23 = pointer (the allocator's return value)
++    _b_abs(0x95448c)            # unlock-if-locked branch, then epilogue returns x23
++    _label('fail')
++    # Call V directly from the trampoline (it aborts, never returns). Do NOT
++    # branch back to 0x954478: the cut replaced the `blr x8` there, so that
++    # would re-enter this trampoline and loop forever on failure.
++    _w(LDRX(0, 25, 2))          # x0 = heap_iface = [x25, #0x10] (restore)
++    _w(LDRX(8, 0, 0))           # x8 = [x0] (vtable)
++    _w(LDRX(8, 8, 0))           # x8 = [x8] (V, vtable slot 0)
++    _w(ADDI(1, 31, 8))          # x1 = &grow_request (sp + 8)
++    _w(BLR(8))                  # blr x8 (call V; aborts, never returns)
++    start = here()
+     for i, item in enumerate(body):
+-        pc = probe + 4 * i
++        pc = start + 4 * i
+         if item[0] == 'w': emit(item[1])
+-        elif item[0] == 'cbz': emit(CBZ(item[1], pc, probe + 4 * labels[item[2]]))
+-        elif item[0] == 'cbnz': emit(CBNZ(item[1], pc, probe + 4 * labels[item[2]]))
+-        else: emit(B(pc, probe + 4 * labels[item[1]]))
+-    # The two cuts share one trampoline shape (only the site value and the
+-    # return address differ). At each cut x0 is the heap interface pointer
+-    # (live: the replaced instruction reads it), x1 is dead (rewritten before
+-    # any read after either cut), and x21/x22/w20/x24 hold container/size/
+-    # count/aligned size. The aux load runs BEFORE the push, while sp is
+-    # still the allocator's frame base.
+-    for site in (0x954478, 0x954390):
+-        fs_site(site, '080040f9')
+-        start = here()
+-        emit(LDRW(13, 31, 0xa))              # w13 = aux = [sp, #0x28]
+-        emit(STP_PRE(0, 1, 31, -16))         # push x0 (iface ptr) + dead x1
+-        emit(MOV(0, 21))                     # x0 = container (the body's 1st arg)
+-        emit(MOV(1, 22))                     # x1 = size (the body's 2nd arg)
+-        emit(MOV(3, 20))                     # x3 = count (the body's 3rd arg)
+-        emit(MOV(4, 24))                     # x4 = aligned size (the body's 4th arg)
+-        emit(ADRP(2, here(), ring)); emit(ADDI(2, 2, ring & 0xFFF))   # x2 = ring
+-        emit(ADRP(8, here(), site)); emit(ADDI(8, 8, site & 0xFFF))   # x8 = site
+-        emit(B(here(), probe) | 0x80000000)   # bl probe
+-        emit(LDP_POST(0, 1, 31, 16))         # restore x0 (iface ptr); x1 restored too (dead)
+-        emit(0xF9400008)                     # ldr x8, [x0] (the replaced instruction)
+-        emit(B(here(), site + 4))            # back to the site + 4
+-        fs_put(site, [B(site, start)], '0230 diagnostic: 0x954310 allocator grow probe, grow-call parameters (REPORT-LOG108-LOG109.md §7)')
++        elif item[0] == 'cbz': emit(CBZ(item[1], pc, start + 4 * labels[item[2]]))
++        elif item[0] == 'b_abs': emit(B(pc, item[1]))
++    fs_put(0x954484, [B(0x954484, start)], '0240: FrameHeap arena-grow overflow -> global ExpHeap allocate; ExpHeap failure calls V (aborts, as before) (REPORT-0234-PROBE-DATA-ANALYSIS.md)')
+ 
+ # (0234 diagnostic) The B-cut probe: log S, T and the slot fields at the
+ # allocator call in B (0x97e278's function, REPORT-GROW-ROOTCAUSE.md), so the
+@@ -850,7 +783,7 @@ def _frame_step_141(ctx):
+     _hud_runtime_frame_step(ctx)
+     _diag_headkey_frame_step(ctx)
+     _headkey_fallback_frame_step(ctx)
+-    _diag_grow_frame_step(ctx)
++    _arena_expheap_frame_step(ctx)
+     _diag_b_frame_step(ctx)
+ 
+ FRAME_STEP = {BUILD_141: _frame_step_141}
+-- 
+2.43.0
+
