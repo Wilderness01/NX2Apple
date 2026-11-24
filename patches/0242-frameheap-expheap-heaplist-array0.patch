@@ -1,0 +1,244 @@
+From 09f2c5ae3715fc953f8b9b6091e4aa1c41868e8d Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Tue, 24 Nov 2026 10:49:19 +0000
+Subject: [PATCH] 0242: route the FrameHeap arena-grow overflow to the ExpHeap
+ via array[0] of the global heap list (replace getCurrentHeap)
+
+0241 used sead::getCurrentHeap (0x9564a0), but the V1.3.64 device run
+proved it returns the FrameHeap during SARC loading (log-cc02472d.txt,
+Football full costume: clean arena abort, backtrace byte-identical to
+V1.3.62 except frame 4 = main+0x14d4264, the return after the 0241
+trampoline's fail-path blr -- the guard fired and V aborted). 0240 was
+wrong before it (it read [x25], struct S's first field = DATA, as a
+vtable and jumped to 0x11019a0e8; DmIOS-2026-11-24-154754.ips, V1.3.63).
+
+The new lookup reads the ExpHeap as array[0] of the global heap list at
+GOT 0x13663e0 (count at +0, array at +8) -- the first heap registered,
+i.e. the root ExpHeap. The game itself reads array[0] as a heap (0x942da0
+passes it to the allocation helper 0x951150 and to 0x96a0c0; 0x9436d0
+allocates the game's main heap FROM array[0] via vtable+0x80 and
+setCurrentHeap()s the result), and array[0] is NOT the FrameHeap
+(0x951150 calls [heap_vtable + 0x80] as a function, but the FrameHeap
+vtable 0xdbdf00 has a DATA pointer at +0x80, 0x1352b18). The guard
+compares array[0]'s vtable against 0xdbdf00 directly; on failure (empty
+list, NULL array[0], FrameHeap vtable, or allocate returns 0) it calls V
+directly (aborts, as before). The cut (0x954484) and the success target
+(0x95448c) are unchanged. Mock 6 lines pass, asm all-pass (24-instruction
+trampoline verified word for word).
+---
+ dm/games/0100000000010000/patches.py | 169 ++++++++++++++++-----------
+ 1 file changed, 98 insertions(+), 71 deletions(-)
+
+diff --git a/dm/games/0100000000010000/patches.py b/dm/games/0100000000010000/patches.py
+index ee3fcd92..d2571048 100644
+--- a/dm/games/0100000000010000/patches.py
++++ b/dm/games/0100000000010000/patches.py
+@@ -545,7 +545,7 @@ def _headkey_fallback_frame_step(ctx):
+         elif item[0] == 'b_abs': emit(B(pc, item[1]))
+     fs_put(0x65f8cc, [B(0x65f8cc, start)], '0239: head-only fallback -- route a NULL-doc_b8 costume-HEAD lookup to the shared high head; non-head lookups pass through (REPORT-7-3-HEAD-ONLY.md)')
+ 
+-# (0240, corrected by 0241) Route a FrameHeap arena-grow overflow to the global ExpHeap.
++# (0240, corrected by 0241, replaced by 0242) Route a FrameHeap arena-grow overflow to the global ExpHeap.
+ # Root cause (REPORT-0234-PROBE-DATA-ANALYSIS.md, device-probed by the 0234
+ # probe in V1.3.62, three runs): the SARC-loading container is a
+ # sead::FrameHeap, a fixed-length frame heap (+0xe0 head, +0xe8 tail). Its
+@@ -562,52 +562,69 @@ def _headkey_fallback_frame_step(ctx):
+ # site that does not fire for the SARC grow (count 4096 passes the tst
+ # check at 0x954368) and is left alone.
+ # The cut replaces the `blr x8` at 0x954484 with `b <trampoline>`. The
+-# trampoline gets the current heap via sead::getCurrentHeap (0x9564a0) --
+-# the same function the dispatcher 0x93eb50 calls when the allocator arg is
+-# NULL -- then calls that heap's allocate (vtable+0x30, the same interface
+-# the dispatcher uses: `ldr x8,[x1]; ldr x3,[x8,#0x30]; br x3`, called as
+-# (allocator, size, count)). (0241 CORRECTS 0240 here: 0240 did
+-# `ldr x8,[x25]` / `ldr x8,[x8,#0x30]`, treating [x25] as a vtable, but
+-# [x25] is struct S's first field (offset 0) = DATA, not a vtable -- it read
+-# S+0x30 as the allocate function and jumped to a .data address. Device
+-# proof: DmIOS-2026-11-24-154754.ips, V1.3.63 Football run, EXC_BAD_ACCESS /
+-# KERN_PROTECTION_FAILURE at 0x11019a0e8, CODESIGNING "Invalid Page",
+-# backtrace frame 1 = 0x97e278, x0=x25=0x1104AE080, x8=PC=0x11019a0e8. The
+-# 0240 concept (overflow -> ExpHeap) is right; only the lookup was wrong.)
+-# Guard: if the current heap IS the FrameHeap (x21), the trampoline does
+-# NOT use it (that would re-enter this allocator and the trampoline
+-# forever); it falls back to V instead. On success it jumps to 0x95448c,
++# trampoline gets the ExpHeap as array[0] of the global heap list at GOT
++# 0x13663e0 (count at +0, array at +8) -- the first heap registered, i.e.
++# the root ExpHeap -- then calls its allocate (vtable+0x30, the same
++# interface the dispatcher uses: `ldr x8,[x1]; ldr x3,[x8,#0x30]; br x3`,
++# called as (allocator, size, count)). (0242 REPLACES 0241's lookup: 0241
++# used sead::getCurrentHeap (0x9564a0), but the V1.3.64 device run proved
++# it returns the FrameHeap during SARC loading (log-cc02472d.txt, Football
++# full costume: clean arena abort, backtrace byte-identical to V1.3.62
++# except frame 4 = main+0x14d4264, the return after the 0241 trampoline's
++# fail-path `blr x8` -- the guard fired and V aborted). 0240's lookup was
++# already wrong (it read [x25], struct S's first field = DATA, as a vtable
++# and jumped to 0x11019a0e8; DmIOS-2026-11-24-154754.ips, V1.3.63). The
++# 0240 concept (overflow -> ExpHeap) is right; only the lookup was wrong
++# twice. Evidence for array[0] (REPORT-0242-EXPHEAP-ROUTE.md): the game
++# itself reads array[0] as a heap -- 0x942da0 passes it to the allocation
++# helper 0x951150 and to 0x96a0c0; 0x9436d0 allocates the game's main heap
++# FROM array[0] (vtable+0x80) and setCurrentHeap()s the result -- and
++# array[0] is NOT the FrameHeap: 0x951150 calls [heap_vtable + 0x80] as a
++# function, but the FrameHeap vtable (0xdbdf00, unique: 0x954310 occurs
++# once in .rodata) has a DATA pointer at +0x80 (0x1352b18).)
++# Guard: if array[0]'s vtable IS the FrameHeap vtable (0xdbdf00), the
++# trampoline does NOT use it (that would re-enter this allocator and the
++# trampoline forever); it falls back to V instead. On success it jumps to 0x95448c,
+ # the unlock-if-locked branch (`cbnz x19,#0x95449c`), and the epilogue
+ # returns the pointer in x23 -- NOT to 0x954488 (which zeroes x23) and NOT
+-# to 0x9544a4 (which skips the unlock). On failure (current heap is NULL,
+-# or is the FrameHeap, or allocate returns 0) it calls V directly from the
+-# trampoline, with the grow request rebuilt (`ldr x0,[x25,#0x10]` for the
+-# heap interface, `add x1,sp,#8` for &grow_request); V aborts, exactly as
+-# before. It does NOT branch back to 0x954478: the cut at 0x954484 replaced
+-# the `blr x8`, so returning there would re-enter the trampoline and loop
+-# forever on failure.
++# to 0x9544a4 (which skips the unlock). On failure (the heap list is
++# empty, or array[0] is NULL, or its vtable is the FrameHeap vtable, or
++# allocate returns 0) it calls V directly from the trampoline, with the
++# grow request rebuilt (`ldr x0,[x25,#0x10]` for the heap interface,
++# `add x1,sp,#8` for &grow_request); V aborts, exactly as before. It does
++# NOT branch back to 0x954478: the cut at 0x954484 replaced the `blr x8`,
++# so returning there would re-enter the trampoline and loop forever on
++# failure.
+ # Register safety: at the cut x25 is the struct S pointer, x22 the size,
+ # w20 the count and x19 the lock flag (0, or &mutex at container+0x98), all
+-# callee-saved and preserved across the trampoline's `bl`/`blr` calls
+-# (0x9564a0 preserves x19 and the AAPCS64 callee-saved registers x19-x28;
+-# the allocator's x30 is saved on its stack at [sp,#0x70] and restored by
+-# the epilogue at 0x95448c, so the trampoline's `bl`/`blr` clobbering x30 is
+-# harmless -- the trampoline JUMPS to 0x95448c, it does not `ret`). The
+-# trampoline writes only x0/x1/x2/x8 (caller-saved, dead after the V call in
+-# the original code) and x23 (the return value, set deliberately). sp is
+-# never touched, so the grow request at [sp,#8] is intact for the fail path
+-# (0x9564a0 uses its own stack frame and restores sp before returning).
+-# UNPINNED: whether 0x9564a0 returns the ExpHeap (the desired case) or the
+-# FrameHeap in the SARC-load context on FileLoadThread cannot be decided
+-# from static disassembly alone (the SARC loader does not call
+-# setCurrentHeap, so the current heap is the thread's ambient heap; the
+-# guard covers the FrameHeap case by falling back to V, so the fix is safe
+-# either way, but if the current heap IS the FrameHeap the costumes still
+-# abort and the fix does not help). The mock verifies the logic on host
+-# values only. Device acceptance: Explorer / Football / Mechanic enter a
+-# kingdom without the abort backtrace and without a codesigning kill, and
+-# the good costumes (Happi / Hakama / Armor / Painter) are unaffected (they
+-# never reach the overflow path, so this cut is a no-op for them).
++# callee-saved and preserved across the trampoline's `blr` call (the
++# allocator's x30 is saved on its stack at [sp,#0x70] and restored by the
++# epilogue at 0x95448c, so the trampoline's `blr` clobbering x30 is harmless
++# -- the trampoline JUMPS to 0x95448c, it does not `ret`). The trampoline
++# writes only x0/x1/x2/x8/x9 (caller-saved, dead after the V call in the
++# original code: x9 held an intermediate of the allocator's size
++# computation and the epilogue at 0x95448c never reads it) and x23 (the
++# return value, set deliberately). sp is never touched, so the grow request
++# at [sp,#8] is intact for the fail path. The `cbz` checks are the 32-bit
++# form (as in 0239/0241): a NULL pointer is 0, a valid heap pointer has
++# non-zero low 32 bits; the count is an i32, so `cbz w1` tests count == 0.
++# The `cmp`/`b.eq` guard: `cbz` does not set flags, so the `cmp` sets them
++# fresh and `b.eq` reads them; no flag-clobbering instruction sits between.
++# UNPINNED: whether array[0] is the ExpHeap (the desired case) cannot be
++# decided from static disassembly alone -- the list contents are runtime
++# values, and the "first registered = root ExpHeap" step is the sead
++# creation order (the root heap is created first, before any FrameHeap),
++# corroborated by the game allocating its main heap FROM array[0] at
++# 0x9436d0, but not proven by a single instruction. The guard covers the
++# FrameHeap case (vtable == 0xdbdf00 -> fall back to V, abort as before),
++# and an array[0] that cannot hold the SARC (allocate returns 0) also
++# falls back to V, so the fix is safe either way; but if array[0] is not
++# a heap that can hold 946,368 bytes, the costumes still abort and the fix
++# does not help. The mock verifies the logic on host values only. Device
++# acceptance: Explorer / Football / Mechanic enter a kingdom without the
++# abort backtrace and without a codesigning kill, and the good costumes
++# (Happi / Hakama / Armor / Painter) are unaffected (they never reach the
++# overflow path, so this cut is a no-op for them).
+ # Cost (intentional, by design): the ExpHeap block is never freed by the
+ # FrameHeap reset, so each overflowing SARC load leaks ~1 MB (925,888 /
+ # 946,368 bytes); a few MB per game session at most. The SARC data is just
+@@ -636,36 +653,46 @@ def _arena_expheap_frame_step(ctx):
+     def _label(name): labels[name] = len(body)
+     def _cbz(rt, label): body.append(('cbz', rt, label))
+     def _beq(label): body.append(('beq', label))
+-    def _bl_abs(target): body.append(('bl_abs', target))
++    def _adrp(reg, target): body.append(('adrp', reg, target))
+     def _b_abs(target): body.append(('b_abs', target))
+-    # (0241) Get the current heap via sead::getCurrentHeap (0x9564a0) -- the
+-    # same function the dispatcher 0x93eb50 calls when the allocator arg is
+-    # NULL -- then call that heap's allocate (vtable+0x30). x25 = struct S
+-    # pointer (the arg 0x9564a0 takes, as the dispatcher passes it), x22 =
+-    # size, x20 = count, x21 = FrameHeap container, x19 = lock flag.
+-    # The 0240 trampoline is WRONG and is replaced here: it did
+-    # `ldr x8,[x25]` / `ldr x8,[x8,#0x30]`, treating [x25] as a vtable, but
+-    # [x25] is struct S's first field (offset 0) = DATA, not a vtable, so it
+-    # read S+0x30 as the allocate function and jumped to a .data address.
+-    # Device proof (DmIOS-2026-11-24-154754.ips, V1.3.63 Football run):
+-    # EXC_BAD_ACCESS / KERN_PROTECTION_FAILURE at 0x11019a0e8, CODESIGNING
+-    # "Invalid Page", faulting thread FileLoadThread, backtrace frame 1 =
+-    # 0x97e278 (right after the SARC allocate call), x0=x25=0x1104AE080,
+-    # x1=946368 (Football SARC size), x2=4096, x8=PC=0x11019a0e8. The 0240
+-    # CONCEPT (overflow -> ExpHeap) is right; only the vtable lookup was
+-    # wrong. The correct lookup is via 0x9564a0 (which the allocator itself
+-    # never calls, but the dispatcher does -- see 0x93eb50).
+-    # Guard: if the current heap IS the FrameHeap (x21), do NOT use it --
+-    # that would re-enter this allocator (0x954310) and the trampoline
+-    # forever. Fall back to V (abort, as before) instead.
+-    _w(MOV(0, 25))              # x0 = struct S pointer (arg for 0x9564a0)
+-    _bl_abs(0x9564a0)           # bl 0x9564a0 (x0 = current heap)
+-    _cbz(0, 'fail')             # current heap is NULL -> fall back to V
+-    _w(CMPR(0, 21))             # cmp x0, x21 (is the current heap the FrameHeap?)
++    # (0242) Get the ExpHeap as array[0] of the global heap list at GOT
++    # 0x13663e0 (count at +0, array at +8) -- the first heap registered,
++    # i.e. the root ExpHeap -- then call its allocate (vtable+0x30). x22 =
++    # size, x20 = count, x21 = FrameHeap container, x25 = struct S pointer,
++    # x19 = lock flag.
++    # 0241 is DEAD and is replaced here: it used sead::getCurrentHeap
++    # (0x9564a0), but the V1.3.64 device run proved that returns the
++    # FrameHeap during SARC loading (log-cc02472d.txt, Football full
++    # costume: clean arena abort, backtrace byte-identical to V1.3.62 except
++    # frame 4 = main+0x14d4264, the return after the 0241 trampoline's
++    # fail-path `blr x8` -- the guard fired and V aborted). 0240 was wrong
++    # before it (it read [x25], struct S's first field = DATA, as a vtable
++    # and jumped to 0x11019a0e8; DmIOS-2026-11-24-154754.ips, V1.3.63).
++    # The 0240 CONCEPT (overflow -> ExpHeap) is right; only the lookup was
++    # wrong twice. Evidence for array[0] (REPORT-0242-EXPHEAP-ROUTE.md):
++    # the game itself reads array[0] as a heap (0x942da0 passes it to the
++    # allocation helper 0x951150 and to 0x96a0c0; 0x9436d0 allocates the
++    # game's main heap FROM array[0] via vtable+0x80 and setCurrentHeap()s
++    # the result), and array[0] is NOT the FrameHeap (0x951150 calls
++    # [heap_vtable + 0x80] as a function, but the FrameHeap vtable 0xdbdf00
++    # has a DATA pointer at +0x80, 0x1352b18).
++    # Guard: if array[0]'s vtable IS the FrameHeap vtable (0xdbdf00), do NOT
++    # use it -- that would re-enter this allocator (0x954310) and the
++    # trampoline forever. Fall back to V (abort, as before) instead.
++    _adrp(0, 0x13663e0)          # adrp x0, #0x1366000 (GOT page of the heap list)
++    _w(LDRX(0, 0, 0x7c))        # ldr x0, [x0, #0x3e0] (heap list object)
++    _w(LDRW(1, 0, 0))           # ldr w1, [x0] (count)
++    _cbz(1, 'fail')             # count == 0 -> fall back to V
++    _w(LDRX(0, 0, 1))           # ldr x0, [x0, #8] (array)
++    _w(LDRX(0, 0, 0))           # ldr x0, [x0] (array[0] = ExpHeap)
++    _cbz(0, 'fail')             # array[0] is NULL -> fall back to V
++    _w(LDRX(8, 0, 0))           # ldr x8, [x0] (vtable)
++    _adrp(9, 0xdbdf00)           # adrp x9, #0xdbd000 (FrameHeap vtable page)
++    _w(ADDI(9, 9, 0xf00))       # add x9, x9, #0xf00 (x9 = 0xdbdf00)
++    _w(CMPR(8, 9))              # cmp x8, x9 (is the vtable the FrameHeap vtable?)
+     _beq('fail')                # yes -> fall back to V (do NOT recurse)
+     _w(MOV(1, 22))              # x1 = size
+     _w(MOV(2, 20))              # x2 = count (x20's upper bits are zero -- set by `mov w20, w2` at 0x95435c -- so this is the zero-extended count, as the dispatcher's `mov w2, w19`)
+-    _w(LDRX(8, 0, 0))           # x8 = [x0] (current heap vtable)
+     _w(LDRX(8, 8, 6))           # x8 = [x8, #0x30] (allocate)
+     _w(BLR(8))                  # blr x8 (allocate(heap, size, count); x0 = pointer or 0)
+     _cbz(0, 'fail')             # allocate returned 0 -> fall back to V
+@@ -686,9 +713,9 @@ def _arena_expheap_frame_step(ctx):
+         if item[0] == 'w': emit(item[1])
+         elif item[0] == 'cbz': emit(CBZ(item[1], pc, start + 4 * labels[item[2]]))
+         elif item[0] == 'beq': emit(BEQ(pc, start + 4 * labels[item[1]]))
+-        elif item[0] == 'bl_abs': emit(BL(pc, item[1]))
++        elif item[0] == 'adrp': emit(ADRP(item[1], pc, item[2]))
+         elif item[0] == 'b_abs': emit(B(pc, item[1]))
+-    fs_put(0x954484, [B(0x954484, start)], '0241: FrameHeap arena-grow overflow -> current heap (getCurrentHeap 0x9564a0) allocate; FrameHeap guard + ExpHeap failure call V (aborts, as before) (REPORT-0241-EXPHEAP-LOOKUP-FIX.md)')
++    fs_put(0x954484, [B(0x954484, start)], '0242: FrameHeap arena-grow overflow -> ExpHeap array[0] of the global heap list (GOT 0x13663e0) allocate; FrameHeap-vtable guard + failure call V (aborts, as before) (REPORT-0242-EXPHEAP-ROUTE.md)')
+ 
+ # (0234 diagnostic) The B-cut probe: log S, T and the slot fields at the
+ # allocator call in B (0x97e278's function, REPORT-GROW-ROOTCAUSE.md), so the
+-- 
+2.43.0
+
