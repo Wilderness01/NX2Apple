@@ -1,0 +1,101 @@
+From 4b7b415659d43cc3eccb4f55cc37482765349c89 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Wed, 25 Nov 2026 22:39:19 +0000
+Subject: [PATCH] 0247: raise present-thread RT computation cap to the full period
+
+0247 (stutter experiment): raise the present thread's real-time CPU
+declaration (computation) cap from 0.9 x period to 1.0 x period, and
+narrow the upward re-declare band from 15% to 5%.
+
+The device log (log-6a204394.txt, V1.3.67, 340 s) shows the declared
+computation pinned at the 15.00 ms cap 16 times, i.e. the present
+thread's per-frame CPU peak exceeds 13.6 ms (15 / 1.1) or its p90
+exceeds 12 ms, while the worst frames are CPU-side stalls (frame
+5003/15938: 142 ms, submit ~6 ms, GPU ~8 ms). The code comment says a
+frame running past its declared computation stalls the thread 30-60 ms
+(Dark Souls precedent: declaring above the peak held 60 fps).
+
+Two changes, both in dm/gfx/nvn/hle_nvn.c, declaration only -- no game
+interval change, no frame-rate cap change, no 0236 change:
+
+1. Both 0.9 x period clamps (set_time_constraint_comp and rt_comp_tick)
+   become 1.0 x period, so the declaration can reach 16.667 ms and cover
+   a peak up to 15.15 ms (16.667 / 1.1).
+2. The upward re-declare band narrows 15% -> 5%. The 15% band exceeds
+   the 11.1% headroom between the old 15.00 ms cap and the 16.667 ms
+   period, so a declaration stuck at 15.00 ms could never climb to the
+   new cap (15.00 x 1.15 = 17.25 > 16.667); lifting the cap alone would
+   have been a no-op in exactly the stuck state the log shows. The
+   downward band stays 0.85.
+
+Experiment, not a proven fix: the cap -> demotion -> stall causal chain
+is unpinned; the next device log decides (P-core share, dropped frames,
+p99 frame time, declared computation). If the P-core share does not move,
+this line is refuted. Risk: a larger computation claim may let the
+scheduler favour the present thread over the main thread; watch main
+thread ms/s in the next log. Kernel acceptance: XNU's
+thread_policy_set_internal rejects only constraint < computation,
+computation > max_rt_quantum (50 ms) or computation < min_rt_quantum
+(50 us); there is no computation <= period check, so computation ==
+period (16,666,667 ns, exactly the period -- verified by mock) should be
+accepted. If the kernel rejects, set_time_constraint_comp logs "failed
+to set" and keeps the old value; that line in the next log is the
+discriminator.
+
+Mock: 33/33 checks pass (~/workspace/.tmp/mock-0247/), including the
+cap-only variant proving the hysteresis trap, the fixed DM_RT_COMP=20
+case proving env alone cannot exceed 15 ms before the fix, and the
+kernel-rejection failure path.
+---
+ dm/gfx/nvn/hle_nvn.c | 26 ++++++++++++++++++++++----
+ 1 file changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/dm/gfx/nvn/hle_nvn.c b/dm/gfx/nvn/hle_nvn.c
+index f031d10e..6fcb3410 100644
+--- a/dm/gfx/nvn/hle_nvn.c
++++ b/dm/gfx/nvn/hle_nvn.c
+@@ -1777,13 +1777,13 @@ static void slow_emit(uint64_t f) {
+ // Declaration for the time-constraint (real-time) thread: period = present period, constraint = period, computation = the CPU time this thread actually needs per frame.
+ // The computation used to be hard-coded at 2 ms, while the game main thread (game logic + recording + submit replay) takes about 10 ms per frame when hot - a 5× gap between declared and actual:
+ // a real-time thread that exceeds its declared computation gets demoted by the system, and the performance controller also sets frequency from the declaration (this declaration is how the system learns the frame deadline and the workload).
+-// DM_RT_COMP=<ms> fixes the declaration; default auto = every 120 frames take the larger of 1.25 × the p90 and 1.1 × the peak of this thread's per-frame CPU time and re-declare if it differs from the declared value by > 15% (capped at 0.9 × period).
++// DM_RT_COMP=<ms> fixes the declaration; default auto = every 120 frames take the larger of 1.25 × the p90 and 1.1 × the peak of this thread's per-frame CPU time and re-declare if it differs from the declared value by > 5% upward / > 15% downward (capped at 1.0 × period; 0247).
+ // DM_RT=0 leaves the acquire thread on the standard policy (its QoS only), for power A/B: the real-time declaration is how the performance controller learns the frame deadline, and it may hold the clock up for it
+ static int rt_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_RT"); v = !(e && !strcmp(e, "0")); if (!v) LOG("[nvn] DM_RT=0: the present thread gets no time-constraint policy (QoS only)"); } return v; }
+ static void set_time_constraint_comp(uint64_t period_ns, uint64_t comp_ns) {
+     if (!rt_on()) return;
+     static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
+-    if (comp_ns < 1000000ull) comp_ns = 1000000ull; if (comp_ns > period_ns * 9 / 10) comp_ns = period_ns * 9 / 10;
++    if (comp_ns < 1000000ull) comp_ns = 1000000ull; if (comp_ns > period_ns) comp_ns = period_ns;   // 0247: cap is the full period, was 0.9 x period (rationale at rt_comp_tick)
+     thread_time_constraint_policy_data_t p = {
+         .period = (uint32_t)(period_ns * tb.denom / tb.numer), .computation = (uint32_t)(comp_ns * tb.denom / tb.numer),
+         .constraint = (uint32_t)(period_ns * tb.denom / tb.numer), .preemptible = 1};
+@@ -1804,8 +1804,26 @@ static void rt_comp_tick(uint64_t period_ns) {
+     double v[120]; memcpy(v, win, sizeof v); qsort(v, 120, sizeof *v, dcmp); n = 0;
+     // Also the window's peak: every frame that ran past the declaration stalled the thread for 30–60 ms. Dark Souls Remastered's render thread needs 1.9–2.0 ms a frame with one or
+     // two frames in 120 near 4.4 ms; declared at 2.5 ms (p90 × 1.25) it stalled about once a second, at 30 fps and at 60; declared above the peak it held 60 fps at the same CPU energy
+-    double p90 = v[107], comp = fmax(p90 * 1.25, v[119] * 1.1), cap = period_ns * 0.9 / 1e6; if (comp > cap) comp = cap; if (comp < 1) comp = 1;
+-    if (comp > g_rt_comp_ms * 1.15 || comp < g_rt_comp_ms * 0.85) set_time_constraint_comp(period_ns, (uint64_t)(comp * 1e6));
++    // 0247: the cap is the full period, not 0.9 x period. The 0.9 x cap made the
++    // declaration lie whenever the thread's peak CPU time passed 13.6 ms (1.1 x peak
++    // over 15 ms): log-6a204394 hit the 15.00 ms cap 16 times, so the declaration
++    // under-states the peak, and a frame past its declaration stalls 30-60 ms
++    // (see the comment above). XNU's thread_policy_set_internal rejects only
++    // constraint < computation, computation > max_rt_quantum (50 ms) or
++    // computation < min_rt_quantum (50 us); there is no computation <= period
++    // check, so computation == period should be accepted. If this kernel
++    // rejects it, the "failed to set" log line is the signal and the old
++    // value is kept. The upward band is 5% (was 15%): 15% is wider than the
++    // 11.1% headroom between the old 15.00 ms cap and the 16.667 ms period, so
++    // a declaration sitting at 15.00 ms could never climb to the new cap.
++    // Under-declaring stalls; over-declaring is harmless, so the tuner rises
++    // fast and falls slow (downward band stays 15%). 0247 is an experiment:
++    // the cap -> stall link is inferred, not proven; verdict from the next
++    // log (P-core share, dropped frames, p99, declared computation). Risk:
++    // a bigger computation claim may favour the present thread over the main
++    // thread; watch main-thread ms/s too.
++    double p90 = v[107], comp = fmax(p90 * 1.25, v[119] * 1.1), cap = period_ns / 1e6; if (comp > cap) comp = cap; if (comp < 1) comp = 1;
++    if (comp > g_rt_comp_ms * 1.05 || comp < g_rt_comp_ms * 0.85) set_time_constraint_comp(period_ns, (uint64_t)(comp * 1e6));
+ }
+ static void sleep_until_ns(uint64_t dl) {   // absolute time on the monotonic clock
+     static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);

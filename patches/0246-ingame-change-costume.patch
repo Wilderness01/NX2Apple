@@ -1,0 +1,796 @@
+From f4038e67 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Wed, 25 Nov 2026 22:47:20 +0000
+Subject: [PATCH] 0246: in-game costume change (ChangeClothes + SaveData
+ write + delayed redirect)
+
+---
+ dm/host/hle_cheats.c | 423 ++++++++++++++++++++++++++++++++++++++++-
+ dm/host/dm.h | 1 +
+ dm/host/hle_fs.c | 11 +++++++++++
+ dm/ios/Sources/DmGameMenu.h | 1 +
+ dm/ios/Sources/GameMenu.swift | 5 +++--
+ dm/ios/Sources/Launcher.swift | 49 +++++++++++++++++++++++++++++++++----------------
+ dm/ios/Sources/InGameCostumePicker.swift | 71 ++++++++++++++++++++++++++++++++++++++++
+ 7 files changed, 542 insertions(+), 19 deletions(-)
+
+diff --git a/dm/host/hle_cheats.c b/dm/host/hle_cheats.c
+index 54be0ac..10e85ec 100644
+--- a/dm/host/hle_cheats.c
++++ b/dm/host/hle_cheats.c
+@@ -1605,7 +1605,427 @@
+         }
+         return;
+     }
+-    costume_override_write(obj);
++    // 0246: while a non-default costume pick is active, the pick is applied
++    // in-game (write + ChangeClothes), not at kingdom entry. Do not write
++    // it into SaveData here, or the next kingdom entry would load the big
++    // costume SARC into the FrameHeap and abort (0240 line) -- and the
++    // write would undo 0246's revert after every ChangeClothes.
++    if (!dm_costume_delay_redirect())
++        costume_override_write(obj);
++}
++
++// ---- 0246: in-game costume change (ChangeClothes message + SaveData write + delayed redirect) ----
++// The launcher pick (0226) only takes effect at kingdom entry, and a
++// non-default (big) costume SARC loaded there aborts in the FrameHeap
++// (0240 line: the allocator's grow virtual function aborts by design).
++// 0246 applies the pick AFTER entry, where the game changes costume by a
++// registry lookup with zero file opens (REPORT-0245-INGAME-CHANGE-WORKAROUND),
++// so no SARC is loaded and nothing aborts. The flow per pick is:
++//   (1) write the new names into the TRUE SaveData object's inline buffers
++//       (0226's write, but only after the object is pinned -- see below);
++//   (2) call the game's own send function 0x75cbd0(scene+0x10,
++//       "ChangeClothes", 0...) -- the trigger pinned by log-6a204394
++//       (run 2, 340 s: exactly 1 keeper MATCH, ChangeClothes FOUND in the
++//       handler table). The handler re-reads SaveData and applies the
++//       costume. Sending without writing re-applies the CURRENT costume.
++//   (3) revert SaveData to the names it held before the write, so the next
++//       kingdom entry loads the small default SARC, never the big one.
++// The pick is driven by the DM_CHAR_* environment (the launcher writes it
++// at startup, the in-game picker writes it on tap); the per-frame code
++// below derives the flag and the pending pick from it, so both places
++// agree and the latest pick wins. A CHARACTER pick (DM_CHAR_SELECT) is
++// not changed in-game -- it still applies at the next kingdom entry
++// through the fs redirect, which the delayed redirect leaves alone.
++// Fail-safes (every one returns without writing or calling, never a crash):
++// a missing scene, an unpinned SaveData, a handler table without
++// ChangeClothes (the send itself is a silent no-op then), a build-ID
++// mismatch. The host calls the game's own function with its own NULL
++// guards (0x75cbd0 returns silently on every NULL step, and zeroes s0
++// and x2-x7 itself before the tail-call, so a plain C call with
++// (scene+0x10, "ChangeClothes") is the whole convention).
++// What is NOT pinned (device run decides): whether the ChangeClothes
++// handler rebuilds the model safely on the Presentation Thread (the
++// present hook is where this runs). The allocator is locked and the
++// rebuild allocates a new model rather than mutating in place
++// (REPORT-0245-REBUILD), and the game's own shop change runs the same
++// code while rendering continues; if the device run shows otherwise,
++// the fallback is a rewriter cut on a main-thread per-frame function.
++#define INGAME_BUILD_ID      "de3a640000b0a200cced760001000000"  // NSO build id, first 16 bytes hex
++#define INGAME_SEND_MSG      0x75cbd0ull   // generic send-message function
++#define INGAME_CHANGE_STR    0xe6ec60ull   // "ChangeClothes" rodata string
++#define INGAME_SCENE_VT      0x12c4dc8ull  // StageScene main vtable
++#define INGAME_SLOT_LO       0x12c5d90ull  // first scene nerve slot (.data vaddr)
++#define INGAME_SLOT_HI       0x12c5f80ull  // end of the scene nerve-slot run (exclusive)
++#define INGAME_NERVE_LO      0x12c4ee8ull  // first scene nerve object
++#define INGAME_NERVE_HI      0x12c5d00ull  // end of the scene nerve-object run (exclusive)
++#define INGAME_CLOSET_OFF    0x188u        // [scene+0x188] = closet (stage init 0x46fbb4)
++#define INGAME_ENTRY_OFF     0x20u         // [closet+0x20] = "Closet" entry (ctor 0x47f268)
++#define INGAME_ENTRY_SCAN    0x200u        // qwords scanned in the entry for the SaveData pointer
++#define INGAME_SCAN_HIT_MAX  256           // slot-value hits collected per run
++#define INGAME_SCAN_CAND_MAX 512           // keeper candidates tested per run
++#define INGAME_STATE_MAX     0x1000000     // largest plausible keeper state
++
++static _Atomic int g_0246_delay_redirect;   // 1 while a non-default costume pick is active
++static _Atomic uint64_t g_0246_scene;       // pinned StageScene (0 = none)
++static _Atomic uint64_t g_0246_savedata;    // pinned SaveData object (0 = none)
++static _Atomic int g_0246_pending;          // a pick awaits write+trigger
++static _Atomic int g_0246_scan_started;     // the scene scan thread was started
++static _Atomic int g_0246_scan_running;     // a scene scan is running now
++static char g_0246_want_cap[64], g_0246_want_clo[64];   // the pick to apply
++static char g_0246_last_cap[64], g_0246_last_clo[64];   // the pick last applied
++static _Atomic uint64_t g_0246_applied_scene;  // the scene the pick was last applied to
++
++// The delayed-redirect flag, read by dm_char_redirect (hle_fs.c). 1 while a
++// non-default costume pick is active: the costume redirect is suppressed at
++// kingdom entry so the game loads the small default files.
++int dm_costume_delay_redirect(void) { return atomic_load(&g_0246_delay_redirect); }
++
++// Fixed addresses run only on the NSO build they were found in (house rule).
++static int ingame_build_ok(void) {
++    const char *bid = dm_main_build();
++    return bid && strncmp(bid, INGAME_BUILD_ID, 32) == 0;
++}
++
++// Scene validity, checked before every use of the pinned scene: the vtable
++// is the StageScene vtable, [scene+0x08] is the keeper, the keeper's owner
++// is this scene (bidirectional), both slots are scene nerve slots, and the
++// keeper tail is 0. A freed/reused scene fails the vtable or the owner
++// link, so a stale pin is never called through.
++static int ingame_scene_valid(uint64_t scene, uint64_t base) {
++    if (!scene || !base) return 0;
++    uint64_t vt = 0, keeper = 0, link = 0, cur = 0, nxt = 0, tail = 0;
++    if (mem_read(scene, 8, &vt) != 0 || vt != base + INGAME_SCENE_VT) return 0;
++    if (mem_read(scene + 0x08, 8, &keeper) != 0 || !keeper) return 0;
++    if (mem_read(keeper + 0x00, 8, &link) != 0 || link != scene) return 0;
++    if (mem_read(keeper + 0x08, 8, &cur) != 0) return 0;
++    if (mem_read(keeper + 0x10, 8, &nxt) != 0) return 0;
++    if (cur < base + INGAME_SLOT_LO || cur >= base + INGAME_SLOT_HI) return 0;
++    if (nxt < base + INGAME_SLOT_LO || nxt >= base + INGAME_SLOT_HI) return 0;
++    if (mem_read(keeper + 0x28, 8, &tail) != 0 || tail != 0) return 0;
++    return 1;
++}
++
++// Test one candidate keeper K against the scene-keeper signature (the
++// 0245-dump Stage 2, without the chain dump). Returns 1 on MATCH and
++// fills *owner with the scene.
++static int ingame_keeper_test(uint64_t k, uint64_t base, uint64_t hb, size_t hopen, uint64_t *owner) {
++    uint64_t v = 0, o = 0, cur = 0, nxt = 0, del = 0, tail = 0, link = 0;
++    int32_t state = 0;
++    *owner = 0;
++    if (mem_read(k + 0x00, 8, &o) != 0) return 0;
++    if (mem_read(k + 0x08, 8, &cur) != 0) return 0;
++    if (mem_read(k + 0x10, 8, &nxt) != 0) return 0;
++    if (mem_read(k + 0x18, 4, &v) != 0) return 0;
++    state = (int32_t)(uint32_t)v;
++    if (mem_read(k + 0x20, 8, &del) != 0) return 0;
++    if (mem_read(k + 0x28, 8, &tail) != 0) return 0;
++    if (!(o >= hb && hopen && o - hb < hopen)) return 0;   // owner-not-heap
++    if (mem_read(o + 0x08, 8, &link) != 0 || link != k) return 0;  // owner-link-mismatch
++    int cur_ok = 0, next_ok = 0;
++    uint64_t nerve = 0;
++    if (cur >= base + INGAME_SLOT_LO && cur < base + INGAME_SLOT_HI &&
++        mem_read(cur, 8, &nerve) == 0 &&
++        nerve >= base + INGAME_NERVE_LO && nerve < base + INGAME_NERVE_HI)
++        cur_ok = 1;
++    if (nxt >= base + INGAME_SLOT_LO && nxt < base + INGAME_SLOT_HI &&
++        mem_read(nxt, 8, &nerve) == 0 &&
++        nerve >= base + INGAME_NERVE_LO && nerve < base + INGAME_NERVE_HI)
++        next_ok = 1;
++    if (!cur_ok && !next_ok) return 0;
++    if (state != -1 && (state < 0 || state > INGAME_STATE_MAX)) return 0;
++    if (del != 0 && !(del >= hb && hopen && del - hb < hopen)) return 0;
++    if (tail != 0) return 0;
++    *owner = o;
++    return 1;
++}
++
++// One scene scan pass: walk the guest heap for scene nerve-slot values and
++// test the keeper candidates (the 0245-dump Stage 1+2). Returns the pinned
++// scene, or 0. The same chunk machine as the 0226 scans (1 MB chunks,
++// 15-byte overhang so a value straddling a boundary is still found).
++static uint64_t ingame_scene_scan(uint64_t base) {
++    uint64_t hb = 0; size_t hopen = 0;
++    dm_guest_heap_range(&hb, &hopen);
++    if (!hb || !hopen) return 0;
++    const size_t CH = 1u << 20, OV = 15;
++    uint8_t *chunk = malloc(CH + OV);
++    if (!chunk) return 0;
++    uint64_t hits[INGAME_SCAN_HIT_MAX];
++    int nhit = 0, total = 0;
++    uint64_t slo = base + INGAME_SLOT_LO, shi = base + INGAME_SLOT_HI;
++    for (size_t off = 0; off < hopen; off += CH) {
++        size_t n = hopen - off < CH ? hopen - off : CH;
++        size_t want = n + OV < hopen - off ? n + OV : hopen - off;
++        vm_size_t got = 0;
++        if (vm_read_overwrite(mach_task_self(), (vm_address_t)(hb + off), (vm_size_t)want, (vm_address_t)(uintptr_t)chunk, &got) || got != want) {
++            if (vm_read_overwrite(mach_task_self(), (vm_address_t)(hb + off), (vm_size_t)n, (vm_address_t)(uintptr_t)chunk, &got) || got != n)
++                continue;   // unmapped chunk (heap grew/shrank): skip it
++            want = n;
++        }
++        for (size_t i = 0; i + 8 <= want && i < n; i += 8) {
++            uint64_t val;
++            memcpy(&val, chunk + i, 8);
++            if (val >= slo && val < shi) {
++                total++;
++                if (nhit < INGAME_SCAN_HIT_MAX) hits[nhit++] = hb + off + i;
++            }
++        }
++    }
++    uint64_t seen[INGAME_SCAN_CAND_MAX];
++    int nseen = 0, matched = 0;
++    uint64_t scene = 0;
++    for (int i = 0; i < nhit && !scene; i++) {
++        for (int w = 0; w < 2 && !scene; w++) {
++            uint64_t k = hits[i] - (w == 0 ? 0x08u : 0x10u);
++            int dup = 0;
++            for (int j = 0; j < nseen; j++) if (seen[j] == k) { dup = 1; break; }
++            if (dup) continue;
++            if (nseen < INGAME_SCAN_CAND_MAX) seen[nseen++] = k;
++            uint64_t o = 0;
++            if (ingame_keeper_test(k, base, hb, hopen, &o)) {
++                matched++;
++                if (ingame_scene_valid(o, base)) scene = o;
++            }
++        }
++    }
++    LOG("[dm] 0246: scene scan: %d slot-value hit(s), %d keeper match(es)%s",
++        total, matched, scene ? "" : " (no scene pinned)");
++    if (scene)
++        LOG("[dm] 0246: scene pinned %#llx", (unsigned long long)scene);
++    free(chunk);
++    return scene;
++}
++
++// Background scene scan thread: re-scan every ~60 s while no scene is
++// pinned (or the pinned one went invalid, e.g. a kingdom change), so the
++// pick is applied in the new kingdom too. arg is the main module base.
++static void *ingame_scene_thread(void *arg) {
++    uint64_t base = (uint64_t)(uintptr_t)arg;
++    for (;;) {
++        uint64_t pinned = atomic_load(&g_0246_scene);
++        if (!pinned || !ingame_scene_valid(pinned, base)) {
++            uint64_t scene = ingame_scene_scan(base);
++            if (scene) atomic_store(&g_0246_scene, scene);
++        }
++        sleep(60);
++    }
++    return NULL;
++}
++
++static void ingame_scene_start(uint64_t base) {
++    if (atomic_load(&g_0246_scan_started)) return;
++    atomic_store(&g_0246_scan_started, 1);
++    pthread_t th; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
++    if (pthread_create(&th, &a, ingame_scene_thread, (void *)(uintptr_t)base)) {
++        LOG("[RED] 0246: cannot start scene scan thread");
++        atomic_store(&g_0246_scan_started, 0);
++    }
++    pthread_attr_destroy(&a);
++}
++
++// Collect the SaveData-shaped objects that pass the strict 0226 signature
++// for the given names (the heap walk of costume_heap_scan, but returning
++// the list instead of only a count, so the closet chain can pick among
++// them). Returns the number of full matches (0..max).
++static int ingame_savedata_candidates(const char *exp_c, const char *exp_p, uint64_t exp_vt,
++                                      uint64_t *out, int max) {
++    uint64_t hb = 0; size_t hopen = 0;
++    dm_guest_heap_range(&hb, &hopen);
++    if (!hb || !hopen) return -1;
++    const size_t CH = 1u << 20, OV = 15;
++    uint8_t *chunk = malloc(CH + OV);
++    if (!chunk) return -1;
++    uint64_t hits[2][COSTUME_HEAP_HIT_MAX];
++    int nhit[2] = { 0, 0 };
++    for (int s = 0; s < 2; s++) {
++        const char *name = s == 0 ? exp_c : exp_p; size_t nl = strlen(name);
++        for (size_t off = 0; off < hopen; off += CH) {
++            size_t n = hopen - off < CH ? hopen - off : CH;
++            size_t want = n + OV < hopen - off ? n + OV : hopen - off;
++            vm_size_t got = 0;
++            if (vm_read_overwrite(mach_task_self(), (vm_address_t)(hb + off), (vm_size_t)want, (vm_address_t)(uintptr_t)chunk, &got) || got != want) {
++                if (vm_read_overwrite(mach_task_self(), (vm_address_t)(hb + off), (vm_size_t)n, (vm_address_t)(uintptr_t)chunk, &got) || got != n)
++                    continue;
++                want = n;
++            }
++            for (size_t i = 0; i + nl + 1 <= want && i < n; ) {
++                uint8_t *p = memchr(chunk + i, (unsigned char)name[0], want - i);
++                if (!p) break;
++                i = (size_t)(p - chunk);
++                if (i < n && i + nl + 1 <= want && !memcmp(p, name, nl) && p[nl] == 0) {
++                    if (nhit[s] < COSTUME_HEAP_HIT_MAX) hits[s][nhit[s]++] = hb + off + i;
++                    i += nl + 1;
++                } else i++;
++            }
++        }
++    }
++    int nmatch = 0;
++    uint64_t seen[2 * COSTUME_HEAP_HIT_MAX]; int nseen = 0;
++    for (int s = 0; s < 2; s++) {
++        for (int i = 0; i < nhit[s]; i++) {
++            uint64_t o = hits[s][i] - (s == 0 ? COSTUME_BUF_CLOTHES : COSTUME_BUF_CAP);
++            int dup = 0;
++            for (int k = 0; k < nseen; k++) if (seen[k] == o) { dup = 1; break; }
++            if (dup) continue;
++            if (nseen < 2 * COSTUME_HEAP_HIT_MAX) seen[nseen++] = o;
++            costume_fields_t f;
++            if (costume_object_test(o, exp_c, exp_p, exp_vt, &f) && nmatch < max)
++                out[nmatch++] = o;
++        }
++    }
++    free(chunk);
++    return nmatch;
++}
++
++// Pin the TRUE SaveData object. The 0226 heap scan alone yields 5 matches
++// when the current names are the defaults ("Mario"/"Mario": every
++// default-initialised SaveData-shaped object holds them), so it cannot
++// pick. The closet chain disambiguates: scene -> [scene+0x188] = closet
++// (stage init 0x46fbb4) -> [closet+0x20] = the "Closet" entry (ctor
++// 0x47f268) -> the entry holds a pointer to the SaveData the game's own
++// Wear getters read ([x0+0x20] in 0x4d67f0/0x4d6840). The entry's exact
++// field is UNPINNED, so instead of assuming an offset, the entry's qwords
++// are scanned for a pointer equal to one of the scan matches: exactly one
++// such candidate, passing the strict signature, is the SaveData. Anything
++// else (0 or >1) returns 0 and nothing is written.
++static uint64_t ingame_savedata_locate(uint64_t scene, uint64_t base, const char *exp_c, const char *exp_p) {
++    uint64_t g748 = 0;
++    if (mem_read(base + COSTUME_VT_GLOBAL, 8, &g748) != 0 || !g748) return 0;
++    uint64_t cands[8];
++    int n = ingame_savedata_candidates(exp_c, exp_p, g748 + 0x10, cands, 8);
++    if (n < 0) return 0;
++    if (n == 1) return cands[0];
++    if (n == 0) return 0;
++    if (!ingame_scene_valid(scene, base)) return 0;
++    uint64_t closet = 0, entry = 0;
++    if (mem_read(scene + INGAME_CLOSET_OFF, 8, &closet) != 0 || !closet) return 0;
++    if (mem_read(closet + INGAME_ENTRY_OFF, 8, &entry) != 0 || !entry) return 0;
++    uint64_t found = 0; int nfound = 0;
++    for (size_t off = 0; off < INGAME_ENTRY_SCAN; off += 8) {
++        uint64_t q = 0;
++        if (guest_page_read(entry + off, (uint8_t *)&q, 8) != 0) break;
++        for (int i = 0; i < n; i++)
++            if (q == cands[i]) { nfound++; found = cands[i]; }
++    }
++    if (nfound != 1) {
++        LOG("[dm] 0246: SaveData locate: %d scan match(es), closet chain matched %d -- not writing", n, nfound);
++        return 0;
++    }
++    LOG("[dm] 0246: SaveData pinned %#llx via the closet chain (%d scan match(es))",
++        (unsigned long long)found, n);
++    return found;
++}
++
++// The host immediate-apply entry, called from Swift (GameMenu / the in-game
++// picker) after the tap writes UserDefaults and setenv's DM_CHAR_*.
++// It only arms the pick; the write+trigger runs on the next presented
++// frame, where the scene and the SaveData are verified first.
++void dm_costume_apply_now(void) {
++    if (!ingame_build_ok()) return;
++    char cap[64], clo[64];
++    if (!costume_pick_target(getenv("DM_CHAR_CAP"), 1, cap, sizeof cap)) cap[0] = 0;
++    if (!costume_pick_target(getenv("DM_CHAR_CLOTHES"), 0, clo, sizeof clo)) clo[0] = 0;
++    if (!cap[0] && !clo[0]) return;   // no pick: follow the save
++    if (!cap[0]) snprintf(cap, sizeof cap, "Mario");
++    if (!clo[0]) snprintf(clo, sizeof clo, "Mario");
++    snprintf(g_0246_want_cap, sizeof g_0246_want_cap, "%s", cap);
++    snprintf(g_0246_want_clo, sizeof g_0246_want_clo, "%s", clo);
++    int nondefault = strcmp(cap, "Mario") != 0 || strcmp(clo, "Mario") != 0;
++    atomic_store(&g_0246_delay_redirect, nondefault ? 1 : 0);
++    atomic_store(&g_0246_pending, 1);
++}
++
++// Per presented frame: derive the flag and the pending pick from the
++// DM_CHAR_* environment (so the launcher pick, set at startup, is picked
++// up too), then, when a pick is pending, write it into SaveData, send
++// ChangeClothes, and revert SaveData. Runs for Odyssey only.
++static void ingame_change_present(void) {
++    int smo = atomic_load(&g_costume_smo);
++    if (smo < 0) {
++        smo = dm_profile() && dm_profile()->program_id == COSTUME_SMO_PROGRAM ? 1 : 0;
++        atomic_store(&g_costume_smo, smo);
++        if (!smo) return;
++    } else if (!smo) return;
++    if (!ingame_build_ok()) return;
++    uint64_t base = 0;
++    if (g_main_mod) base = (uint64_t)(uintptr_t)g_main_mod->base;
++    if (!base) return;
++    static uint64_t frame;
++    frame++;
++    if (frame >= COSTUME_FRAME_BACKSTOP) ingame_scene_start(base);
++    // Derive the pick from the environment every frame: the launcher pick
++    // (set at startup) and the in-game pick (set on tap) both flow here.
++    char cap[64], clo[64];
++    int has_cap = costume_pick_target(getenv("DM_CHAR_CAP"), 1, cap, sizeof cap);
++    int has_clo = costume_pick_target(getenv("DM_CHAR_CLOTHES"), 0, clo, sizeof clo);
++    int nondefault = (has_cap && strcmp(cap, "Mario") != 0) || (has_clo && strcmp(clo, "Mario") != 0);
++    atomic_store(&g_0246_delay_redirect, nondefault ? 1 : 0);
++    if (nondefault) {
++        if (!has_cap) snprintf(cap, sizeof cap, "Mario");
++        if (!has_clo) snprintf(clo, sizeof clo, "Mario");
++        uint64_t scene = atomic_load(&g_0246_scene);
++        // Re-arm when the pick changed, or when the scene changed (a new
++        // kingdom loads the default costume, so the pick must be applied
++        // again there), or when the Swift tap armed it explicitly.
++        int changed = strcmp(cap, g_0246_last_cap) != 0 || strcmp(clo, g_0246_last_clo) != 0;
++        int new_scene = scene && scene != atomic_load(&g_0246_applied_scene);
++        if (changed || new_scene || atomic_load(&g_0246_pending)) {
++            snprintf(g_0246_want_cap, sizeof g_0246_want_cap, "%s", cap);
++            snprintf(g_0246_want_clo, sizeof g_0246_want_clo, "%s", clo);
++            atomic_store(&g_0246_pending, 1);
++        }
++    }
++    if (!atomic_load(&g_0246_pending)) return;
++    uint64_t scene = atomic_load(&g_0246_scene);
++    if (!ingame_scene_valid(scene, base)) { atomic_store(&g_0246_pending, 0); return; }
++    // The SaveData object, pinned once per session (it does not move).
++    uint64_t sd = atomic_load(&g_0246_savedata);
++    if (!sd) {
++        // The current in-memory names are the revert target's source: read
++        // them from the save file when available, else from the env default.
++        char cur_c[64], cur_p[64];
++        if (!costume_save_read(cur_p, sizeof cur_p, cur_c, sizeof cur_c)) {
++            snprintf(cur_c, sizeof cur_c, "Mario");
++            snprintf(cur_p, sizeof cur_p, "Mario");
++        }
++        sd = ingame_savedata_locate(scene, base, cur_c, cur_p);
++        if (!sd) { atomic_store(&g_0246_pending, 0); return; }
++        atomic_store(&g_0246_savedata, sd);
++    }
++    // Read the names the object holds now (the revert target), then write
++    // the pick, send ChangeClothes, and revert. The object is re-validated
++    // before the write: a moved or changed object is never written.
++    char rev_c[64], rev_p[64];
++    if (!costume_buf_read(sd + COSTUME_BUF_CLOTHES, rev_c, sizeof rev_c) ||
++        !costume_buf_read(sd + COSTUME_BUF_CAP, rev_p, sizeof rev_p)) {
++        atomic_store(&g_0246_pending, 0); return;
++    }
++    if (strcmp(rev_c, g_0246_want_clo) != 0 || strcmp(rev_p, g_0246_want_cap) != 0) {
++        // The object must hold either the revert names or the want names;
++        // anything else means it is not the SaveData the game reads.
++        costume_fields_t f;
++        uint64_t exp_vt = 0, g748 = 0;
++        if (mem_read(base + COSTUME_VT_GLOBAL, 8, &g748) != 0 || !g748) { atomic_store(&g_0246_pending, 0); return; }
++        exp_vt = g748 + 0x10;
++        if (!costume_object_test(sd, rev_c, rev_p, exp_vt, &f)) { atomic_store(&g_0246_pending, 0); return; }
++    }
++    costume_write_buf(sd + COSTUME_BUF_CLOTHES, g_0246_want_clo, 0);
++    costume_write_buf(sd + COSTUME_BUF_CAP, g_0246_want_cap, 1);
++    // The game's own send: 0x75cbd0(scene+0x10, "ChangeClothes"). It zeroes
++    // s0 and x2-x7 itself and returns silently on every NULL step, so the
++    // host passes only (sub, name). The string is the game's own rodata
++    // string, so strcmp in the dispatcher matches by content.
++    typedef void (*dm_send_msg_fn)(uint64_t sub, const char *name);
++    dm_send_msg_fn send = (dm_send_msg_fn)(base + INGAME_SEND_MSG);
++    send(scene + 0x10, (const char *)(base + INGAME_CHANGE_STR));
++    LOG("[dm] 0246: sent ChangeClothes to scene %#llx (cap=\"%s\" clothes=\"%s\")",
++        (unsigned long long)scene, g_0246_want_cap, g_0246_want_clo);
++    costume_write_buf(sd + COSTUME_BUF_CLOTHES, rev_c, 0);
++    costume_write_buf(sd + COSTUME_BUF_CAP, rev_p, 1);
++    snprintf(g_0246_last_cap, sizeof g_0246_last_cap, "%s", g_0246_want_cap);
++    snprintf(g_0246_last_clo, sizeof g_0246_last_clo, "%s", g_0246_want_clo);
++    atomic_store(&g_0246_applied_scene, scene);
++    atomic_store(&g_0246_pending, 0);
+ }
+ 
+ // Per presented frame (hle_nvn.c dump_frame): apply the cheats and note the present, so the idle thread stands down
+@@ -1614,6 +2034,7 @@
+     atomic_store(&g_present_ns, now_ns());
+     cheats_pass();
+     costume_override_present();   // 0226: launcher costume override (host per-frame write)
++    ingame_change_present();      // 0246: in-game costume change (write + ChangeClothes + revert)
+ }
+ 
+ // The fixed ~60 Hz passes when the game is not presenting (window minimized, graphics suspended or before the first
+
+diff --git a/dm/host/dm.h b/dm/host/dm.h
+index 42a4bb2..a3aee57 100644
+--- a/dm/host/dm.h
++++ b/dm/host/dm.h
+@@ -160,6 +160,7 @@
+ // Cheats (hle_cheats.c): Atmosphère-format cheat code files applied to the running game (docs/development.md "Cheats")
+ void dm_cheats_init(void);            // Called once in host_preload after loading the modules (main.c): reads DM_CHEATS and friends, loads the build's file
+ void dm_cheats_present(void);         // Per presented frame (hle_nvn.c presents): applies the enabled cheats once
++int dm_costume_delay_redirect(void);  // hle_cheats.c (0246): 1 while a non-default costume pick is active -- the costume fs redirect is suppressed at kingdom entry so the game loads the small default files
+ // The Cheats submenu's rows (front_mac.m, Mac window only). Readers of the list of cheats; the front end copies the strings out immediately
+ int dm_cheats_found(void);            // A cheat file is loaded (this build's, or another build's on DM_CHEATS_ANY_BUILD)
+ int dm_cheats_ncheats(void);          // The loaded file's cheats, in file order
+
+diff --git a/dm/host/hle_fs.c b/dm/host/hle_fs.c
+index 132ab92..bb5c7bd 100644
+--- a/dm/host/hle_fs.c
++++ b/dm/host/hle_fs.c
+@@ -946,6 +946,13 @@
+     }
+     size_t core_len = slen - plen - 5;
+     const char *core = stem + 5;   // the costume name minus "Mario" ("" for a default part)
++    // 0246: delayed costume redirect. While a non-default costume pick is
++    // active, the pick is applied in-game (write + ChangeClothes), not at
++    // kingdom entry: a big costume SARC loaded there aborts in the
++    // FrameHeap (0240 line). Forcing the core to empty makes this file a
++    // default part, so the redirect below can only name the character's
++    // default part (small files); the character swap itself is untouched.
++    if (dm_costume_delay_redirect()) core_len = 0;
+     // The overlay lives on the mount the game named (h_fs_MountRom attaches
+     // DM_ROMFS_OVERLAY to the MountRom name, i.e. "content"); there is no
+     // "rom" mount on device, so a lookup for a mount named "rom" finds
+@@ -1001,6 +1008,10 @@
+     // A set value names the costume to force ("default" = the character's own
+     // default part); unset follows the save, with the adapted-or-default rule.
+     const char *slot = !strcmp(part, "Cap") ? cap : clothes;
++    // 0246: with the delayed redirect on, the slot is forced to "default"
++    // (with core_len forced to 0 above, the only candidate the redirect
++    // can name is the character's default part).
++    if (dm_costume_delay_redirect()) slot = "default";
+     // 0218 (log-85) / 0220: the slot must never redirect a cap file to a
+     // stock costume cap. The cap loader looks the cap model up by name
+     // ("MarioCap") inside the cap file, like the High/Mechanic loaders
+
+diff --git a/dm/ios/Sources/DmGameMenu.h b/dm/ios/Sources/DmGameMenu.h
+index 892f0ed..51bb21e 100644
+--- a/dm/ios/Sources/DmGameMenu.h
++++ b/dm/ios/Sources/DmGameMenu.h
+@@ -14,6 +14,7 @@
+ void dm_hud_pad_open_editor(void);   // HudPadEditor.m: the in-game menu's "HUD 设置" opens the pad-style HUD editor
+ void dm_hud_pad_apply_saved(void);   // HudPadEditor.m: the saved DmHudPad.* settings go into the DM_HUD_* environment before the game starts
+ void dm_char_select_apply_saved(void);   // CharSelectPersist.m (0168): the saved DmCharSelect.* settings go into the DM_CHAR_* environment before the game starts
++void dm_costume_apply_now(void);   // hle_cheats.c (0246): the in-game picker's tap calls this after writing DmCharSelect.* and setenv'ing DM_CHAR_* -- it arms the in-game change (SaveData write + ChangeClothes) on the next presented frame
+ void dm_gamepad_touch_feedback(bool on);   // DM_TOUCH_HAPTICS
+ bool dm_setting_live(const char *env, const char *value);
+ void *dm_quit_menu(void);   // front_ios.m: the menu's last item, Quit <game>, which opens the quit prompt (a retained UIMenu, shown inline)   // front_ios.m: value NULL asks whether the running game takes env at once; otherwise applies it
+
+diff --git a/dm/ios/Sources/GameMenu.swift b/dm/ios/Sources/GameMenu.swift
+index f863d66..bc66694 100644
+--- a/dm/ios/Sources/GameMenu.swift
++++ b/dm/ios/Sources/GameMenu.swift
+@@ -21,17 +21,18 @@
+     let layout = UIMenu(title: LauncherText.text("ui.controllerLayout", "Controller layout"), image: UIImage(systemName: "gamecontroller"), options: .singleSelection, children: layouts)   // a choice's value shows in its submenu: a subtitle would make each row two lines
+     let padSettings = UIAction(title: "按键设置", image: UIImage(systemName: "gamecontroller.fill")) { _ in dm_gamepad_open_pad_settings() }   // the button editor (DmGamepad.m): the icons' size and where they sit
+     let hudSettings = UIAction(title: "HUD 设置", image: UIImage(systemName: "gauge")) { _ in dm_hud_pad_open_editor() }   // (0148) the pad-style HUD editor (HudPadEditor.m): drag the elements on the game, live in the running game
++    let costumeSettings = UIAction(title: "换装", image: UIImage(systemName: "tshirt")) { _ in dm_costume_open_picker() }   // (0246) the in-game costume picker: the same character/outfit picker as the launcher, over the game; a tap applies the costume in-game (SaveData write + ChangeClothes), a character change takes effect at the next kingdom entry
+     var items: [UIMenuElement] = []
+     var placed = false
+     if let m = gameMenuModel {
+         for section in m.sections {
+-            var rows: [UIMenuElement] = section == "Controls" ? [layout, padSettings, hudSettings] : []
++            var rows: [UIMenuElement] = section == "Controls" ? [layout, padSettings, hudSettings, costumeSettings] : []
+             if section == "Controls" { placed = true }
+             for s in m.rows(in: section) where (s.kind == "choice" || s.kind == "toggle") && dm_setting_live(s.env, nil) { rows.append(gameMenuRow(m, s)) }
+             if !rows.isEmpty { items.append(UIMenu(options: .displayInline, children: rows)) }
+         }
+     }
+-    if !placed { items.insert(UIMenu(options: .displayInline, children: [layout, padSettings, hudSettings]), at: 0) }
++    if !placed { items.insert(UIMenu(options: .displayInline, children: [layout, padSettings, hudSettings, costumeSettings]), at: 0) }
+     items.append(Unmanaged<UIMenu>.fromOpaque(dm_quit_menu()).takeRetainedValue())   // Quit <game>, last and on its own: it opens the quit prompt (front_ios.m)
+     return items
+ }
+
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index 2225ffe..df9fabd 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -246,12 +246,12 @@
+ }
+ 
+ /// A character's promo art (0188): the official 3D renders bundled in LauncherBackground (char_<id>.png). Loaded the same way as the poster art.
+-private func dmCharImage(_ name: String) -> UIImage? {
++func dmCharImage(_ name: String) -> UIImage? {
+     UIImage(named: name, in: Bundle(for: LauncherModel.self), compatibleWith: nil)
+ }
+ 
+ /// An outfit's real 3D render (0201): the character in T-pose wearing it, rendered in Blender from the game's own models and bundled in LauncherBackground as of_<character>_<ItemName>.png (transparent background). Replaces the 8-bit dot-art icons (0194, extracted from the RomFS *2D.szs) — the user wants the cards to look like the flat-grid mockup, a real render, not pixel icons. UIImage(named:) finds the file the Sources glob bundles at the bundle root. Returns nil when the render is missing; the card then shows the Chinese name in text.
+-private func dmOutfitImage(_ name: String) -> UIImage? {
++func dmOutfitImage(_ name: String) -> UIImage? {
+     UIImage(named: name, in: Bundle(for: LauncherModel.self), compatibleWith: nil)
+ }
+ 
+@@ -261,12 +261,12 @@
+ /// multiply blend only darkens a little). Returns nil when the tile is
+ /// missing — the cartridge then renders flat, which is still the v4 look
+ /// minus grain.
+-private func dmGrainImage() -> UIImage? {
++func dmGrainImage() -> UIImage? {
+     UIImage(named: "dm_grain_noise", in: Bundle(for: LauncherModel.self), compatibleWith: nil)
+ }
+ 
+ // Caps (50)
+-private let dmOutfitCaps: [(id: String, name: String)] = [
++let dmOutfitCaps: [(id: String, name: String)] = [
+     ("Mario64", "64"),
+     ("Mario64Metal", "\u{91d1}\u{5c5e}\u{9a6c}\u{529b}\u{6b27}"),
+     ("MarioAloha", "\u{963f}\u{7f57}\u{54c8}"),
+@@ -320,7 +320,7 @@
+ ]
+ 
+ // Clothes (52)
+-private let dmOutfitClothes: [(id: String, name: String)] = [
++let dmOutfitClothes: [(id: String, name: String)] = [
+     ("Mario64", "64"),
+     ("Mario64Metal", "\u{91d1}\u{5c5e}\u{9a6c}\u{529b}\u{6b27}"),
+     ("MarioAloha", "\u{963f}\u{7f57}\u{54c8}"),
+@@ -376,7 +376,7 @@
+ ]
+ 
+ // Wario's costumes with a dot-art icon (0194): 8 of his 10. Captain and High have no *2D.szs in RomFS, so no icon exists and the picker does not offer them (never invent one). The id is the Mario-prefixed ItemName the host redirect expects (it swaps the prefix for the picked character); the icon is Wario's own dot art, so the card shows what Wario will wear.
+-private let dmWarioOutfits: [(id: String, name: String)] = [
++let dmWarioOutfits: [(id: String, name: String)] = [
+     ("Mario64", "64"),
+     ("MarioColorClassic", "\u{7ecf}\u{5178}"),
+     ("MarioColorGold", "\u{91d1}\u{8272}"),
+@@ -388,14 +388,14 @@
+ ]
+ 
+ /// One outfit in the grid (0194, 0201): `id` is the value written to DmCharSelect.cap / DmCharSelect.clothes (a Mario-prefixed ItemName, or "default" for the character's own default part); `image` is the bundled real-render filename (of_<character>_<id>.png, nil when no render exists — the card then shows the name in text); `name` is the Chinese label on the card (the game's own ItemCloth.msbt name, suffix stripped).
+-private struct DeckItem: Identifiable {
++struct DeckItem: Identifiable {
+     let id: String
+     let image: String?
+     let name: String
+ }
+ 
+ /// The render filename for an outfit id (0205): the ids are Mario-prefixed ItemNames ("Mario64"), but the renders are named of_<character>_<bare>.png ("of_mario_64.png") — strip the "Mario" prefix. Without this every card looked up "of_mario_Mario64", found nothing, and fell back to a text-only card; only "default" worked, because its id is literally "default" (V1.3.44 device report).
+-private func dmOutfitImageName(character: String, id: String) -> String {
++func dmOutfitImageName(character: String, id: String) -> String {
+     let base = id.hasPrefix("Mario") ? String(id.dropFirst(5)) : id
+     return "of_\(character)_" + base
+ }
+@@ -403,14 +403,14 @@
+ /// The outfit's English code for the cartridge (0227, v4 prototype):
+ /// the spine's vertical text and the label's typewriter subtitle, e.g.
+ /// "MARIO HAKAMA"; "MARIO DEFAULT" for the default card.
+-private func dmOutfitENCode(_ id: String) -> String {
++func dmOutfitENCode(_ id: String) -> String {
+     if id == "default" { return "MARIO DEFAULT" }
+     let bare = id.hasPrefix("Mario") ? String(id.dropFirst(5)) : id
+     return "MARIO " + bare.uppercased()
+ }
+ 
+ /// The grid's list for a character and a slot (0194, 0201, 0226). The first entry is always "default". Mario gets all 50 caps + 52 clothes; Luigi gets Mario's full set too (0226: he is a 28-bone Mario-skeleton reskin -- Mario body geometry + Luigi head -- so the Mario renders and the Mario body reskins serve him, and the host write makes the pick stick); Wario gets his 8 costumes in each slot; Peach, Pauline and Toad get default only for now. The card image is the real render of_<character>_<id>.png; the default card uses of_<character>_default (only Mario's exists — the rest fall back to a text-only card).
+-private func dmDeckItems(character: String, caps: Bool) -> [DeckItem] {
++func dmDeckItems(character: String, caps: Bool) -> [DeckItem] {
+     var items: [DeckItem] = [DeckItem(id: "default", image: "of_\(character)_default", name: "\u{9ed8}\u{8ba4}")]
+     switch character {
+     case "mario", "luigi":
+@@ -427,7 +427,7 @@
+ }
+ 
+ /// The holographic foil (0194, Duel Masters card style): a rainbow wash with a white glint that sweeps across, animated on device. The gradient is static on every card; the glint only animates on the front card, so the deck does not shimmer all over. The card clips it to its rounded shape.
+-private struct FoilBackground: View {
++struct FoilBackground: View {
+     let animated: Bool
+     @State private var glint: CGFloat = -1.2
+ 
+@@ -461,7 +461,7 @@
+ /// preview lives in CharacterPickerView: every tap, tab switch and character
+ /// change reports the current item through onSelect, so the hero shows the
+ /// last-tapped outfit's render.
+-private struct OutfitGridView: View {
++struct OutfitGridView: View {
+     let characterId: String
+     let characterName: String
+     let scale: CGFloat
+@@ -491,6 +491,12 @@
+             clothes = item.id
+             UserDefaults.standard.set(item.id, forKey: "DmCharSelect.clothes")
+         }
++        // 0246: push the pick to the host at once (the in-game picker
++        // applies it on the next presented frame; the launcher pick is
++        // picked up the same way). Before the game starts this only
++        // updates the environment; the host acts once the game presents.
++        dm_char_select_apply_saved()
++        dm_costume_apply_now()
+         onSelect(item)
+     }
+ 
+@@ -605,7 +611,7 @@
+ 
+ /// The grain tile as a view (0227): the noise image at a low opacity
+ /// with a blend mode. The caller clips it to its shape.
+-private struct DmGrain: View {
++struct DmGrain: View {
+     let opacity: Double
+     let blendMode: BlendMode
+ 
+@@ -639,7 +645,7 @@
+ /// threshold) is clamped to one step from the card centered at release.
+ /// `startX` is the content x of item 0's center: the leading padding
+ /// centers the first card too, so it is max(cardWidth/2, viewport/2).
+-private struct DmCartridgeDetentBehavior: ScrollTargetBehavior {
++struct DmCartridgeDetentBehavior: ScrollTargetBehavior {
+     let pitch: CGFloat
+     let cardWidth: CGFloat
+     let itemCount: Int
+@@ -660,7 +666,7 @@
+     }
+ }
+ 
+-private struct CartridgeCoverFlowView: View {
++struct CartridgeCoverFlowView: View {
+     let characterId: String
+     let characterName: String
+     let scale: CGFloat
+@@ -702,6 +708,12 @@
+             clothes = item.id
+             UserDefaults.standard.set(item.id, forKey: "DmCharSelect.clothes")
+         }
++        // 0246: push the pick to the host at once (the in-game picker
++        // applies it on the next presented frame; the launcher pick is
++        // picked up the same way). Before the game starts this only
++        // updates the environment; the host acts once the game presents.
++        dm_char_select_apply_saved()
++        dm_costume_apply_now()
+         onSelect(item)
+     }
+ 
+@@ -1186,7 +1198,7 @@
+ }
+ 
+ /// The character picker (0194, 0201, 0209, 0226, in the box): the hero on the left and the outfit picker on the right, the six character cards in a row at the bottom. The choice is saved to DmCharSelect.character (NSUserDefaults), which dm_char_select_apply_saved reads at startup before the game starts, so the next launch plays as the picked character. The roster is Mario / Luigi / Wario / Peach / Pauline / Toad; the hero and the picker follow the pick. Pauline and Toad need their model patches (0193) to play in-game — the picker itself only writes the name. The hero is a live preview (0226): it shows the last-tapped outfit's render, and the character promo art for "default" or before any tap. Cap + clothes cannot be composited (the renders are single-item), so the hero shows one item at a time.
+-private struct CharacterPickerView: View {
++struct CharacterPickerView: View {
+     let scale: CGFloat
+     @State private var selected: String = UserDefaults.standard.string(forKey: "DmCharSelect.character") ?? "mario"
+     @State private var heroOutfitImage: String? = nil   // nil = the character promo art; otherwise an outfit render name
+@@ -1271,6 +1283,11 @@
+                     Button {
+                         selected = c.id
+                         UserDefaults.standard.set(c.id, forKey: "DmCharSelect.character")
++                        // 0246: update the environment at once, so the
++                        // character redirect applies the new character at
++                        // the next kingdom entry (the character itself is
++                        // not changed in-game; only the costume is).
++                        dm_char_select_apply_saved()
+                     } label: {
+                         VStack(spacing: 4 * scale) {
+                             if let img = dmCharImage(c.image) {
+
+diff --git a/dm/ios/Sources/InGameCostumePicker.swift b/dm/ios/Sources/InGameCostumePicker.swift
+new file mode 100644
+index 0000000..bf90c92
+--- /dev/null
++++ b/dm/ios/Sources/InGameCostumePicker.swift
+@@ -0,0 +1,71 @@
++import SwiftUI
++import UIKit
++
++// The in-game costume picker (0246): the launcher's CharacterPickerView,
++// presented over the running game from the in-game menu's "换装" row
++// (GameMenu.swift -> dm_costume_open_picker()). A tap in the picker writes
++// DmCharSelect.* and pushes the pick to the host at once (Launcher.swift
++// select(): dm_char_select_apply_saved() + dm_costume_apply_now()); the host
++// applies the costume on the next presented frame (SaveData write +
++// ChangeClothes). A character change takes effect at the next kingdom
++// entry (the fs redirect reads the updated environment). Closing the
++// picker returns to the game; the launcher is untouched.
++//
++// Presentation follows HudPadEditor (dm_hud_pad_open_editor): main queue,
++// key window, modal over the root view controller. The scale formula is
++// the launcher's (Launcher.swift:1414).
++
++private var dmCostumePickerController: DmHostingController<InGameCostumePickerView>?
++
++/// GameMenu.swift calls this (C entry point, declared in DmGameMenu.h).
++func dm_costume_open_picker() {
++    DispatchQueue.main.async {
++        guard dmCostumePickerController == nil else { return }  // already open
++        var window: UIWindow?
++        for scene in UIApplication.shared.connectedScenes {
++            guard let ws = scene as? UIWindowScene else { continue }
++            if let w = ws.windows.first(where: { $0.isKeyWindow }) { window = w; break }
++        }
++        window = window ?? UIApplication.shared.keyWindow
++        guard let w = window, let root = w.rootViewController else { return }
++        let picker = DmHostingController(rootView: InGameCostumePickerView())
++        picker.modalPresentationStyle = .fullScreen
++        dmCostumePickerController = picker
++        root.present(picker, animated: true)
++    }
++}
++
++private struct InGameCostumePickerView: View {
++    @Environment(\.dismiss) private var dismiss
++
++    var body: some View {
++        GeometryReader { geo in
++            let scale = min(max(geo.size.width / 932, 0.5), 1.6)
++            ZStack {
++                // The game is behind the picker; a dim backdrop keeps the
++                // picker readable without hiding the game entirely.
++                Color.black.opacity(0.45).ignoresSafeArea()
++                VStack(spacing: 12) {
++                    HStack {
++                        Text("换装")
++                            .font(.system(size: 22, weight: .bold))
++                            .foregroundStyle(.white)
++                        Spacer()
++                        Button("完成") { dismiss() }
++                            .font(.system(size: 17, weight: .semibold))
++                            .foregroundStyle(.white)
++                            .padding(.horizontal, 16)
++                            .padding(.vertical, 8)
++                            .background(Color.white.opacity(0.15))
++                            .clipShape(Capsule())
++                    }
++                    .padding(.horizontal, 20)
++                    CharacterPickerView(scale: scale)
++                    Spacer()
++                }
++                .padding(.top, 16)
++            }
++        }
++        .onDisappear { dmCostumePickerController = nil }
++    }
++}
