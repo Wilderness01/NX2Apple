@@ -189,4 +189,5 @@
 0241-frameheap-expheap-lookup-fix.patch
 0242-frameheap-expheap-heaplist-array0.patch
 0243-frameheap-expheap-heaplist-walk.patch
-0245-dump-scene-keeper-message-chain.patch
+0246-ingame-change-costume.patch
+0247-stutter-compcap-raise-to-period.patch
