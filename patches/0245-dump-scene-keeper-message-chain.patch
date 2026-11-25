@@ -1,0 +1,552 @@
+From 6211a12b73bf6b4d4bd05ce2c16637ad4253c510 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Wed, 25 Nov 2026 05:25:44 +0000
+Subject: [PATCH] 0245-dump: diagnostic scene keeper scan + message-chain dump
+ (read-only)
+
+Diagnostic only, not a fix. Scans the guest heap in-host for the scene
+keeper signature (REPORT-0245-ACTOR.md), follows the 0x75cbd0 message
+chain to final (REPORT-0245-TARGET.md), and dumps final's handler table
+checking for a "ChangeClothes" handler -- all read-only, logged to the
+[dm] log. The getter is never called in-host (its identity is unpinned
+and vtable[0] of similar objects is a destructor); trivial field-load
+getters are followed by reading instead. Runs at presented frame 600
+then every ~60 s until the chain is pinned or 30 runs pass. Removed
+after it serves its purpose, like 0225d was. Does not touch the
+arena/FrameHeap code or the 0244 parent-heap patch.
+---
+ dm/host/hle_cheats.c | 512 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 512 insertions(+)
+
+diff --git a/dm/host/hle_cheats.c b/dm/host/hle_cheats.c
+index 54be0aca..5baf9c5b 100644
+--- a/dm/host/hle_cheats.c
++++ b/dm/host/hle_cheats.c
+@@ -1608,12 +1608,524 @@ static void costume_override_present(void) {
+     costume_override_write(obj);
+ }
+ 
++
++// ---- 0245-dump diagnostic block (begin) ----
++// ---------- 0245-dump diagnostic: scene keeper scan + message-chain dump (DIAGNOSTIC ONLY) ----------
++// Purpose: pin the two unpinned links of the 0245 in-game costume-change
++// trigger (REPORT-0245-ACTOR.md, REPORT-0245-TARGET.md) by reading the live
++// guest heap, the way 0225d pinned SaveData. The trigger needs (1) the scene
++// address (only an INFERRED heap-scan signature exists for it) and (2) the
++// final target of the 0x75cbd0 "ChangeClothes" message chain and whether it
++// has a handler (statically invisible: the handler table is
++// runtime-registered, and the final target's type is unpinned).
++// This patch READS ONLY. It never writes guest memory, never calls game
++// code, never touches the arena/FrameHeap paths or the 0244 parent-heap
++// patch, and changes no game behaviour. Remove after it serves its purpose
++// (like 0225d was). It runs for Super Mario Odyssey only.
++//
++// What it does, in order:
++//   Stage 1 -- value scan: walk the guest heap for the scene nerve-slot
++//     addresses (fixed .data values, base + 0x12c5d90 .. base + 0x12c5f80).
++//     A slot value at address A gives two keeper candidates, A-0x08 (slot
++//     at +0x08) and A-0x10 (slot at +0x10). Every candidate is tested and
++//     logged; nothing is silently picked.
++//   Stage 2 -- signature test: the keeper is a 0x30-byte object; +0x00 is
++//     the owner (scene) with [owner+0x08] == keeper (bidirectional), +0x08 /
++//     +0x10 is a scene nerve slot (and [slot] a scene nerve object), +0x18
++//     is a small state int, +0x20 is 0 or a heap pointer, +0x28 is 0.
++//     (The slot range is the CORRECTED ACTOR signature: the keeper holds
++//     SLOT addresses in [0x12c5d90, 0x12c5f80), whose dereferenced nerve
++//     objects are in [0x12c4ee8, 0x12c5d00]; the ACTOR report's
++//     [0x12c4f10-0x12c5210+] is the nerve-object range, approximately, and
++//     misses the initial nerve object 0x12c4ee8 while the objects run past
++//     0x12c5210. Verified by RELA: slots 0x12c5d90..0x12c5f40 resolve to
++//     nerve objects 0x12c4ee8..0x12c5c68, 0x40 apart; [0x12c5d90] =
++//     0x12c4ee8 -> thunk 0x4772e0 -> execute 0x473f80. The run breaks
++//     before slot 0x12c5f80, so that is the exclusive upper bound.)
++//   Stage 3 -- chain follow: for each MATCH, scene = [keeper+0x00]. Read
++//     [scene+0x10] (message-receiver sub-object vtable) and its vtable[0]
++//     (the getter). The getter is NEVER called: vtable[0] of similar
++//     objects has been proven to be a destructor (TARGET section 5.2), and
++//     the getter's identity is unpinned, so calling it could destroy game
++//     state. Instead the getter's first two instructions are read and
++//     matched against the two trivial patterns (ldr x0,[x0,#N]; ret, or
++//     mov x0,x0; ret -- encodings verified against the ARM toolchain:
++//     ldr x0,[x0,#8] = 0xf9400400, ret = 0xd65f03c0, mov x0,x0 =
++//     0xaa0003e0); when one matches, G is computed by READING [sub+N] (or
++//     sub itself) -- the same value the getter would return, without
++//     executing it. Then K = [G+0x20], V = [K+0x08], final = [V+0x80],
++//     each NULL-checked (the 0x75cbd0 chain itself returns silently on
++//     NULL at every step, so the same guards are mirrored here). final's
++//     vtable (its TYPE identifier) and the dispatcher flags
++//     ([final+0x28]/[final+0x29], [final+0x68]) are logged, then the
++//     handler table at [[final+0x10]+0x28] is dumped and checked for
++//     "ChangeClothes" (string at 0xe6ec60). (The lookup 0x762d80 is a
++//     linear strcmp scan or a binary search -- 0x93f730 is a binary search
++//     over a sorted array, not a hash -- over a {s32 count, array} name
++//     list, plus a second list of groups; the dump enumerates both lists
++//     by their counts.)
++// Timing: the scene only exists during kingdom gameplay, so the scan runs
++// on a background thread starting at presented frame 600 and re-runs every
++// ~60 s until the chain is pinned or 30 runs pass. On the title screen it
++// finds 0 candidates, logs that, and waits.
++#define DIAG_SCENE_SMO_PROGRAM   0x0100000000010000ull   // Super Mario Odyssey title ID
++#define DIAG_SCENE_SLOT_LO       0x12c5d90ull   // first scene nerve slot (.data vaddr)
++#define DIAG_SCENE_SLOT_HI       0x12c5f80ull   // end of the scene nerve-slot run (exclusive)
++#define DIAG_SCENE_NERVE_LO      0x12c4ee8ull   // first scene nerve object (initial nerve)
++#define DIAG_SCENE_NERVE_HI      0x12c5d00ull   // end of the scene nerve-object run (exclusive)
++#define DIAG_SCENE_HIT_MAX       256            // slot-value hits collected (the full count is still logged)
++#define DIAG_SCENE_CAND_MAX      512            // keeper candidates tested per run
++#define DIAG_SCENE_TABLE_MAX     512            // handler-table entries logged per chain
++#define DIAG_SCENE_STR_MAX       64             // longest name string read
++#define DIAG_SCENE_STATE_MAX     0x1000000      // largest plausible keeper state (frames in one nerve)
++#define DIAG_SCENE_FRAME_FIRST   600            // first scan at this presented frame (~10 s)
++#define DIAG_SCENE_MAX_RUNS      30             // stop after ~30 min if the chain is never pinned
++#define DIAG_SCENE_CHANGE_STR    0xe6ec60ull    // "ChangeClothes" (NSO .rodata vaddr)
++
++static _Atomic int diag_scene_smo = -1;      // -1 unknown, 0 not Odyssey, 1 Odyssey
++static _Atomic int diag_scene_started;        // the scan thread was started (never restarted)
++static _Atomic int diag_scene_running;        // a scan thread is running now
++static _Atomic int diag_scene_done;           // a MATCH completed the chain to final: stop
++static _Atomic int diag_scene_runs;           // scan runs completed
++
++// Is `addr` a pointer into the currently opened guest heap?
++static int diag_scene_in_heap(uint64_t addr, uint64_t hb, size_t hopen) {
++    return addr >= hb && hopen && addr - hb < hopen;
++}
++
++// Read a NUL-terminated string at a guest address (at most outn-1 chars).
++// Returns 1 when a NUL-terminated string was read, 0 otherwise.
++static int diag_scene_read_str(uint64_t addr, char *out, size_t outn) {
++    uint8_t win[DIAG_SCENE_STR_MAX];
++    if (!addr || outn < 2) return 0;
++    if (guest_page_read(addr, win, sizeof win) != 0) return 0;
++    size_t k = 0;
++    while (k < sizeof win && win[k]) k++;
++    if (k >= sizeof win) return 0;   // no NUL in the whole window: not a name string
++    size_t n = k < outn - 1 ? k : outn - 1;
++    memcpy(out, win, n);
++    out[n] = 0;
++    return 1;
++}
++
++typedef struct {
++    uint64_t owner, cur, next, delegate, tail;
++    int32_t state;
++    uint64_t nerve_cur, nerve_next;   // dereferenced nerve objects (0 when unreadable)
++} diag_scene_keeper_t;
++
++// Test one candidate keeper K against the scene-keeper signature. Logs one
++// line with every field and the verdict, so every miss is diagnosable.
++// Returns 1 on MATCH.
++static int diag_scene_keeper_test(uint64_t k, uint64_t base, uint64_t hb, size_t hopen, diag_scene_keeper_t *f) {
++    uint64_t v = 0, link = 0;
++    memset(f, 0, sizeof *f);
++    int r_owner = mem_read(k + 0x00, 8, &f->owner) == 0;
++    int r_cur = mem_read(k + 0x08, 8, &f->cur) == 0;
++    int r_next = mem_read(k + 0x10, 8, &f->next) == 0;
++    int r_state = mem_read(k + 0x18, 4, &v) == 0;
++    if (r_state) f->state = (int32_t)(uint32_t)v;
++    int r_del = mem_read(k + 0x20, 8, &f->delegate) == 0;
++    int r_tail = mem_read(k + 0x28, 8, &f->tail) == 0;
++    const char *why;
++    int match = 0;
++    if (!r_owner || !r_cur || !r_next || !r_state || !r_del || !r_tail) {
++        why = "field-unreadable";
++    } else if (!diag_scene_in_heap(f->owner, hb, hopen)) {
++        why = "owner-not-heap";
++    } else if (mem_read(f->owner + 0x08, 8, &link) != 0 || link != k) {
++        why = "owner-link-mismatch";
++    } else {
++        // Slot check: at least one of cur/next must be a scene nerve slot
++        // whose dereferenced nerve object is in the scene nerve range.
++        int cur_ok = 0, next_ok = 0;
++        if (f->cur >= base + DIAG_SCENE_SLOT_LO && f->cur < base + DIAG_SCENE_SLOT_HI &&
++            mem_read(f->cur, 8, &f->nerve_cur) == 0 &&
++            f->nerve_cur >= base + DIAG_SCENE_NERVE_LO && f->nerve_cur < base + DIAG_SCENE_NERVE_HI)
++            cur_ok = 1;
++        if (f->next >= base + DIAG_SCENE_SLOT_LO && f->next < base + DIAG_SCENE_SLOT_HI &&
++            mem_read(f->next, 8, &f->nerve_next) == 0 &&
++            f->nerve_next >= base + DIAG_SCENE_NERVE_LO && f->nerve_next < base + DIAG_SCENE_NERVE_HI)
++            next_ok = 1;
++        if (!cur_ok && !next_ok) {
++            why = "slot-mismatch";
++        } else if (f->state != -1 && (f->state < 0 || f->state > DIAG_SCENE_STATE_MAX)) {
++            why = "state-mismatch";
++        } else if (f->delegate != 0 && !diag_scene_in_heap(f->delegate, hb, hopen)) {
++            why = "delegate-mismatch";
++        } else if (f->tail != 0) {
++            why = "tail-nonzero";
++        } else {
++            why = "MATCH";
++            match = 1;
++        }
++    }
++    LOG("diag-scene: keeper K=%#llx owner=%#llx cur=%#llx (nerve %#llx) next=%#llx (nerve %#llx) state=%d delegate=%#llx tail=%#llx -> %s",
++        (unsigned long long)k, (unsigned long long)f->owner,
++        (unsigned long long)f->cur, (unsigned long long)f->nerve_cur,
++        (unsigned long long)f->next, (unsigned long long)f->nerve_next,
++        f->state, (unsigned long long)f->delegate, (unsigned long long)f->tail, why);
++    return match;
++}
++
++// The getter is [sub] vtable[0]. Read its first two instructions and match
++// the two trivial patterns. On a match, *field is the field offset the
++// getter loads (or (uint64_t)-1 for the identity pattern, where G is sub
++// itself). Returns 1 when the pattern is recognised, 0 otherwise (the
++// getter is NOT called in either case). The raw instruction words are
++// logged either way, so the offline analysis can follow an unrecognised
++// getter from the log.
++#define DIAG_SCENE_RET 0xd65f03c0u        // ret
++#define DIAG_SCENE_MOV_X0_X0 0xaa0003e0u  // mov x0, x0 (orr x0, xzr, x0)
++static int diag_scene_getter_field(uint64_t getter, uint64_t *field) {
++    uint64_t q = 0;
++    if (mem_read(getter, 8, &q) != 0) {
++        LOG("diag-scene: getter %#llx unreadable (cannot read instructions)", (unsigned long long)getter);
++        return 0;
++    }
++    uint32_t insn0 = (uint32_t)q, insn1 = (uint32_t)(q >> 32);
++    if (insn1 == DIAG_SCENE_RET && insn0 == DIAG_SCENE_MOV_X0_X0) {
++        LOG("diag-scene: getter %#llx: mov x0, x0; ret (identity) -- G is sub itself", (unsigned long long)getter);
++        *field = (uint64_t)-1;
++        return 1;
++    }
++    // ldr x0, [x0, #N] (unsigned offset): opcode mask 0xffc00000 == 0xf9400000,
++    // Rn == 0, Rt == 0; N = imm12 * 8.
++    if (insn1 == DIAG_SCENE_RET && (insn0 & 0xffc00000u) == 0xf9400000u &&
++        ((insn0 >> 5) & 0x1fu) == 0 && (insn0 & 0x1fu) == 0) {
++        uint64_t n = (uint64_t)((insn0 >> 10) & 0xfffu) * 8u;
++        LOG("diag-scene: getter %#llx: ldr x0, [x0, #%#llx]; ret (field load)", (unsigned long long)getter, (unsigned long long)n);
++        *field = n;
++        return 1;
++    }
++    LOG("diag-scene: getter %#llx: pattern unrecognised (insn0=%#x insn1=%#x) -- NOT called; offline analysis needed",
++        (unsigned long long)getter, insn0, insn1);
++    return 0;
++}
++
++// Dump one name list ({s32 count, record-pointer array}) and check for
++// "ChangeClothes". `tag` labels the list in the log ("table[0]" /
++// "table[1][j]"). Returns 1 when ChangeClothes is found (and logs the
++// record + handler), 0 otherwise. `logged` counts logged entries across
++// all lists (capped at DIAG_SCENE_TABLE_MAX; checking never stops early).
++static int diag_scene_list_dump(uint64_t names, const char *tag, uint64_t base, int *logged) {
++    uint64_t v = 0;
++    int32_t count = 0;
++    uint64_t array = 0;
++    if (mem_read(names, 4, &v) != 0 || mem_read(names + 0x08, 8, &array) != 0) {
++        LOG("diag-scene: %s: names object %#llx unreadable", tag, (unsigned long long)names);
++        return 0;
++    }
++    count = (int32_t)(uint32_t)v;
++    LOG("diag-scene: %s: names %#llx count=%d array=%#llx", tag, (unsigned long long)names, count, (unsigned long long)array);
++    if (count <= 0 || count > 4096) {
++        LOG("diag-scene: %s: count %d out of range -- not dumped as a list", tag, count);
++        return 0;
++    }
++    int found = 0, skipped = 0;
++    for (int32_t i = 0; i < count; i++) {
++        uint64_t record = 0, name_ptr = 0;
++        if (mem_read(array + (uint64_t)i * 8u, 8, &record) != 0 || !record) { skipped++; continue; }
++        if (mem_read(record, 8, &name_ptr) != 0 || !name_ptr) { skipped++; continue; }
++        char name[DIAG_SCENE_STR_MAX];
++        if (!diag_scene_read_str(name_ptr, name, sizeof name)) { skipped++; continue; }
++        if (*logged < DIAG_SCENE_TABLE_MAX) {
++            LOG("diag-scene: %s[%d] name=\"%s\" record=%#llx", tag, i, name, (unsigned long long)record);
++            (*logged)++;
++        }
++        if (!strcmp(name, "ChangeClothes")) {
++            uint64_t h18 = 0;
++            uint8_t b8 = 0, b9 = 0, bb = 0, b14 = 0;
++            if (mem_read(record + 0x08, 1, &v) == 0) b8 = (uint8_t)v;
++            if (mem_read(record + 0x09, 1, &v) == 0) b9 = (uint8_t)v;
++            if (mem_read(record + 0x0b, 1, &v) == 0) bb = (uint8_t)v;
++            if (mem_read(record + 0x14, 1, &v) == 0) b14 = (uint8_t)v;
++            if (mem_read(record + 0x18, 8, &h18) != 0) h18 = 0;
++            LOG("diag-scene: *** ChangeClothes FOUND: record=%#llx name_ptr=%#llx (static string: %s) flags b8=%u b9=%u bb=%u b14=%u handler_subobj=%#llx",
++                (unsigned long long)record, (unsigned long long)name_ptr,
++                name_ptr == base + DIAG_SCENE_CHANGE_STR ? "yes" : "no",
++                (unsigned)b8, (unsigned)b9, (unsigned)bb, (unsigned)b14, (unsigned long long)h18);
++            found = 1;
++        }
++    }
++    if (skipped)
++        LOG("diag-scene: %s: %d of %d entries skipped (NULL or unreadable)", tag, skipped, count);
++    return found;
++}
++
++// Dump the handler table at [[final+0x10]+0x28]: the first name list, then
++// the second list of groups. Returns 1 when "ChangeClothes" is registered.
++static int diag_scene_table_dump(uint64_t table, uint64_t base) {
++    uint64_t first = 0, second = 0, v = 0;
++    uint8_t flag = 0;
++    if (mem_read(table, 8, &first) != 0) {
++        LOG("diag-scene: table %#llx unreadable", (unsigned long long)table);
++        return 0;
++    }
++    if (mem_read(table + 0x08, 1, &v) == 0) flag = (uint8_t)v;
++    if (mem_read(table + 0x10, 8, &second) != 0) second = 0;
++    LOG("diag-scene: table %#llx first=%#llx flag=%u (1=linear strcmp, 0=binary search) second=%#llx",
++        (unsigned long long)table, (unsigned long long)first, (unsigned)flag, (unsigned long long)second);
++    int logged = 0, found = 0;
++    if (first) found |= diag_scene_list_dump(first, "table[0]", base, &logged);
++    if (second) {
++        int32_t ngrp = 0;
++        uint64_t garray = 0;
++        if (mem_read(second, 4, &v) == 0) ngrp = (int32_t)(uint32_t)v;
++        if (mem_read(second + 0x08, 8, &garray) == 0 && ngrp > 0 && ngrp <= 4096) {
++            LOG("diag-scene: table[1]: second %#llx groups=%d array=%#llx", (unsigned long long)second, ngrp, (unsigned long long)garray);
++            for (int32_t j = 0; j < ngrp; j++) {
++                uint64_t group = 0, names = 0;
++                if (mem_read(garray + (uint64_t)j * 8u, 8, &group) != 0 || !group) continue;
++                if (mem_read(group, 8, &names) != 0 || !names) continue;
++                char tag[32];
++                snprintf(tag, sizeof tag, "table[1][%d]", j);
++                found |= diag_scene_list_dump(names, tag, base, &logged);
++            }
++        } else {
++            LOG("diag-scene: table[1]: second %#llx groups=%d -- not dumped", (unsigned long long)second, ngrp);
++        }
++    }
++    LOG("diag-scene: table: %d entries logged%s; ChangeClothes: %s", logged,
++        logged >= DIAG_SCENE_TABLE_MAX ? " (capped)" : "", found ? "FOUND" : "NOT FOUND");
++    return found;
++}
++
++// Follow the 0x75cbd0 chain from a MATCHed scene (read-only, never calls
++// the getter). Returns 1 when final was reached and its table dumped,
++// 0 when the chain stopped early. `found_change` is set to 1 when
++// "ChangeClothes" is registered in final's handler table.
++static int diag_scene_chain(uint64_t scene, uint64_t base, int *found_change) {
++    *found_change = 0;
++    uint64_t scene_vt = 0, sub10_vt = 0, sub18_vt = 0, getter = 0;
++    if (mem_read(scene, 8, &scene_vt) != 0) {
++        LOG("diag-scene: chain: scene %#llx vtable unreadable", (unsigned long long)scene);
++        return 0;
++    }
++    LOG("diag-scene: chain: scene=%#llx vtable=%#llx", (unsigned long long)scene, (unsigned long long)scene_vt);
++    if (mem_read(scene + 0x10, 8, &sub10_vt) != 0) {
++        LOG("diag-scene: chain: scene+0x10 vtable unreadable");
++        return 0;
++    }
++    if (mem_read(sub10_vt, 8, &getter) != 0) {
++        LOG("diag-scene: chain: sub+0x10 vtable %#llx unreadable (vtable[0] = getter)", (unsigned long long)sub10_vt);
++        return 0;
++    }
++    LOG("diag-scene: chain: sub+0x10 vtable=%#llx getter=vtable[0]=%#llx", (unsigned long long)sub10_vt, (unsigned long long)getter);
++    // Raw sub-object fields (the offline analysis needs them to double-check
++    // the getter's field offset). A 0 here means unreadable-or-zero.
++    uint64_t q[8];
++    for (int i = 0; i < 8; i++) if (mem_read(scene + 0x10 + (uint64_t)i * 8u, 8, &q[i]) != 0) q[i] = 0;
++    LOG("diag-scene: chain: sub+0x10 qwords: %#llx %#llx %#llx %#llx %#llx %#llx %#llx %#llx",
++        (unsigned long long)q[0], (unsigned long long)q[1], (unsigned long long)q[2], (unsigned long long)q[3],
++        (unsigned long long)q[4], (unsigned long long)q[5], (unsigned long long)q[6], (unsigned long long)q[7]);
++    if (mem_read(scene + 0x18, 8, &sub18_vt) == 0)
++        LOG("diag-scene: chain: sub+0x18 vtable=%#llx", (unsigned long long)sub18_vt);
++    else
++        LOG("diag-scene: chain: sub+0x18 vtable unreadable");
++    uint64_t field = 0;
++    if (!diag_scene_getter_field(getter, &field)) {
++        LOG("diag-scene: chain: stops at the getter (pattern unrecognised) -- offline analysis needed");
++        return 0;
++    }
++    uint64_t sub = scene + 0x10, g = 0;
++    if (field == (uint64_t)-1) {
++        g = sub;
++    } else if (mem_read(sub + field, 8, &g) != 0 || !g) {
++        LOG("diag-scene: chain: G = [sub+%#llx] unreadable or NULL -- chain stops here", (unsigned long long)field);
++        return 0;
++    }
++    LOG("diag-scene: chain: G=%#llx", (unsigned long long)g);
++    uint64_t k = 0, vv = 0, final = 0;
++    if (mem_read(g + 0x20, 8, &k) != 0 || !k) {
++        LOG("diag-scene: chain: K = [G+0x20] unreadable or NULL -- chain stops here");
++        return 0;
++    }
++    LOG("diag-scene: chain: K=[G+0x20]=%#llx", (unsigned long long)k);
++    if (mem_read(k + 0x08, 8, &vv) != 0 || !vv) {
++        LOG("diag-scene: chain: V = [K+0x08] unreadable or NULL -- chain stops here");
++        return 0;
++    }
++    LOG("diag-scene: chain: V=[K+0x08]=%#llx", (unsigned long long)vv);
++    if (mem_read(vv + 0x80, 8, &final) != 0 || !final) {
++        LOG("diag-scene: chain: final = [V+0x80] unreadable or NULL -- chain stops here");
++        return 0;
++    }
++    LOG("diag-scene: chain: final=[V+0x80]=%#llx", (unsigned long long)final);
++    uint64_t final_vt = 0, h = 0, table = 0;
++    if (mem_read(final, 8, &final_vt) != 0) {
++        LOG("diag-scene: chain: final vtable unreadable");
++        return 0;
++    }
++    LOG("diag-scene: chain: final vtable=%#llx (final's TYPE identifier)", (unsigned long long)final_vt);
++    uint64_t v = 0;
++    uint8_t f28 = 0, f29 = 0;
++    uint64_t f68 = 0;
++    if (mem_read(final + 0x28, 1, &v) == 0) f28 = (uint8_t)v;
++    if (mem_read(final + 0x29, 1, &v) == 0) f29 = (uint8_t)v;
++    if (mem_read(final + 0x68, 8, &f68) != 0) f68 = 0;
++    LOG("diag-scene: chain: final flags: [final+0x28]=%u [final+0x29]=%u [final+0x68]=%#llx (dispatcher needs 0/0; f68 is the optional pointer)",
++        (unsigned)f28, (unsigned)f29, (unsigned long long)f68);
++    if (mem_read(final + 0x10, 8, &h) != 0 || !h) {
++        LOG("diag-scene: chain: H = [final+0x10] unreadable or NULL -- no handler table");
++        return 1;
++    }
++    LOG("diag-scene: chain: H=[final+0x10]=%#llx", (unsigned long long)h);
++    if (mem_read(h + 0x28, 8, &table) != 0 || !table) {
++        LOG("diag-scene: chain: table = [H+0x28] unreadable or NULL -- no handler table");
++        return 1;
++    }
++    LOG("diag-scene: chain: table=[H+0x28]=%#llx", (unsigned long long)table);
++    *found_change = diag_scene_table_dump(table, base);
++    return 1;
++}
++
++// One full scan pass: value-scan the heap for scene nerve-slot addresses,
++// test each candidate keeper, follow the chain for each MATCH. Returns the
++// number of MATCHes (0 when no scene is present, e.g. the title screen),
++// or -1 when there is no heap yet. `chained` is set to 1 when at least one
++// MATCH completed the chain to final.
++static int diag_scene_scan_once(uint64_t base, int *chained) {
++    *chained = 0;
++    uint64_t hb = 0; size_t hopen = 0;
++    dm_guest_heap_range(&hb, &hopen);
++    if (!hb || !hopen) return -1;
++    LOG("diag-scene: scan: heap %#llx + %#zx (base %#llx)", (unsigned long long)hb, hopen, (unsigned long long)base);
++    const size_t CH = 1u << 20, OV = 15;
++    uint8_t *chunk = malloc(CH + OV);
++    if (!chunk) {
++        LOG("diag-scene: scan: malloc failed");
++        return -1;
++    }
++    // Stage 1: value scan for slot addresses in [base+SLOT_LO, base+SLOT_HI).
++    // The same chunk machine as the 0225d/0226 scans (1 MB chunks, 15-byte
++    // overhang so a value straddling a boundary is still found).
++    uint64_t hits[DIAG_SCENE_HIT_MAX];
++    int nhit = 0, total = 0;
++    uint64_t slo = base + DIAG_SCENE_SLOT_LO, shi = base + DIAG_SCENE_SLOT_HI;
++    for (size_t off = 0; off < hopen; off += CH) {
++        size_t n = hopen - off < CH ? hopen - off : CH;
++        size_t want = n + OV < hopen - off ? n + OV : hopen - off;
++        vm_size_t got = 0;
++        if (vm_read_overwrite(mach_task_self(), (vm_address_t)(hb + off), (vm_size_t)want, (vm_address_t)(uintptr_t)chunk, &got) || got != want) {
++            if (vm_read_overwrite(mach_task_self(), (vm_address_t)(hb + off), (vm_size_t)n, (vm_address_t)(uintptr_t)chunk, &got) || got != n)
++                continue;   // unmapped chunk (heap grew/shrank): skip it
++            want = n;
++        }
++        for (size_t i = 0; i + 8 <= want && i < n; i += 8) {
++            uint64_t val;
++            memcpy(&val, chunk + i, 8);
++            if (val >= slo && val < shi) {
++                total++;
++                if (nhit < DIAG_SCENE_HIT_MAX) hits[nhit++] = hb + off + i;
++            }
++        }
++    }
++    LOG("diag-scene: scan: %d slot-value hit(s)%s", total, total > nhit ? " (collection capped, hits beyond the cap untested)" : "");
++    // Stage 2+3: derive candidates, test, follow the chain for MATCHes.
++    uint64_t seen[DIAG_SCENE_CAND_MAX];
++    int nseen = 0, tested = 0, matched = 0;
++    for (int i = 0; i < nhit; i++) {
++        for (int w = 0; w < 2; w++) {
++            uint64_t k = hits[i] - (w == 0 ? 0x08u : 0x10u);
++            int dup = 0;
++            for (int j = 0; j < nseen; j++) if (seen[j] == k) { dup = 1; break; }
++            if (dup) continue;
++            if (nseen < DIAG_SCENE_CAND_MAX) seen[nseen++] = k;
++            diag_scene_keeper_t f;
++            tested++;
++            if (diag_scene_keeper_test(k, base, hb, hopen, &f)) {
++                matched++;
++                int found_change = 0;
++                int ok = diag_scene_chain(f.owner, base, &found_change);
++                if (ok) *chained = 1;
++                LOG("diag-scene: keeper %#llx: chain %s; ChangeClothes %s",
++                    (unsigned long long)k, ok ? "completed" : "stopped early",
++                    found_change ? "FOUND" : "not found");
++            }
++        }
++    }
++    LOG("diag-scene: scan: tested %d candidate keeper(s), %d match(es)", tested, matched);
++    free(chunk);
++    return matched;
++}
++
++// Background scan thread: re-scan every ~60 s until the chain is pinned
++// (a MATCH completes the chain to final) or the run cap is hit. arg is the
++// main module base (passed as a pointer-sized integer).
++static void *diag_scene_thread(void *arg) {
++    uint64_t base = (uint64_t)(uintptr_t)arg;
++    LOG("diag-scene: scan thread started (base %#llx)", (unsigned long long)base);
++    for (int run = 1; run <= DIAG_SCENE_MAX_RUNS; run++) {
++        if (atomic_load(&diag_scene_done)) break;
++        atomic_store(&diag_scene_runs, run);
++        int chained = 0;
++        int nmatch = diag_scene_scan_once(base, &chained);
++        if (nmatch < 0) {
++            LOG("diag-scene: run %d: no heap yet", run);
++        } else if (nmatch == 0) {
++            LOG("diag-scene: run %d: 0 candidate keeper(s) -- no scene yet (title screen?)", run);
++        } else if (chained) {
++            atomic_store(&diag_scene_done, 1);
++            LOG("diag-scene: run %d: chain pinned -- no further scans", run);
++            break;
++        } else {
++            LOG("diag-scene: run %d: %d match(es) but the chain stopped early -- retrying", run, nmatch);
++        }
++        if (run < DIAG_SCENE_MAX_RUNS && !atomic_load(&diag_scene_done)) {
++            for (int s = 0; s < 60; s++) {
++                if (atomic_load(&diag_scene_done)) break;
++                usleep(1000000);
++            }
++        }
++    }
++    if (!atomic_load(&diag_scene_done))
++        LOG("diag-scene: %d runs done, chain not pinned -- giving up (enter a kingdom and relaunch to retry)", DIAG_SCENE_MAX_RUNS);
++    atomic_store(&diag_scene_running, 0);
++    return NULL;
++}
++
++// Start the scan thread (once per launch).
++static void diag_scene_start(uint64_t base) {
++    if (atomic_load(&diag_scene_started)) return;
++    atomic_store(&diag_scene_started, 1);
++    if (atomic_exchange(&diag_scene_running, 1)) return;
++    pthread_t th; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
++    if (pthread_create(&th, &a, diag_scene_thread, (void *)(uintptr_t)base)) {
++        LOG("[RED] diag-scene: cannot start scan thread");
++        atomic_store(&diag_scene_running, 0);
++    }
++    pthread_attr_destroy(&a);
++}
++
++// Per presented frame: start the scan thread once the game has been
++// presenting for a while (frame 600, ~10 s). The thread re-scans
++// periodically on its own. Odyssey only.
++static void diag_scene_present(void) {
++    int smo = atomic_load(&diag_scene_smo);
++    if (smo < 0) {
++        smo = dm_profile() && dm_profile()->program_id == DIAG_SCENE_SMO_PROGRAM ? 1 : 0;
++        atomic_store(&diag_scene_smo, smo);
++        if (!smo) return;
++        LOG("diag-scene: dump live (Odyssey; first scan at frame %d, then every ~60 s)", DIAG_SCENE_FRAME_FIRST);
++    } else if (!smo) return;
++    static uint64_t frame;
++    frame++;
++    if (frame >= DIAG_SCENE_FRAME_FIRST && !atomic_load(&diag_scene_started)) {
++        uint64_t base = 0;
++        if (g_main_mod) base = (uint64_t)(uintptr_t)g_main_mod->base;
++        if (base) diag_scene_start(base);
++    }
++}
++// ---- 0245-dump diagnostic block (end) ----
++
+ // Per presented frame (hle_nvn.c dump_frame): apply the cheats and note the present, so the idle thread stands down
+ // (brief: once per presented frame; the idle thread only when it is not presenting)
+ void dm_cheats_present(void) {
+     atomic_store(&g_present_ns, now_ns());
+     cheats_pass();
+     costume_override_present();   // 0226: launcher costume override (host per-frame write)
++    diag_scene_present();         // 0245-dump diagnostic only: scene keeper scan + message-chain dump (read-only)
+ }
+ 
+ // The fixed ~60 Hz passes when the game is not presenting (window minimized, graphics suspended or before the first
+-- 
+2.43.0
+
