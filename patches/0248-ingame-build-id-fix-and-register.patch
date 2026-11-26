@@ -1,0 +1,40 @@
+From 9ee67c35fc17788fbc2fb5f4b2db569f4ce124eb Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Thu, 26 Nov 2026 06:44:14 +0000
+Subject: [PATCH] 0248: fix the in-game-change build ID (1.4.1 main) and
+ register it in docs_patches.py HOST_BINDING
+
+---
+ dm/host/hle_cheats.c     | 2 +-
+ dm/tools/docs_patches.py | 2 ++
+ 2 files changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/dm/host/hle_cheats.c b/dm/host/hle_cheats.c
+index 10e85ec0..0c2be26a 100644
+--- a/dm/host/hle_cheats.c
++++ b/dm/host/hle_cheats.c
+@@ -1650,7 +1650,7 @@ static void costume_override_present(void) {
+ // (REPORT-0245-REBUILD), and the game's own shop change runs the same
+ // code while rendering continues; if the device run shows otherwise,
+ // the fallback is a rewriter cut on a main-thread per-frame function.
+-#define INGAME_BUILD_ID      "de3a640000b0a200cced760001000000"  // NSO build id, first 16 bytes hex
++#define INGAME_BUILD_ID      "b424be150a8e7d78701cbe7a439d9ebf"  // NSO build id, first 16 bytes hex (1.4.1 main, BUILD_141)
+ #define INGAME_SEND_MSG      0x75cbd0ull   // generic send-message function
+ #define INGAME_CHANGE_STR    0xe6ec60ull   // "ChangeClothes" rodata string
+ #define INGAME_SCENE_VT      0x12c4dc8ull  // StageScene main vtable
+diff --git a/dm/tools/docs_patches.py b/dm/tools/docs_patches.py
+index fe2c1d01..2113c140 100644
+--- a/dm/tools/docs_patches.py
++++ b/dm/tools/docs_patches.py
+@@ -83,6 +83,8 @@ HOST_BINDING = [
+     ('k_nier_dr', '', '', {'what': "NieR's frame interval and dynamic-resolution floor at fixed addresses", 'now': 'build', 'goal': 'game', 'purpose': 'frame rate',
+      'checked': "both releases' mains, where these rows were found",
+      'why': "the game's own display object; the Asian release's function is the global one's 0x13c0 further on, so the rewriter's function match could give the host both releases' addresses"}),
++    ('', '', 'b424be150a8e7d78701cbe7a439d9ebf', {'what': "Super Mario Odyssey's in-game costume change, gated on its 1.4.1 main build ID (hle_cheats.c)", 'now': 'build', 'goal': 'game', 'purpose': 'runtime',
++     'why': "the ChangeClothes call and the SaveData costume offsets were found in this build's code; the rewriter's function match could give the host the call and the offsets for other builds"}),
+ ]
+ # Translator rules keyed by one shader's code hash: (the start of the rule's comment, entry)
+ SHADER_BINDING = [
+-- 
+2.43.0
+
