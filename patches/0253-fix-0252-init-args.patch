@@ -1,0 +1,69 @@
+From 8afdb05470dbfc9031a1b95ed7e190fdda8ea26c Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Fri, 27 Nov 2026 08:03:08 +0000
+Subject: [PATCH] 0253: explicit initializers for the 0252 picker arguments
+
+---
+ dm/ios/Sources/Launcher.swift | 32 ++++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index ef0bf263..beb2e60b 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -469,6 +469,17 @@ struct OutfitGridView: View {
+     // picker instead. The launcher keeps the default (true).
+     let showTitle: Bool = true
+     let onSelect: (DeckItem) -> Void
++
++    // (0253) Explicit initializer matching the call site's argument
++    // labels and order; the default keeps the launcher call unchanged.
++    init(characterId: String, characterName: String, scale: CGFloat, showTitle: Bool = true, onSelect: @escaping (DeckItem) -> Void) {
++        self.characterId = characterId
++        self.characterName = characterName
++        self.scale = scale
++        self.showTitle = showTitle
++        self.onSelect = onSelect
++    }
++
+     // 0229: the interface-style switch lives in this header now (moved
+     // from the Game tab settings); same DmLauncherUIStyle key as the
+     // parent, so tapping it swaps the picker immediately, no restart.
+@@ -683,6 +694,19 @@ struct CartridgeCoverFlowView: View {
+     // (0252) False in-game: the title lives in the header row above the
+     // picker instead. The launcher keeps the default (true).
+     let showTitle: Bool = true
++
++    // (0253) Explicit initializer matching the call site's argument
++    // labels and order (showTitle before onSelect); the default keeps
++    // the launcher call unchanged.
++    init(characterId: String, characterName: String, scale: CGFloat, showTitle: Bool = true, onSelect: @escaping (DeckItem) -> Void, onOpenChange: @escaping (Bool) -> Void) {
++        self.characterId = characterId
++        self.characterName = characterName
++        self.scale = scale
++        self.showTitle = showTitle
++        self.onSelect = onSelect
++        self.onOpenChange = onOpenChange
++    }
++
+     // 0229: the interface-style switch lives in this header now (moved
+     // from the Game tab settings); same DmLauncherUIStyle key as the
+     // parent, so tapping it swaps the picker immediately, no restart.
+@@ -1221,6 +1245,14 @@ struct CharacterPickerView: View {
+     // above the picker. The launcher keeps the default (false) and is
+     // unchanged.
+     let titleInHeader: Bool = false
++
++    // (0253) Explicit initializer matching the call site's argument
++    // labels; the default keeps the launcher call unchanged.
++    init(scale: CGFloat, titleInHeader: Bool = false) {
++        self.scale = scale
++        self.titleInHeader = titleInHeader
++    }
++
+     @State private var selected: String = UserDefaults.standard.string(forKey: "DmCharSelect.character") ?? "mario"
+     @State private var heroOutfitImage: String? = nil   // nil = the character promo art; otherwise an outfit render name
+     @AppStorage("DmLauncherUIStyle") private var uiStyle: String = "classic"
+-- 
+2.43.0
+

@@ -196,3 +196,4 @@
 0250-costume-picker-present-and-editor.patch
 0251-ingame-scene-accept-idle-next.patch
 0252-costume-title-to-header.patch
+0253-fix-0252-init-args.patch
