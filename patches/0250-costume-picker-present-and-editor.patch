@@ -1,0 +1,355 @@
+From b9e3997d27eafb8c735a3970ac0dcb6d6da5fa99 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Fri, 27 Nov 2026 01:54:20 +0000
+Subject: [PATCH] 0250: costume picker present hardening + costume button in
+ the button editor
+
+---
+ dm/ios/Sources/DmGameMenu.h              |  1 +
+ dm/ios/Sources/DmGamepad.m               | 50 ++++++++++++------------
+ dm/ios/Sources/DmPadGeometry.h           | 22 ++++++-----
+ dm/ios/Sources/InGameCostumePicker.swift | 34 +++++++++++++---
+ dm/ios/Sources/front_ios.m               |  3 ++
+ 5 files changed, 71 insertions(+), 39 deletions(-)
+
+diff --git a/dm/ios/Sources/DmGameMenu.h b/dm/ios/Sources/DmGameMenu.h
+index 04da5795..c5be613c 100644
+--- a/dm/ios/Sources/DmGameMenu.h
++++ b/dm/ios/Sources/DmGameMenu.h
+@@ -16,6 +16,7 @@ void dm_hud_pad_apply_saved(void);   // HudPadEditor.m: the saved DmHudPad.* set
+ void dm_char_select_apply_saved(void);   // CharSelectPersist.m (0168): the saved DmCharSelect.* settings go into the DM_CHAR_* environment before the game starts
+ void dm_costume_apply_now(void);   // hle_cheats.c (0246): the in-game picker's tap calls this after writing DmCharSelect.* and setenv'ing DM_CHAR_* -- it arms the in-game change (SaveData write + ChangeClothes) on the next presented frame
+ void dm_costume_open_picker(void);   // InGameCostumePicker.swift (0249): the gamepad's costume button beside the gear opens the in-game picker (C entry point, @_cdecl)
++void dm_log(const char *msg);   // front_ios.m (0250): Swift's log line into Documents/log.txt (the LOG macro is C-only, so Swift cannot call it; pass the full line, "[dm] " prefix included, as the host's own lines do)
+ void dm_gamepad_touch_feedback(bool on);   // DM_TOUCH_HAPTICS
+ bool dm_setting_live(const char *env, const char *value);
+ void *dm_quit_menu(void);   // front_ios.m: the menu's last item, Quit <game>, which opens the quit prompt (a retained UIMenu, shown inline)   // front_ios.m: value NULL asks whether the running game takes env at once; otherwise applies it
+diff --git a/dm/ios/Sources/DmGamepad.m b/dm/ios/Sources/DmGamepad.m
+index 5de511c3..b071ba2e 100644
+--- a/dm/ios/Sources/DmGamepad.m
++++ b/dm/ios/Sources/DmGamepad.m
+@@ -47,10 +47,10 @@
+ #import "DmGameMenu.h"
+ 
+ enum { B_A = 0, B_B, B_X, B_Y, B_LS, B_RS, B_L, B_R, B_ZL, B_ZR, B_PLUS, B_MINUS, B_LEFT, B_UP, B_RIGHT, B_DOWN, B_N };
+-enum { E_A = 0, E_B, E_Y, E_ZL, E_L, E_MINUS, E_PLUS, E_JUMP, E_PHOTO, E_MENU, E_N };   // the movable controls (the button editor), the menu included (0117); others are hidden (X, ZR, R, L3, R3, D-pad) or floating (the stick)
++enum { E_A = 0, E_B, E_Y, E_ZL, E_L, E_MINUS, E_PLUS, E_JUMP, E_PHOTO, E_MENU, E_COSTUME, E_N };   // the movable controls (the button editor), the menu included (0117); the costume button too (0250); others are hidden (X, ZR, R, L3, R3, D-pad) or floating (the stick)
+ enum { G_A = 0, G_B, G_Y, G_ZL, G_L, G_PLUS, G_MINUS, G_JUMP, G_PHOTO, G_MENU, G_COSTUME, G_N };   // the controls with a glass disc behind them (0111); G_COSTUME is the in-game costume button (0249)
+-static NSString *const k_lineEditKeys[E_N] = {@"a", @"b", @"y", @"zl", @"l", @"minus", @"plus", @"jump", @"photo", @"menu"};   // the NSUserDefaults offsets' keys
+-static NSString *const k_lineEditNames[E_N] = {@"A键", @"B键", @"攻击键", @"撞地键", @"视角键", @"+键", @"−键", @"跳跃键", @"拍照键", @"设置键"};   // the editor's name for the selected icon
++static NSString *const k_lineEditKeys[E_N] = {@"a", @"b", @"y", @"zl", @"l", @"minus", @"plus", @"jump", @"photo", @"menu", @"costume"};   // the NSUserDefaults offsets' keys
++static NSString *const k_lineEditNames[E_N] = {@"A键", @"B键", @"攻击键", @"撞地键", @"视角键", @"+键", @"−键", @"跳跃键", @"拍照键", @"设置键", @"换装键"};   // the editor's name for the selected icon
+ enum { C_NONE = 0, C_STICK, C_DPAD, C_FACE, C_BTN, C_GAME };   // which control a touch holds; C_GAME: none, the touch goes to the game's touch screen (finger slot << 8)
+ 
+ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+@@ -156,7 +156,7 @@ void front_ios_quit_controllers(void);   // front_ios.m: the controllers changed
+ - (BOOL)pointInside:(CGPoint)p withEvent:(UIEvent *)e { DmGamepad *pad = (DmGamepad *)self.superview; return [pad menuTakes:[self convertPoint:p toView:pad]]; }
+ @end
+ 
+-// The costume button (0249): like the menu button, a UIButton of its own below the gear; it opens the in-game costume picker (InGameCostumePicker.swift), it is not in the button editor (it follows the gear), and its hit circle is the menu's.
++// The costume button (0249): like the menu button, a UIButton of its own; it opens the in-game costume picker (InGameCostumePicker.swift). (0250) It is in the button editor now, with its own place and size (above the gear by default); its hit circle is the menu's formula on its own radius.
+ @interface DmCostumeButton : UIButton
+ @end
+ @implementation DmCostumeButton
+@@ -194,7 +194,7 @@ static void pads_start(void);   // Physical controllers, below
+     DmPadGeo _geoLine;                             // the geometry with the editor's size and drag offsets applied
+     CALayer *_hint; CATextLayer *_hintText; NSString *_hintWords;   // the 3D layout's right-stick hint: words only, once per launch (see "The right-stick hint")
+     DmMenuButton *_menu;                           // opens the in-game menu (GameMenu.swift)
+-    DmCostumeButton *_costume;                     // (0249) opens the in-game costume picker, below the gear
++    DmCostumeButton *_costume;                     // (0249) opens the in-game costume picker; (0250) its own place and size, in the button editor
+     UIImpactFeedbackGenerator *_touchFeedback;       // one short feedback per touch-control press edge
+     unsigned _hapticSticks;
+     BOOL _stickShown;                              // the left stick was held at the last refresh
+@@ -433,10 +433,10 @@ static void glassDiscSetOpacity(CAGradientLayer *disc, CGFloat p) {   // the fal
+     // 0146: a control the player hid in the button settings stays hidden (and cannot be
+     // pressed, see extraButtonAt / faceAt / the KEY lineOff). While the editor is open it
+     // is shown dimmed instead, so it can be tapped to unhide it; a control the layout
+-    // already hid (Tap, X/ZR/R...) stays hidden. The menu is never hidden. A control
++    // already hid (Tap, X/ZR/R...) stays hidden. The menu is never hidden (0250: the costume button either). A control
+     // that is not hidden gets its full opacity back (undo a previous dim).
+     for (int e = 0; e < E_N; e++) {
+-        if (e == E_MENU) continue;
++        if (e == E_MENU || e == E_COSTUME) continue;
+         CALayer *ly = [self editLayer:e];
+         if (!ly || ly.hidden) continue;   // layout-hidden: leave it hidden
+         if (_lineHidden[e]) {
+@@ -509,10 +509,8 @@ static int dropIndex(int b) { return b == B_ZL ? DM_PAD_ZL : b == B_L ? DM_PAD_L
+ - (CGPoint)clickCenter:(int)b { return self.geo->click[b == B_RS]; }
+ - (CGRect)pillRect:(int)b { return self.geo->pill[b == B_PLUS ? DM_PAD_PLUS : DM_PAD_MINUS]; }
+ - (CGPoint)menuCenter { return self.geo->swap; }
+-- (CGPoint)costumeCenter {   // (0249) below the gear, clear of the − / + pills (which sit 12pt from the gear's edge): two hit radii plus a gap, so the hit circles never overlap; it follows the gear when the gear is dragged (0117)
+-    CGFloat gap = MAX(self.geo->swapR * 1.6, 22) * 2 + 8;
+-    CGPoint mc = self.menuCenter;
+-    return CGPointMake(mc.x, mc.y + gap);
++- (CGPoint)costumeCenter {   // (0250) the costume button's own place (DmPadGeometry.h): above the gear by default, plus the editor's drag offset; it no longer follows the gear
++    return self.geo->costume;
+ }
+ 
+ static CGFloat dist(CGPoint a, CGPoint b) { return hypot(a.x - b.x, a.y - b.y); }
+@@ -527,12 +525,12 @@ static int lockedKey(int c) {   // DmPadGeometry.h's control → the key it pres
+     return dm_pad_menu_takes(self.geo, _full, _layout.separated, p);
+ }
+ - (BOOL)costumeTakes:(CGPoint)p {   // (0249) the costume button takes a touch in its hit circle unless a locked key's target is nearer, or the gear is nearer (the circles never overlap by construction; this is the tie-break)
+-    if (_editing) return NO;   // the button editor is open: the touch falls through to the pad (the costume button is not movable, it follows the gear)
++    if (_editing) return NO;   // the button editor is open: the touch falls through to the pad, where editTouchBegan picks the costume button up as a movable control (0250)
+     if (dm_pad_costume_distance(self.geo, p) > 1) return NO;
+     if (_tap || _padOff || (_layout.separated && !CGRectContainsPoint(_layout.controls, p))) return YES;
+     return dm_pad_costume_takes(self.geo, _full, _layout.separated, p);
+ }
+-- (void)openCostumePicker { [self reset]; dm_costume_open_picker(); }   // (0249) like opening the menu: release every key and touch first
++- (void)openCostumePicker { LOG("[dm] 0250: costume: tap: opening picker"); [self reset]; dm_costume_open_picker(); }   // (0249) like opening the menu: release every key and touch first
+ - (uint64_t)faceAt:(CGPoint)p {   // keys under the finger in the diamond (between two keys both count); a hidden key cannot be pressed (0146)
+     uint64_t m = 0;
+     for (int b = B_A; b <= B_Y; b++) if (![self keyUserHidden:b] && dist(p, [self facePos:b]) <= [self lineFaceHitR:b]) m |= 1ull << b;
+@@ -713,7 +711,7 @@ static CGRect growRect(CGRect r, CGFloat fill) {   // grow a rect about its cent
+     _photo.frame = growRect(squareFrame([self photoCenter], 2 * [self lineExtraRFor:E_PHOTO]), DM_PAD_LINE_FILL);
+     CGFloat mr = self.geo->swapR; CGPoint mc = self.menuCenter;
+     _menu.frame = growRect(squareFrame(mc, 2 * mr), k_padMenuFill); _menu.layer.cornerRadius = _menu.frame.size.width / 2;
+-    _costume.frame = growRect(squareFrame([self costumeCenter], 2 * mr), k_padMenuFill); _costume.layer.cornerRadius = _costume.frame.size.width / 2;   // (0249) the same size as the gear, below it
++    _costume.frame = growRect(squareFrame([self costumeCenter], 2 * self.geo->costumeR), k_padMenuFill); _costume.layer.cornerRadius = _costume.frame.size.width / 2;   // (0250) its own size, no longer the gear's
+     for (int g = 0; g < G_N; g++) {   // the glass follows its button: the same centre and size, through the size slider and drags (the geometry already carries them)
+         CGRect f = [self glassFrame:g];
+         if (_glassView[g]) { _glassView[g].frame = f; _glassView[g].layer.cornerRadius = f.size.width / 2; }
+@@ -752,7 +750,7 @@ static CGRect growRect(CGRect r, CGFloat fill) {   // grow a rect about its cent
+         case G_MINUS: { CGRect r = [self pillRect:B_MINUS]; return squareFrame(CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r)), 2 * [self linePillRFor:E_MINUS]); }
+         case G_JUMP: return squareFrame([self jumpCenter], 2 * [self lineExtraRFor:E_JUMP]);
+         case G_PHOTO: return squareFrame([self photoCenter], 2 * [self lineExtraRFor:E_PHOTO]);
+-        case G_COSTUME: return squareFrame([self costumeCenter], 2 * self.geo->swapR);   // (0249) the costume button's own square
++        case G_COSTUME: return squareFrame([self costumeCenter], 2 * self.geo->costumeR);   // (0250) the costume button's own square
+         default: return squareFrame(self.menuCenter, 2 * self.geo->swapR);
+     }
+ }
+@@ -855,6 +853,8 @@ static BOOL g_hintShown;   // once per launch
+     g->clickR *= s; g->stickR *= s; g->knobR *= s;
+     g->swapR *= _lineSizes[E_MENU];   // the menu button's own size (0117): never the legacy global, its stored size falls back to it on an old save (loadLineLayout)
+     CGPoint mo = [self lineOffset:@"menu"]; g->swap.x += mo.x; g->swap.y += mo.y;   // the menu button's drag offset (0117): menuCenter, the frame, the glass and menuTakes all follow it
++    g->costumeR *= _lineSizes[E_COSTUME];   // (0250) the costume button's own size: the frame, the glass and the hit radius all follow it
++    CGPoint co = [self lineOffset:@"costume"]; g->costume.x += co.x; g->costume.y += co.y;   // (0250) the costume button's drag offset: costumeCenter, the frame, the glass and costumeTakes all follow it
+     for (int i = 0; i < 2; i++) { CGFloat ps = _lineSizes[i == DM_PAD_MINUS ? E_MINUS : E_PLUS]; CGRect r = g->pill[i]; CGFloat w = r.size.width * ps, h = r.size.height * ps; g->pill[i] = CGRectMake(CGRectGetMidX(r) - w / 2, CGRectGetMidY(r) - h / 2, w, h); }
+     static const int faceMoved[] = {0, 1, 3}; static NSString *const faceNames[] = {@"a", @"b", @"y"};   // faceKey[] is A B X Y
+     BOOL split = NO;
+@@ -894,9 +894,9 @@ static NSString *const k_line_layout_key = @"DmPadLineLayout";
+         NSNumber *v = [z isKindOfClass:[NSDictionary class]] ? z[k_lineEditKeys[e]] : nil;
+         _lineSizes[e] = [v isKindOfClass:[NSNumber class]] ? fmin(fmax(v.doubleValue, 0.7), 3.0) : _lineScale;
+     }
+-    NSDictionary *h = d[@"hidden"];   // 0146: an icon the player hid (its key maps to @(YES)); the menu is never hidden, so a stored YES for it is ignored
++    NSDictionary *h = d[@"hidden"];   // 0146: an icon the player hid (its key maps to @(YES)); the menu is never hidden, so a stored YES for it is ignored (0250: the costume button either)
+     if ([h isKindOfClass:[NSDictionary class]]) for (int e = 0; e < E_N; e++) {
+-        if (e == E_MENU) continue;
++        if (e == E_MENU || e == E_COSTUME) continue;
+         NSNumber *v = h[k_lineEditKeys[e]];
+         _lineHidden[e] = [v isKindOfClass:[NSNumber class]] && v.boolValue;
+     }
+@@ -1136,10 +1136,10 @@ static const CGFloat k_panel_default[1][2] = {{0.30, 0.58}};   // pad: the bar's
+     [self saveLineLayout];
+ }
+ // 0146: the eye toggle for the selected icon: eye (shown) or eye.slash (hidden, red);
+-// the menu (gear) is never hideable, so the eye is disabled and dimmed for it.
++// the menu (gear) is never hideable, so the eye is disabled and dimmed for it (0250: the costume button either).
+ - (void)updateEditEye {
+     if (!_editEye) return;
+-    BOOL menu = _editSelected == E_MENU;
++    BOOL menu = _editSelected == E_MENU || _editSelected == E_COSTUME;
+     BOOL hidden = !menu && _lineHidden[_editSelected];
+     [_editEye setImage:[UIImage systemImageNamed:hidden ? @"eye.slash" : @"eye"] forState:UIControlStateNormal];
+     _editEye.tintColor = hidden ? UIColor.systemRedColor : UIColor.whiteColor;
+@@ -1148,7 +1148,7 @@ static const CGFloat k_panel_default[1][2] = {{0.30, 0.58}};   // pad: the bar's
+ }
+ - (void)editEyeTapped:(UIButton *)b {   // 0146: hide / show the selected icon
+     (void)b;
+-    if (_editSelected == E_MENU) return;   // the menu is never hideable
++    if (_editSelected == E_MENU || _editSelected == E_COSTUME) return;   // the menu is never hideable (0250: the costume button either)
+     _lineHidden[_editSelected] = !_lineHidden[_editSelected];
+     [self saveLineLayout];
+     [self applyLayout];   // the icon hides at once, or shows dimmed so it stays tappable
+@@ -1191,7 +1191,7 @@ static const CGFloat k_panel_default[1][2] = {{0.30, 0.58}};   // pad: the bar's
+         case E_A: return _key[B_A]; case E_B: return _key[B_B]; case E_Y: return _key[B_Y];
+         case E_ZL: return _key[B_ZL]; case E_L: return _key[B_L];
+         case E_MINUS: return _key[B_MINUS]; case E_PLUS: return _key[B_PLUS];
+-        case E_JUMP: return _jump; case E_MENU: return _menu; default: return _photo;
++        case E_JUMP: return _jump; case E_MENU: return _menu; case E_COSTUME: return _costume.layer; default: return _photo;
+     }
+ }
+ // 0146: whether a game key (B_*) is hidden by the player in the button settings
+@@ -1210,7 +1210,7 @@ static const CGFloat k_panel_default[1][2] = {{0.30, 0.58}};   // pad: the bar's
+         case E_A: return _key[B_A].hidden; case E_B: return _key[B_B].hidden; case E_Y: return _key[B_Y].hidden;
+         case E_ZL: return _key[B_ZL].hidden; case E_L: return _key[B_L].hidden;
+         case E_MINUS: return _key[B_MINUS].hidden; case E_PLUS: return _key[B_PLUS].hidden;
+-        case E_JUMP: return _jump.hidden; case E_MENU: return _menu.hidden; default: return _photo.hidden;
++        case E_JUMP: return _jump.hidden; case E_MENU: return _menu.hidden; case E_COSTUME: return _costume.hidden; default: return _photo.hidden;
+     }
+ }
+ - (CGFloat)editDrawnR:(int)e {   // the selected icon's drawn radius (the highlight rings this, not the hit circle)
+@@ -1219,6 +1219,7 @@ static const CGFloat k_panel_default[1][2] = {{0.30, 0.58}};   // pad: the bar's
+         case E_ZL: return [self dropR:B_ZL]; case E_L: return [self dropR:B_L];
+         case E_MINUS: case E_PLUS: return [self linePillRFor:e];
+         case E_MENU: return self.geo->swapR;   // the menu button's drawn radius (0117)
++        case E_COSTUME: return self.geo->costumeR;   // (0250) the costume button's drawn radius
+         default: return [self lineExtraRFor:e];
+     }
+ }
+@@ -1228,7 +1229,7 @@ static const CGFloat k_panel_default[1][2] = {{0.30, 0.58}};   // pad: the bar's
+         case E_ZL: return [self dropCenter:B_ZL]; case E_L: return [self dropCenter:B_L];
+         case E_MINUS: { CGRect r = [self pillRect:B_MINUS]; return CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r)); }
+         case E_PLUS: { CGRect r = [self pillRect:B_PLUS]; return CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r)); }
+-        case E_JUMP: return [self jumpCenter]; case E_MENU: return [self menuCenter]; default: return [self photoCenter];
++        case E_JUMP: return [self jumpCenter]; case E_MENU: return [self menuCenter]; case E_COSTUME: return [self costumeCenter]; default: return [self photoCenter];
+     }
+ }
+ - (CGFloat)editRadius:(int)e {   // a movable control's hit radius, in points
+@@ -1237,6 +1238,7 @@ static const CGFloat k_panel_default[1][2] = {{0.30, 0.58}};   // pad: the bar's
+         case E_ZL: return [self dropR:B_ZL]; case E_L: return [self dropR:B_L];
+         case E_MINUS: case E_PLUS: return [self linePillRFor:e];
+         case E_MENU: return MAX(self.geo->swapR * 1.6, 22);   // the menu button's hit radius, the same formula as dm_pad_menu_hit_r (0117)
++        case E_COSTUME: return MAX(self.geo->costumeR * 1.6, 22);   // (0250) the costume button's hit radius, the same formula as dm_pad_costume_hit_r
+         default: return [self lineExtraRFor:e];   // jump and photo
+     }
+ }
+@@ -1361,7 +1363,7 @@ static BOOL pads_slotted(GCController *gone) {
+ - (void)updateControlVisibility {
+     _controls.hidden = _padOff;
+     _menu.hidden = (_padOff && _layout.onTV);   // the gear stays visible in the button editor (it is adjustable now, 0117)
+-    _costume.hidden = (_padOff && _layout.onTV);   // (0249) the costume button follows the gear
++    _costume.hidden = (_padOff && _layout.onTV);   // (0249) the costume button hides with the gear
+     [self syncGlassVisibility];   // the glass hides with the whole touch pad while a controller is in use
+ }
+ - (void)padsChanged:(NSNotification *)note {
+diff --git a/dm/ios/Sources/DmPadGeometry.h b/dm/ios/Sources/DmPadGeometry.h
+index 12909aa0..91977b8f 100644
+--- a/dm/ios/Sources/DmPadGeometry.h
++++ b/dm/ios/Sources/DmPadGeometry.h
+@@ -46,6 +46,7 @@ typedef struct {
+     CGPoint click[2]; CGFloat clickR;                 // L3, R3 (3D only)
+     CGRect pill[2];                                   // −, +
+     CGPoint swap; CGFloat swapR;                      // the menu button
++    CGPoint costume; CGFloat costumeR;                // (0250) the costume button: above the menu button by default, its own size
+     CGPoint faceKey[4];                               // A B X Y where they are: the diamond around face, unless a key was moved on its own
+     BOOL faceSplit;                                   // a key of the diamond was moved on its own: the diamond is then grabbed key by key
+     unsigned moved, dropped;                          // DM_TOUCH_LAYOUT: the controls (1 << DM_PAD_C_*) it moved, and the ones it asked to move that kept their place
+@@ -126,19 +127,22 @@ static inline DmPadGeo dm_pad_geo_at(CGRect bounds, UIEdgeInsets insets, DmLayou
+         g.pill[i] = CGRectMake(x - w / 2, top - h / 2, w, h);
+     }
+     g.swap = CGPointMake(CGRectGetMidX(s), top); g.swapR = DM_PAD_SWAP_R * u;
++    g.costumeR = g.swapR;   // (0250) the costume button's own radius, the gear's until the button editor scales it
++    // (0250) The costume button sits ABOVE the gear: the gear is at the bottom edge, so below it is off the screen (V1.3.70: the icon only appeared
++    // once the player dragged the gear up). The gap is two hit radii plus a margin, so the hit circles never overlap; the − / + pills sit beside
++    // the gear, not above it, so the space above is clear.
++    g.costume = CGPointMake(g.swap.x, g.swap.y - (MAX(g.swapR * 1.6, 22) * 2 + 8));
+     for (int i = 0; i < 4; i++) g.faceKey[i] = dm_pad_diamond_key(g.face, g.faceGap, i);
+     return g;
+ }
+ 
+-// The costume button (0249): below the gear, clear of the − / + pills
+-// (which sit 12pt from the gear's edge): two menu hit radii plus a gap,
+-// so the hit circles never overlap; it follows the gear when the gear is
+-// dragged, so it needs no geometry of its own.
++// The costume button (0250): its own place in the geometry (g->costume),
++// above the gear by default, moved by the button editor's drag offset
++// (DmGamepad.m applyLineAdjustments). It no longer follows the gear.
+ static inline CGPoint dm_pad_costume_center(const DmPadGeo *g) {
+-    CGFloat gap = MAX(g->swapR * 1.6, 22) * 2 + 8;
+-    return CGPointMake(g->swap.x, g->swap.y + gap);
++    return g->costume;
+ }
+-static inline CGFloat dm_pad_costume_hit_r(const DmPadGeo *g) { return MAX(g->swapR * 1.6, 22); }
++static inline CGFloat dm_pad_costume_hit_r(const DmPadGeo *g) { return MAX(g->costumeR * 1.6, 22); }
+ 
+ // The face key positions: A right, B bottom, X top, Y left (i = 0..3 in that order).
+ static inline CGPoint dm_pad_face_key(const DmPadGeo *g, int i) { return g->faceKey[i]; }
+@@ -164,7 +168,7 @@ static inline int dm_pad_shapes(const DmPadGeo *g, BOOL full, DmPadShape out[_No
+     if (full) for (int i = 0; i < 2; i++) out[n++] = (DmPadShape){g->click[i], g->clickR, CGRectNull, NO, safe, DM_PAD_SHAPE_CLICK + i};
+     for (int i = 0; i < 2; i++) out[n++] = (DmPadShape){CGPointZero, 0, g->pill[i], YES, safe, DM_PAD_SHAPE_PILL + i};
+     out[n++] = (DmPadShape){g->swap, g->swapR, CGRectNull, NO, safe, DM_PAD_SHAPE_SWAP};
+-    out[n++] = (DmPadShape){dm_pad_costume_center(g), g->swapR, CGRectNull, NO, safe, DM_PAD_SHAPE_COSTUME};   // (0249) a moved control keeps clear of the costume button too
++    out[n++] = (DmPadShape){dm_pad_costume_center(g), g->costumeR, CGRectNull, NO, safe, DM_PAD_SHAPE_COSTUME};   // (0249) a moved control keeps clear of the costume button too
+     return n;
+ }
+ static inline BOOL dm_pad_shape_inside(const DmPadShape *s) {
+@@ -331,7 +335,7 @@ static inline BOOL dm_pad_control_fits(const DmPadGeo *g, BOOL full, int c) {
+         for (int j = 0; j < n; j++) {
+             if (dm_pad_is_shape_of(s[j].id, c)) continue;
+             DmPadShape o = s[j];
+-            if (o.id == DM_PAD_SHAPE_SWAP || o.id == DM_PAD_SHAPE_COSTUME) o.r = fmax(o.r + gap, MAX(g->swapR * 1.6, 22)) - gap;   // the menu button: its whole hit circle (0249: the costume button too)
++            if (o.id == DM_PAD_SHAPE_SWAP || o.id == DM_PAD_SHAPE_COSTUME) o.r = fmax(o.r + gap, MAX(o.r * 1.6, 22)) - gap;   // the menu button: its whole hit circle (0249: the costume button too; 0250: each button's own radius)
+             if (dm_pad_shapes_near(&s[i], &o, gap)) return NO;
+         }
+     }
+diff --git a/dm/ios/Sources/InGameCostumePicker.swift b/dm/ios/Sources/InGameCostumePicker.swift
+index 8df5b54b..cce617a4 100644
+--- a/dm/ios/Sources/InGameCostumePicker.swift
++++ b/dm/ios/Sources/InGameCostumePicker.swift
+@@ -15,9 +15,12 @@ import UIKit
+ // entry point below). The picker is no longer full-screen: it is the
+ // launcher's right glass box, ~550pt wide on the iPhone 15 Pro Max
+ // landscape canvas, the game visible around it; tap outside the box (or
+-// 完成) to close it. Presentation follows HudPadEditor
+-// (dm_hud_pad_open_editor): main queue, key window, modal over the root
+-// view controller. The scale formula is the launcher's
++// 完成) to close it. Presentation is modal over the topmost controller
++// (0250: as front_save_failed does — presenting from a controller that is
++// already presenting drops the new presentation silently, with no picker
++// and no error, which is what a tap on V1.3.70 did). Every step logs a
++// [dm] 0250 line, so the next device log says exactly where a failed
++// open stopped. The scale formula is the launcher's
+ // (Launcher.swift:1414).
+ 
+ private var dmCostumePickerController: DmHostingController<InGameCostumePickerView>?
+@@ -26,19 +29,38 @@ private var dmCostumePickerController: DmHostingController<InGameCostumePickerVi
+ @_cdecl("dm_costume_open_picker")
+ public func dm_costume_open_picker() {
+     DispatchQueue.main.async {
+-        guard dmCostumePickerController == nil else { return }  // already open
++        guard dmCostumePickerController == nil else {
++            dm_log("[dm] 0250: picker: already open, ignoring tap")
++            return
++        }  // already open
+         var window: UIWindow?
+         for scene in UIApplication.shared.connectedScenes {
+             guard let ws = scene as? UIWindowScene else { continue }
+             if let w = ws.windows.first(where: { $0.isKeyWindow }) { window = w; break }
+         }
+         window = window ?? UIApplication.shared.keyWindow
+-        guard let w = window, let root = w.rootViewController else { return }
++        guard let w = window else {
++            dm_log("[dm] 0250: picker: no key window, cannot present")
++            return
++        }
++        guard let root = w.rootViewController else {
++            dm_log("[dm] 0250: picker: no root view controller, cannot present")
++            return
++        }
++        // (0250) Present from the topmost controller, as front_save_failed
++        // does: presenting from a controller that is already presenting
++        // drops the new presentation silently, with no picker and no log.
++        var top = root
++        while let p = top.presentedViewController { top = p }
++        if top !== root {
++            dm_log("[dm] 0250: picker: root was presenting \(String(describing: type(of: top))), walking to it")
++        }
+         let picker = DmHostingController(rootView: InGameCostumePickerView())
+         picker.modalPresentationStyle = .overFullScreen
+         picker.view.backgroundColor = .clear
+         dmCostumePickerController = picker
+-        root.present(picker, animated: true)
++        dm_log("[dm] 0250: picker: presenting from \(String(describing: type(of: top)))")
++        top.present(picker, animated: true)
+     }
+ }
+ 
+diff --git a/dm/ios/Sources/front_ios.m b/dm/ios/Sources/front_ios.m
+index c9be3eca..4244e113 100644
+--- a/dm/ios/Sources/front_ios.m
++++ b/dm/ios/Sources/front_ios.m
+@@ -485,6 +485,9 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
+ 
+ // Save write failed (most likely the phone's storage is full): show a notice on the main thread without blocking the game. hle_fs.c calls this when a save transaction is refused or a mount has to fall back to read-only;
+ // the iOS front end used not to implement it, so there was only a log line and the player never learned that progress was not being saved
++// (0250) Swift's log line into Documents/log.txt: the host only writes to stderr, which main.m redirects to the log file, and the LOG macro is
++// C-only, so Swift calls this with the full line (including its own "[dm] " prefix, as the host's own lines do).
++void dm_log(const char *msg) { if (msg && *msg) LOG("%s", msg); }
+ void front_save_failed(int err) {
+     LOG("front end: save data write failed errno=%d, telling the player", err);
+     dispatch_async(dispatch_get_main_queue(), ^{
+-- 
+2.43.0
+

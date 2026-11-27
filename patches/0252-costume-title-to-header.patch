@@ -1,0 +1,130 @@
+From 6f9aebf45c2985b30cc429b9ebebc71b5336209f Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Fri, 27 Nov 2026 02:12:16 +0000
+Subject: [PATCH] 0252: move the costume title into the picker header (in-game
+ only)
+
+---
+ dm/ios/Sources/InGameCostumePicker.swift |  2 +-
+ dm/ios/Sources/Launcher.swift            | 49 ++++++++++++++++++++----
+ 2 files changed, 42 insertions(+), 9 deletions(-)
+
+diff --git a/dm/ios/Sources/InGameCostumePicker.swift b/dm/ios/Sources/InGameCostumePicker.swift
+index cce617a4..e0b7ab8e 100644
+--- a/dm/ios/Sources/InGameCostumePicker.swift
++++ b/dm/ios/Sources/InGameCostumePicker.swift
+@@ -92,7 +92,7 @@ private struct InGameCostumePickerView: View {
+                             .clipShape(Capsule())
+                     }
+                     .padding(.horizontal, 20)
+-                    CharacterPickerView(scale: scale)
++                    CharacterPickerView(scale: scale, titleInHeader: true)   // (0252) the section title sits in the header above the picker, not in the narrow column beside the hero
+                 }
+                 .padding(.vertical, 16)
+                 // 0249: the launcher's right glass box, not full-screen:
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index ecc3f1f6..ef0bf263 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -465,6 +465,9 @@ struct OutfitGridView: View {
+     let characterId: String
+     let characterName: String
+     let scale: CGFloat
++    // (0252) False in-game: the title lives in the header row above the
++    // picker instead. The launcher keeps the default (true).
++    let showTitle: Bool = true
+     let onSelect: (DeckItem) -> Void
+     // 0229: the interface-style switch lives in this header now (moved
+     // from the Game tab settings); same DmLauncherUIStyle key as the
+@@ -505,9 +508,14 @@ struct OutfitGridView: View {
+             // Header: title + subtitle + cap/clothes switch.
+             HStack(alignment: .firstTextBaseline) {
+                 VStack(alignment: .leading, spacing: 2 * scale) {
+-                    Text(characterName + "\u{7684}\u{670d}\u{88c5}")
+-                        .font(.system(size: 20 * scale, weight: .bold))
+-                        .foregroundStyle(.white)
++                    // (0252) Hidden in-game: the title lives in the
++                    // header row above the picker instead. The subtitle
++                    // stays here, beside the hero.
++                    if showTitle {
++                        Text(characterName + "\u{7684}\u{670d}\u{88c5}")
++                            .font(.system(size: 20 * scale, weight: .bold))
++                            .foregroundStyle(.white)
++                    }
+                     Text("\u{53ea}\u{663e}\u{793a}" + characterName + "\u{80fd}\u{7a7f}\u{7684}\u{8863}\u{670d}")
+                         .font(.system(size: 13 * scale))
+                         .foregroundStyle(.white.opacity(0.7))
+@@ -672,6 +680,9 @@ struct CartridgeCoverFlowView: View {
+     let scale: CGFloat
+     let onSelect: (DeckItem) -> Void
+     let onOpenChange: (Bool) -> Void
++    // (0252) False in-game: the title lives in the header row above the
++    // picker instead. The launcher keeps the default (true).
++    let showTitle: Bool = true
+     // 0229: the interface-style switch lives in this header now (moved
+     // from the Game tab settings); same DmLauncherUIStyle key as the
+     // parent, so tapping it swaps the picker immediately, no restart.
+@@ -743,9 +754,14 @@ struct CartridgeCoverFlowView: View {
+             // Header: title + subtitle + cap/clothes switch (same as classic).
+             HStack(alignment: .firstTextBaseline) {
+                 VStack(alignment: .leading, spacing: 2 * scale) {
+-                    Text(characterName + "\u{7684}\u{670d}\u{88c5}")
+-                        .font(.system(size: 20 * scale, weight: .bold))
+-                        .foregroundStyle(.white)
++                    // (0252) Hidden in-game: the title lives in the
++                    // header row above the picker instead. The subtitle
++                    // stays here, beside the hero.
++                    if showTitle {
++                        Text(characterName + "\u{7684}\u{670d}\u{88c5}")
++                            .font(.system(size: 20 * scale, weight: .bold))
++                            .foregroundStyle(.white)
++                    }
+                     Text("\u{53ea}\u{663e}\u{793a}" + characterName + "\u{80fd}\u{7a7f}\u{7684}\u{8863}\u{670d}")
+                         .font(.system(size: 13 * scale))
+                         .foregroundStyle(.white.opacity(0.7))
+@@ -1200,6 +1216,11 @@ struct CartridgeCoverFlowView: View {
+ /// The character picker (0194, 0201, 0209, 0226, in the box): the hero on the left and the outfit picker on the right, the six character cards in a row at the bottom. The choice is saved to DmCharSelect.character (NSUserDefaults), which dm_char_select_apply_saved reads at startup before the game starts, so the next launch plays as the picked character. The roster is Mario / Luigi / Wario / Peach / Pauline / Toad; the hero and the picker follow the pick. Pauline and Toad need their model patches (0193) to play in-game — the picker itself only writes the name. The hero is a live preview (0226): it shows the last-tapped outfit's render, and the character promo art for "default" or before any tap. Cap + clothes cannot be composited (the renders are single-item), so the hero shows one item at a time.
+ struct CharacterPickerView: View {
+     let scale: CGFloat
++    // (0252) In-game only: the section title ("<character>的服装") moves
++    // out of the narrow hero-side column into a full-width header row
++    // above the picker. The launcher keeps the default (false) and is
++    // unchanged.
++    let titleInHeader: Bool = false
+     @State private var selected: String = UserDefaults.standard.string(forKey: "DmCharSelect.character") ?? "mario"
+     @State private var heroOutfitImage: String? = nil   // nil = the character promo art; otherwise an outfit render name
+     @AppStorage("DmLauncherUIStyle") private var uiStyle: String = "classic"
+@@ -1234,6 +1255,18 @@ struct CharacterPickerView: View {
+ 
+     var body: some View {
+         VStack(spacing: 6 * scale) {
++            // (0252) In-game only: the section title, one line in the
++            // header above the picker (it wrapped to two lines in the
++            // narrow column beside the hero). Same text and styling as
++            // the title it replaces in the two headers below.
++            if titleInHeader {
++                HStack {
++                    Text(current.name + "\u{7684}\u{670d}\u{88c5}")
++                        .font(.system(size: 20 * scale, weight: .bold))
++                        .foregroundStyle(.white)
++                    Spacer()
++                }
++            }
+             // Top row (0209, 0226): the hero is back. 0201 dropped it when the stacked deck became a flat grid, but the settled design keeps the big image next to the clothes — "大图330宽" in the mockup is 330 mockup pixels, i.e. 170pt at 2x, the 0194 frame. Hero on the left in a fixed frame (so a narrow render like Peach or Pauline does not move the picker), picker on the right; both follow the picked character. The hero is a live preview (0226): it shows the last-tapped outfit's render, the promo art for "default".
+             HStack(alignment: .top, spacing: 12 * scale) {
+                 // Hero (0226 live preview) + the cartridge badge (0227):
+@@ -1272,9 +1305,9 @@ struct CharacterPickerView: View {
+                 // cap/clothes state from the same DmCharSelect.*
+                 // defaults, so switching styles never loses the pick.
+                 if uiStyle == "cartridge" {
+-                    CartridgeCoverFlowView(characterId: current.id, characterName: current.name, scale: scale, onSelect: didSelect, onOpenChange: { lidOpen = $0 })
++                    CartridgeCoverFlowView(characterId: current.id, characterName: current.name, scale: scale, showTitle: !titleInHeader, onSelect: didSelect, onOpenChange: { lidOpen = $0 })
+                 } else {
+-                    OutfitGridView(characterId: current.id, characterName: current.name, scale: scale, onSelect: didSelect)
++                    OutfitGridView(characterId: current.id, characterName: current.name, scale: scale, showTitle: !titleInHeader, onSelect: didSelect)
+                 }
+             }
+             // Cards: one row, left to right. The selected card gets a gold ring.
+-- 
+2.43.0
+

@@ -193,3 +193,6 @@
 0247-stutter-compcap-raise-to-period.patch
 0248-ingame-build-id-fix-and-register.patch
 0249-costume-delay-gate-scene-ui.patch
+0250-costume-picker-present-and-editor.patch
+0251-ingame-scene-accept-idle-next.patch
+0252-costume-title-to-header.patch

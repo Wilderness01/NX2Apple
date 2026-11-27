@@ -1,0 +1,32 @@
+From 734e3e27d8865482e780cdda440c6beb730b276a Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Fri, 27 Nov 2026 02:10:32 +0000
+Subject: [PATCH] 0251: accept an idle NerveKeeper (next == 0) in the in-game
+ scene check
+
+---
+ dm/host/hle_cheats.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/dm/host/hle_cheats.c b/dm/host/hle_cheats.c
+index c7044066..04e7abdc 100644
+--- a/dm/host/hle_cheats.c
++++ b/dm/host/hle_cheats.c
+@@ -1707,7 +1707,13 @@ static int ingame_scene_valid(uint64_t scene, uint64_t base) {
+     if (mem_read(keeper + 0x08, 8, &cur) != 0) return 0;
+     if (mem_read(keeper + 0x10, 8, &nxt) != 0) return 0;
+     if (cur < base + INGAME_SLOT_LO || cur >= base + INGAME_SLOT_HI) return 0;
+-    if (nxt < base + INGAME_SLOT_LO || nxt >= base + INGAME_SLOT_HI) return 0;
++    // 0251: an idle NerveKeeper has no next nerve queued (next == 0 is the
++    // normal steady state, mid-nerve: device log-6a204394 keeper
++    // K=0x70c2f2de08, state 2160, cur a valid slot, next 0). The old check
++    // demanded next in the slot range too, so it rejected every idle scene
++    // and the pick never applied. cur stays strict: the active nerve is
++    // never 0 on a live scene.
++    if (nxt && (nxt < base + INGAME_SLOT_LO || nxt >= base + INGAME_SLOT_HI)) return 0;
+     if (mem_read(keeper + 0x28, 8, &tail) != 0 || tail != 0) return 0;
+     return 1;
+ }
+-- 
+2.43.0
+
