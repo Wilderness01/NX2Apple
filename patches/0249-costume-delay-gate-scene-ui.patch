@@ -1,0 +1,666 @@
+From d24623f87a405f9132d550039da38a2488958630 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Thu, 26 Nov 2026 23:57:31 +0000
+Subject: [PATCH] 0249: costume delay gate, scene sub-vtable, costume button + box picker
+
+---
+ dm/host/hle_cheats.c                         |  37 ++++++++++++++++++++------
+ dm/host/hle_fs.c                             |  36 +++++++++++++++++++++----
+ dm/ios/Sources/DmGameMenu.h                  |   1 +
+ dm/ios/Sources/DmGamepad.m                   |  35 ++++++++++++++++++++++--
+ dm/ios/Sources/DmPadGeometry.h               |  25 ++++++++++++++++--
+ dm/ios/Sources/GameMenu.swift                |   6 ++---
+ dm/ios/Sources/InGameCostumePicker.swift     |  38 +++++++++++++++++++--------
+ dm/ios/Sources/Launcher.swift                |   2 +-
+ dm/ios/Sources/PadIcons/pad_line_costume.png | Bin 0 -> 10964 bytes
+ 9 files changed, 148 insertions(+), 32 deletions(-)
+
+diff --git a/dm/host/hle_cheats.c b/dm/host/hle_cheats.c
+index 0c2be26..c704406 100644
+--- a/dm/host/hle_cheats.c
++++ b/dm/host/hle_cheats.c
+@@ -1653,7 +1653,7 @@ static void costume_override_present(void) {
+ #define INGAME_BUILD_ID      "b424be150a8e7d78701cbe7a439d9ebf"  // NSO build id, first 16 bytes hex (1.4.1 main, BUILD_141)
+ #define INGAME_SEND_MSG      0x75cbd0ull   // generic send-message function
+ #define INGAME_CHANGE_STR    0xe6ec60ull   // "ChangeClothes" rodata string
+-#define INGAME_SCENE_VT      0x12c4dc8ull  // StageScene main vtable
++#define INGAME_SCENE_SUB_VT  0x12c4e40ull  // StageScene sub-object vtable ([scene+0x10]; RTTI "10StageScene", shared across kingdoms)
+ #define INGAME_SLOT_LO       0x12c5d90ull  // first scene nerve slot (.data vaddr)
+ #define INGAME_SLOT_HI       0x12c5f80ull  // end of the scene nerve-slot run (exclusive)
+ #define INGAME_NERVE_LO      0x12c4ee8ull  // first scene nerve object
+@@ -1686,15 +1686,22 @@ static int ingame_build_ok(void) {
+     return bid && strncmp(bid, INGAME_BUILD_ID, 32) == 0;
+ }
+ 
+-// Scene validity, checked before every use of the pinned scene: the vtable
+-// is the StageScene vtable, [scene+0x08] is the keeper, the keeper's owner
+-// is this scene (bidirectional), both slots are scene nerve slots, and the
+-// keeper tail is 0. A freed/reused scene fails the vtable or the owner
+-// link, so a stale pin is never called through.
++// Scene validity, checked before every use of the pinned scene: the
++// sub-object vtable is the StageScene class vtable, [scene+0x08] is the
++// keeper, the keeper's owner is this scene (bidirectional), both slots are
++// scene nerve slots, and the keeper tail is 0. A freed/reused scene fails
++// the vtable or the owner link, so a stale pin is never called through.
++// 0249 (log-e7763d1d): the old check read the StageScene MAIN vtable
++// (0x12c4dc8, Sand Kingdom: [3] is the Sand stage init 0x46e7a0), so a
++// scene from any other kingdom failed validity and the pick was silently
++// dropped. The sub-object at scene+0x10 is INLINE (its vtable pointer
++// lives at [scene+0x10]) and its vtable is the StageScene class vtable
++// (RELA: +0x48 "10StageScene", +0x50 al::Scene class info), shared by
++// every kingdom -- so validity reads that one instead.
+ static int ingame_scene_valid(uint64_t scene, uint64_t base) {
+     if (!scene || !base) return 0;
+-    uint64_t vt = 0, keeper = 0, link = 0, cur = 0, nxt = 0, tail = 0;
+-    if (mem_read(scene, 8, &vt) != 0 || vt != base + INGAME_SCENE_VT) return 0;
++    uint64_t subvt = 0, keeper = 0, link = 0, cur = 0, nxt = 0, tail = 0;
++    if (mem_read(scene + 0x10, 8, &subvt) != 0 || subvt != base + INGAME_SCENE_SUB_VT) return 0;
+     if (mem_read(scene + 0x08, 8, &keeper) != 0 || !keeper) return 0;
+     if (mem_read(keeper + 0x00, 8, &link) != 0 || link != scene) return 0;
+     if (mem_read(keeper + 0x08, 8, &cur) != 0) return 0;
+@@ -1785,6 +1792,20 @@ static uint64_t ingame_scene_scan(uint64_t base) {
+             if (ingame_keeper_test(k, base, hb, hopen, &o)) {
+                 matched++;
+                 if (ingame_scene_valid(o, base)) scene = o;
++                else {
++                    // 0249: say what the scene actually is, so the next log
++                    // settles whether the run was in a kingdom at all (the
++                    // log-e7763d1d question: title screen vs. another
++                    // kingdom). One line per scan (the thread re-scans every
++                    // ~60 s), not per frame: ingame_scene_valid itself stays
++                    // silent, it also runs on every presented frame.
++                    uint64_t mvt = 0, svt = 0;
++                    (void)mem_read(o, 8, &mvt);
++                    (void)mem_read(o + 0x10, 8, &svt);
++                    LOG("[dm] 0249: scene %#llx rejected: main vt %#llx, sub vt %#llx (want sub %#llx)",
++                        (unsigned long long)o, (unsigned long long)mvt,
++                        (unsigned long long)svt, (unsigned long long)(base + INGAME_SCENE_SUB_VT));
++                }
+             }
+         }
+     }
+diff --git a/dm/host/hle_fs.c b/dm/host/hle_fs.c
+index bb5c7bd..2a481c8 100644
+--- a/dm/host/hle_fs.c
++++ b/dm/host/hle_fs.c
+@@ -881,6 +881,22 @@ static const char *dm_char_nonbody_cores[] = {
+     "PeachHeadShort", "PeachSkirt", "PonchoGuitar", "PonchoPoncho",
+     "SpaceHelmet",
+ };
++
++// 0249: whether the delayed redirect (0246) presses this file to the
++// character default. Only an ordinary BODY file (part == "", a core that
++// is neither a named form nor a non-body core) is pressed: the aborting
++// SARC at kingdom entry is the body file, and pressing any other file
++// breaks its loader's by-name lookup (log-5b04d0b5: MarioHigh.szs ->
++// Mario.szs, the High loader wants MarioHigh.bfres, NULL+0x28 at
++// 0x6ad530). Decided from the ORIGINAL core, before core_len is zeroed.
++static int dm_costume_delay_presses(const char *part, const char *core, size_t core_len) {
++    if (!dm_costume_delay_redirect() || part[0]) return 0;
++    if ((core_len == 4 && !memcmp(core, "High", 4)) ||
++        (core_len == 8 && !memcmp(core, "Mechanic", 8))) return 0;
++    for (size_t i = 0; i < sizeof dm_char_nonbody_cores / sizeof *dm_char_nonbody_cores; i++)
++        if (core_len == strlen(dm_char_nonbody_cores[i]) && !memcmp(core, dm_char_nonbody_cores[i], core_len)) return 0;
++    return 1;
++}
+ static int dm_char_redirect(const char *p, char *out, size_t n) {
+     // The path checks come first, so a player-model open is logged even when
+     // no character is picked: the log then proves the game opens the file at
+@@ -952,7 +968,15 @@ static int dm_char_redirect(const char *p, char *out, size_t n) {
+     // FrameHeap (0240 line). Forcing the core to empty makes this file a
+     // default part, so the redirect below can only name the character's
+     // default part (small files); the character swap itself is untouched.
+-    if (dm_costume_delay_redirect()) core_len = 0;
++    // 0249 (log-5b04d0b5): press ONLY an ordinary body file. 0246 pressed
++    // every file, so MarioHigh.szs became Mario.szs and the High loader
++    // looked MarioHigh.bfres up by name inside it -> NULL -> 0x6ad530
++    // (log-62 Mechanic, same class). A named form (High/Mechanic) keeps
++    // its own core by the rule below; a part-less non-body core (0216)
++    // has no slot counterpart at all; a part file (Head/Cap/Hand/...)
++    // is small, never the aborting SARC.
++    int delay_press = dm_costume_delay_presses(part, core, core_len);
++    if (delay_press) core_len = 0;
+     // The overlay lives on the mount the game named (h_fs_MountRom attaches
+     // DM_ROMFS_OVERLAY to the MountRom name, i.e. "content"); there is no
+     // "rom" mount on device, so a lookup for a mount named "rom" finds
+@@ -1008,10 +1032,12 @@ static int dm_char_redirect(const char *p, char *out, size_t n) {
+     // A set value names the costume to force ("default" = the character's own
+     // default part); unset follows the save, with the adapted-or-default rule.
+     const char *slot = !strcmp(part, "Cap") ? cap : clothes;
+-    // 0246: with the delayed redirect on, the slot is forced to "default"
+-    // (with core_len forced to 0 above, the only candidate the redirect
+-    // can name is the character's default part).
+-    if (dm_costume_delay_redirect()) slot = "default";
++    // 0246/0249: with the delayed redirect pressing THIS file, the slot is
++    // forced to "default" (with core_len forced to 0 above, the only
++    // candidate the redirect can name is the character's default part).
++    // A file the gate did not press keeps its own slot (High/Mechanic keep
++    // the same-core rule, part files keep the pick).
++    if (delay_press) slot = "default";
+     // 0218 (log-85) / 0220: the slot must never redirect a cap file to a
+     // stock costume cap. The cap loader looks the cap model up by name
+     // ("MarioCap") inside the cap file, like the High/Mechanic loaders
+diff --git a/dm/ios/Sources/DmGameMenu.h b/dm/ios/Sources/DmGameMenu.h
+index 51bb21e..04da579 100644
+--- a/dm/ios/Sources/DmGameMenu.h
++++ b/dm/ios/Sources/DmGameMenu.h
+@@ -15,6 +15,7 @@ void dm_hud_pad_open_editor(void);   // HudPadEditor.m: the in-game menu's "HUD
+ void dm_hud_pad_apply_saved(void);   // HudPadEditor.m: the saved DmHudPad.* settings go into the DM_HUD_* environment before the game starts
+ void dm_char_select_apply_saved(void);   // CharSelectPersist.m (0168): the saved DmCharSelect.* settings go into the DM_CHAR_* environment before the game starts
+ void dm_costume_apply_now(void);   // hle_cheats.c (0246): the in-game picker's tap calls this after writing DmCharSelect.* and setenv'ing DM_CHAR_* -- it arms the in-game change (SaveData write + ChangeClothes) on the next presented frame
++void dm_costume_open_picker(void);   // InGameCostumePicker.swift (0249): the gamepad's costume button beside the gear opens the in-game picker (C entry point, @_cdecl)
+ void dm_gamepad_touch_feedback(bool on);   // DM_TOUCH_HAPTICS
+ bool dm_setting_live(const char *env, const char *value);
+ void *dm_quit_menu(void);   // front_ios.m: the menu's last item, Quit <game>, which opens the quit prompt (a retained UIMenu, shown inline)   // front_ios.m: value NULL asks whether the running game takes env at once; otherwise applies it
+diff --git a/dm/ios/Sources/DmGamepad.m b/dm/ios/Sources/DmGamepad.m
+index b6484e8..5de511c 100644
+--- a/dm/ios/Sources/DmGamepad.m
++++ b/dm/ios/Sources/DmGamepad.m
+@@ -48,7 +48,7 @@
+ 
+ enum { B_A = 0, B_B, B_X, B_Y, B_LS, B_RS, B_L, B_R, B_ZL, B_ZR, B_PLUS, B_MINUS, B_LEFT, B_UP, B_RIGHT, B_DOWN, B_N };
+ enum { E_A = 0, E_B, E_Y, E_ZL, E_L, E_MINUS, E_PLUS, E_JUMP, E_PHOTO, E_MENU, E_N };   // the movable controls (the button editor), the menu included (0117); others are hidden (X, ZR, R, L3, R3, D-pad) or floating (the stick)
+-enum { G_A = 0, G_B, G_Y, G_ZL, G_L, G_PLUS, G_MINUS, G_JUMP, G_PHOTO, G_MENU, G_N };   // the controls with a glass disc behind them (0111)
++enum { G_A = 0, G_B, G_Y, G_ZL, G_L, G_PLUS, G_MINUS, G_JUMP, G_PHOTO, G_MENU, G_COSTUME, G_N };   // the controls with a glass disc behind them (0111); G_COSTUME is the in-game costume button (0249)
+ static NSString *const k_lineEditKeys[E_N] = {@"a", @"b", @"y", @"zl", @"l", @"minus", @"plus", @"jump", @"photo", @"menu"};   // the NSUserDefaults offsets' keys
+ static NSString *const k_lineEditNames[E_N] = {@"A键", @"B键", @"攻击键", @"撞地键", @"视角键", @"+键", @"−键", @"跳跃键", @"拍照键", @"设置键"};   // the editor's name for the selected icon
+ enum { C_NONE = 0, C_STICK, C_DPAD, C_FACE, C_BTN, C_GAME };   // which control a touch holds; C_GAME: none, the touch goes to the game's touch screen (finger slot << 8)
+@@ -146,6 +146,7 @@ void front_ios_quit_controllers(void);   // front_ios.m: the controllers changed
+ @interface DmGamepad : UIView <UIGestureRecognizerDelegate>
+ - (void)arrange:(DmLayout)layout;
+ - (BOOL)menuTakes:(CGPoint)p;
++- (BOOL)costumeTakes:(CGPoint)p;   // (0249) the costume button's hit test, like the menu's
+ @end
+ // The menu button: a UIButton whose menu is the in-game menu (UIKit draws it and takes the touches while it is open). Its hit circle is larger than the drawn one, and a key nearer
+ // to the touch wins (− / + sit beside it), so it asks the pad
+@@ -154,6 +155,13 @@ void front_ios_quit_controllers(void);   // front_ios.m: the controllers changed
+ @implementation DmMenuButton
+ - (BOOL)pointInside:(CGPoint)p withEvent:(UIEvent *)e { DmGamepad *pad = (DmGamepad *)self.superview; return [pad menuTakes:[self convertPoint:p toView:pad]]; }
+ @end
++
++// The costume button (0249): like the menu button, a UIButton of its own below the gear; it opens the in-game costume picker (InGameCostumePicker.swift), it is not in the button editor (it follows the gear), and its hit circle is the menu's.
++@interface DmCostumeButton : UIButton
++@end
++@implementation DmCostumeButton
++- (BOOL)pointInside:(CGPoint)p withEvent:(UIEvent *)e { DmGamepad *pad = (DmGamepad *)self.superview; return [pad costumeTakes:[self convertPoint:p toView:pad]]; }
++@end
+ static __weak DmGamepad *g_view;
+ static void pads_start(void);   // Physical controllers, below
+ 
+@@ -186,6 +194,7 @@ static void pads_start(void);   // Physical controllers, below
+     DmPadGeo _geoLine;                             // the geometry with the editor's size and drag offsets applied
+     CALayer *_hint; CATextLayer *_hintText; NSString *_hintWords;   // the 3D layout's right-stick hint: words only, once per launch (see "The right-stick hint")
+     DmMenuButton *_menu;                           // opens the in-game menu (GameMenu.swift)
++    DmCostumeButton *_costume;                     // (0249) opens the in-game costume picker, below the gear
+     UIImpactFeedbackGenerator *_touchFeedback;       // one short feedback per touch-control press edge
+     unsigned _hapticSticks;
+     BOOL _stickShown;                              // the left stick was held at the last refresh
+@@ -379,6 +388,12 @@ static void glassDiscSetOpacity(CAGradientLayer *disc, CGFloat p) {   // the fal
+         __weak DmGamepad *weakSelf = self;
+         [_menu addAction:[UIAction actionWithHandler:^(UIAction *a) { (void)a; [weakSelf reset]; }] forControlEvents:UIControlEventMenuActionTriggered];   // the menu opens: release every key and touch first
+         [self addSubview:_menu];
++        _costume = [DmCostumeButton buttonWithType:UIButtonTypeCustom];   // (0249) the costume button, beside the gear: the same line-icon set, the same size
++        _costume.backgroundColor = UIColor.clearColor;
++        [_costume setBackgroundImage:padUIImage(@"pad_line_costume") forState:UIControlStateNormal];   // the line t-shirt + gold arc, the same set as the gear
++        _costume.accessibilityLabel = @"Costume";
++        [_costume addTarget:self action:@selector(openCostumePicker) forControlEvents:UIControlEventTouchUpInside];
++        [self addSubview:_costume];
+         if (!_glassView[0]) {   // below iOS 26 (no real glass): the vector glass discs, each below its icon layer (the menu's below the menu's layer)
+             for (int g = 0; g < G_N; g++) {
+                 CAGradientLayer *disc = glassDiscLayer();
+@@ -494,6 +509,11 @@ static int dropIndex(int b) { return b == B_ZL ? DM_PAD_ZL : b == B_L ? DM_PAD_L
+ - (CGPoint)clickCenter:(int)b { return self.geo->click[b == B_RS]; }
+ - (CGRect)pillRect:(int)b { return self.geo->pill[b == B_PLUS ? DM_PAD_PLUS : DM_PAD_MINUS]; }
+ - (CGPoint)menuCenter { return self.geo->swap; }
++- (CGPoint)costumeCenter {   // (0249) below the gear, clear of the − / + pills (which sit 12pt from the gear's edge): two hit radii plus a gap, so the hit circles never overlap; it follows the gear when the gear is dragged (0117)
++    CGFloat gap = MAX(self.geo->swapR * 1.6, 22) * 2 + 8;
++    CGPoint mc = self.menuCenter;
++    return CGPointMake(mc.x, mc.y + gap);
++}
+ 
+ static CGFloat dist(CGPoint a, CGPoint b) { return hypot(a.x - b.x, a.y - b.y); }
+ static int lockedKey(int c) {   // DmPadGeometry.h's control → the key it presses
+@@ -506,6 +526,13 @@ static int lockedKey(int c) {   // DmPadGeometry.h's control → the key it pres
+     if (_tap || _padOff || (_layout.separated && !CGRectContainsPoint(_layout.controls, p))) return YES;
+     return dm_pad_menu_takes(self.geo, _full, _layout.separated, p);
+ }
++- (BOOL)costumeTakes:(CGPoint)p {   // (0249) the costume button takes a touch in its hit circle unless a locked key's target is nearer, or the gear is nearer (the circles never overlap by construction; this is the tie-break)
++    if (_editing) return NO;   // the button editor is open: the touch falls through to the pad (the costume button is not movable, it follows the gear)
++    if (dm_pad_costume_distance(self.geo, p) > 1) return NO;
++    if (_tap || _padOff || (_layout.separated && !CGRectContainsPoint(_layout.controls, p))) return YES;
++    return dm_pad_costume_takes(self.geo, _full, _layout.separated, p);
++}
++- (void)openCostumePicker { [self reset]; dm_costume_open_picker(); }   // (0249) like opening the menu: release every key and touch first
+ - (uint64_t)faceAt:(CGPoint)p {   // keys under the finger in the diamond (between two keys both count); a hidden key cannot be pressed (0146)
+     uint64_t m = 0;
+     for (int b = B_A; b <= B_Y; b++) if (![self keyUserHidden:b] && dist(p, [self facePos:b]) <= [self lineFaceHitR:b]) m |= 1ull << b;
+@@ -686,6 +713,7 @@ static CGRect growRect(CGRect r, CGFloat fill) {   // grow a rect about its cent
+     _photo.frame = growRect(squareFrame([self photoCenter], 2 * [self lineExtraRFor:E_PHOTO]), DM_PAD_LINE_FILL);
+     CGFloat mr = self.geo->swapR; CGPoint mc = self.menuCenter;
+     _menu.frame = growRect(squareFrame(mc, 2 * mr), k_padMenuFill); _menu.layer.cornerRadius = _menu.frame.size.width / 2;
++    _costume.frame = growRect(squareFrame([self costumeCenter], 2 * mr), k_padMenuFill); _costume.layer.cornerRadius = _costume.frame.size.width / 2;   // (0249) the same size as the gear, below it
+     for (int g = 0; g < G_N; g++) {   // the glass follows its button: the same centre and size, through the size slider and drags (the geometry already carries them)
+         CGRect f = [self glassFrame:g];
+         if (_glassView[g]) { _glassView[g].frame = f; _glassView[g].layer.cornerRadius = f.size.width / 2; }
+@@ -724,12 +752,14 @@ static CGRect growRect(CGRect r, CGFloat fill) {   // grow a rect about its cent
+         case G_MINUS: { CGRect r = [self pillRect:B_MINUS]; return squareFrame(CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r)), 2 * [self linePillRFor:E_MINUS]); }
+         case G_JUMP: return squareFrame([self jumpCenter], 2 * [self lineExtraRFor:E_JUMP]);
+         case G_PHOTO: return squareFrame([self photoCenter], 2 * [self lineExtraRFor:E_PHOTO]);
++        case G_COSTUME: return squareFrame([self costumeCenter], 2 * self.geo->swapR);   // (0249) the costume button's own square
+         default: return squareFrame(self.menuCenter, 2 * self.geo->swapR);
+     }
+ }
+ - (BOOL)glassHidden:(int)g {   // the glass follows its control: hidden with it in the Tap layout
+     CALayer *icon = [self glassIconLayer:g];
+-    return icon ? icon.hidden : _menu.hidden;
++    if (icon) return icon.hidden;
++    return g == G_COSTUME ? _costume.hidden : _menu.hidden;   // (0249) the costume button is a view of its own, like the menu
+ }
+ - (void)syncGlassVisibility {
+     for (int g = 0; g < G_N; g++) {
+@@ -1331,6 +1361,7 @@ static BOOL pads_slotted(GCController *gone) {
+ - (void)updateControlVisibility {
+     _controls.hidden = _padOff;
+     _menu.hidden = (_padOff && _layout.onTV);   // the gear stays visible in the button editor (it is adjustable now, 0117)
++    _costume.hidden = (_padOff && _layout.onTV);   // (0249) the costume button follows the gear
+     [self syncGlassVisibility];   // the glass hides with the whole touch pad while a controller is in use
+ }
+ - (void)padsChanged:(NSNotification *)note {
+diff --git a/dm/ios/Sources/DmPadGeometry.h b/dm/ios/Sources/DmPadGeometry.h
+index d2efd77..12909aa 100644
+--- a/dm/ios/Sources/DmPadGeometry.h
++++ b/dm/ios/Sources/DmPadGeometry.h
+@@ -130,6 +130,16 @@ static inline DmPadGeo dm_pad_geo_at(CGRect bounds, UIEdgeInsets insets, DmLayou
+     return g;
+ }
+ 
++// The costume button (0249): below the gear, clear of the − / + pills
++// (which sit 12pt from the gear's edge): two menu hit radii plus a gap,
++// so the hit circles never overlap; it follows the gear when the gear is
++// dragged, so it needs no geometry of its own.
++static inline CGPoint dm_pad_costume_center(const DmPadGeo *g) {
++    CGFloat gap = MAX(g->swapR * 1.6, 22) * 2 + 8;
++    return CGPointMake(g->swap.x, g->swap.y + gap);
++}
++static inline CGFloat dm_pad_costume_hit_r(const DmPadGeo *g) { return MAX(g->swapR * 1.6, 22); }
++
+ // The face key positions: A right, B bottom, X top, Y left (i = 0..3 in that order).
+ static inline CGPoint dm_pad_face_key(const DmPadGeo *g, int i) { return g->faceKey[i]; }
+ static inline CGPoint dm_pad_drop_tip(const DmPadGeo *g, int i) {
+@@ -139,7 +149,7 @@ static inline CGPoint dm_pad_drop_tip(const DmPadGeo *g, int i) {
+ 
+ // The drawn shapes as circles and rectangles, for the fit test and for tests: each with the rectangle it must stay inside.
+ typedef struct { CGPoint c; CGFloat r; CGRect rect; BOOL isRect; CGRect within; int id; } DmPadShape;
+-enum { DM_PAD_SHAPE_FACE = 0, DM_PAD_SHAPE_STICK = 4, DM_PAD_SHAPE_DPAD, DM_PAD_SHAPE_DROP, DM_PAD_SHAPE_TIP = 10, DM_PAD_SHAPE_CLICK = 14, DM_PAD_SHAPE_PILL = 16, DM_PAD_SHAPE_SWAP = 18 };
++enum { DM_PAD_SHAPE_FACE = 0, DM_PAD_SHAPE_STICK = 4, DM_PAD_SHAPE_DPAD, DM_PAD_SHAPE_DROP, DM_PAD_SHAPE_TIP = 10, DM_PAD_SHAPE_CLICK = 14, DM_PAD_SHAPE_PILL = 16, DM_PAD_SHAPE_SWAP = 18, DM_PAD_SHAPE_COSTUME = 19 };   // DM_PAD_SHAPE_COSTUME is the in-game costume button (0249)
+ static inline int dm_pad_shapes(const DmPadGeo *g, BOOL full, DmPadShape out[_Nonnull 20]) {
+     int n = 0;
+     CGRect safe = CGRectIsNull(g->customBounds) ? g->safe : g->customBounds;
+@@ -154,6 +164,7 @@ static inline int dm_pad_shapes(const DmPadGeo *g, BOOL full, DmPadShape out[_No
+     if (full) for (int i = 0; i < 2; i++) out[n++] = (DmPadShape){g->click[i], g->clickR, CGRectNull, NO, safe, DM_PAD_SHAPE_CLICK + i};
+     for (int i = 0; i < 2; i++) out[n++] = (DmPadShape){CGPointZero, 0, g->pill[i], YES, safe, DM_PAD_SHAPE_PILL + i};
+     out[n++] = (DmPadShape){g->swap, g->swapR, CGRectNull, NO, safe, DM_PAD_SHAPE_SWAP};
++    out[n++] = (DmPadShape){dm_pad_costume_center(g), g->swapR, CGRectNull, NO, safe, DM_PAD_SHAPE_COSTUME};   // (0249) a moved control keeps clear of the costume button too
+     return n;
+ }
+ static inline BOOL dm_pad_shape_inside(const DmPadShape *s) {
+@@ -320,7 +331,7 @@ static inline BOOL dm_pad_control_fits(const DmPadGeo *g, BOOL full, int c) {
+         for (int j = 0; j < n; j++) {
+             if (dm_pad_is_shape_of(s[j].id, c)) continue;
+             DmPadShape o = s[j];
+-            if (o.id == DM_PAD_SHAPE_SWAP) o.r = fmax(o.r + gap, MAX(g->swapR * 1.6, 22)) - gap;   // the menu button: its whole hit circle
++            if (o.id == DM_PAD_SHAPE_SWAP || o.id == DM_PAD_SHAPE_COSTUME) o.r = fmax(o.r + gap, MAX(g->swapR * 1.6, 22)) - gap;   // the menu button: its whole hit circle (0249: the costume button too)
+             if (dm_pad_shapes_near(&s[i], &o, gap)) return NO;
+         }
+     }
+@@ -418,6 +429,16 @@ static inline BOOL dm_pad_menu_takes(const DmPadGeo *g, BOOL full, BOOL sep, CGP
+     if (d > 1) return NO;
+     return dm_pad_locked_at(g, full, sep, p, &kd) < 0 || d < kd;
+ }
++// Whether the costume button takes a touch-down at p (0249): in its hit
++// circle and nearer than any locked key's target, and nearer than the gear
++// (the circles never overlap by construction; this is the tie-break).
++static inline CGFloat dm_pad_costume_distance(const DmPadGeo *g, CGPoint p) { return dm_pad_dist(p, dm_pad_costume_center(g)) / dm_pad_costume_hit_r(g); }
++static inline BOOL dm_pad_costume_takes(const DmPadGeo *g, BOOL full, BOOL sep, CGPoint p) {
++    CGFloat d = dm_pad_costume_distance(g, p), kd;
++    if (d > 1) return NO;
++    if (dm_pad_dist(p, dm_pad_costume_center(g)) >= dm_pad_dist(p, g->swap)) return NO;
++    return dm_pad_locked_at(g, full, sep, p, &kd) < 0 || d < kd;
++}
+ // A touch-down the menu button did not take. tap: the Tap layout (no control but the menu). stickFree: no touch holds the left stick yet.
+ static inline DmPadHit dm_pad_hit(const DmPadGeo *g, BOOL full, BOOL sep, BOOL tap, BOOL stickFree, CGPoint p) {
+     if (tap) return (DmPadHit){DM_PAD_HIT_NONE, -1};
+diff --git a/dm/ios/Sources/GameMenu.swift b/dm/ios/Sources/GameMenu.swift
+index bc66694..ab2b8dd 100644
+--- a/dm/ios/Sources/GameMenu.swift
++++ b/dm/ios/Sources/GameMenu.swift
+@@ -21,18 +21,18 @@ private func gameMenuItems() -> [UIMenuElement] {
+     let layout = UIMenu(title: LauncherText.text("ui.controllerLayout", "Controller layout"), image: UIImage(systemName: "gamecontroller"), options: .singleSelection, children: layouts)   // a choice's value shows in its submenu: a subtitle would make each row two lines
+     let padSettings = UIAction(title: "按键设置", image: UIImage(systemName: "gamecontroller.fill")) { _ in dm_gamepad_open_pad_settings() }   // the button editor (DmGamepad.m): the icons' size and where they sit
+     let hudSettings = UIAction(title: "HUD 设置", image: UIImage(systemName: "gauge")) { _ in dm_hud_pad_open_editor() }   // (0148) the pad-style HUD editor (HudPadEditor.m): drag the elements on the game, live in the running game
+-    let costumeSettings = UIAction(title: "换装", image: UIImage(systemName: "tshirt")) { _ in dm_costume_open_picker() }   // (0246) the in-game costume picker: the same character/outfit picker as the launcher, over the game; a tap applies the costume in-game (SaveData write + ChangeClothes), a character change takes effect at the next kingdom entry
++    // (0249) the costume picker left the gear menu: it has its own button on the main screen, beside the gear (DmGamepad.m)
+     var items: [UIMenuElement] = []
+     var placed = false
+     if let m = gameMenuModel {
+         for section in m.sections {
+-            var rows: [UIMenuElement] = section == "Controls" ? [layout, padSettings, hudSettings, costumeSettings] : []
++            var rows: [UIMenuElement] = section == "Controls" ? [layout, padSettings, hudSettings] : []
+             if section == "Controls" { placed = true }
+             for s in m.rows(in: section) where (s.kind == "choice" || s.kind == "toggle") && dm_setting_live(s.env, nil) { rows.append(gameMenuRow(m, s)) }
+             if !rows.isEmpty { items.append(UIMenu(options: .displayInline, children: rows)) }
+         }
+     }
+-    if !placed { items.insert(UIMenu(options: .displayInline, children: [layout, padSettings, hudSettings, costumeSettings]), at: 0) }
++    if !placed { items.insert(UIMenu(options: .displayInline, children: [layout, padSettings, hudSettings]), at: 0) }
+     items.append(Unmanaged<UIMenu>.fromOpaque(dm_quit_menu()).takeRetainedValue())   // Quit <game>, last and on its own: it opens the quit prompt (front_ios.m)
+     return items
+ }
+diff --git a/dm/ios/Sources/InGameCostumePicker.swift b/dm/ios/Sources/InGameCostumePicker.swift
+index bf90c92..8df5b54 100644
+--- a/dm/ios/Sources/InGameCostumePicker.swift
++++ b/dm/ios/Sources/InGameCostumePicker.swift
+@@ -2,8 +2,7 @@ import SwiftUI
+ import UIKit
+ 
+ // The in-game costume picker (0246): the launcher's CharacterPickerView,
+-// presented over the running game from the in-game menu's "换装" row
+-// (GameMenu.swift -> dm_costume_open_picker()). A tap in the picker writes
++// presented over the running game. A tap in the picker writes
+ // DmCharSelect.* and pushes the pick to the host at once (Launcher.swift
+ // select(): dm_char_select_apply_saved() + dm_costume_apply_now()); the host
+ // applies the costume on the next presented frame (SaveData write +
+@@ -11,14 +10,21 @@ import UIKit
+ // entry (the fs redirect reads the updated environment). Closing the
+ // picker returns to the game; the launcher is untouched.
+ //
+-// Presentation follows HudPadEditor (dm_hud_pad_open_editor): main queue,
+-// key window, modal over the root view controller. The scale formula is
+-// the launcher's (Launcher.swift:1414).
++// (0249) Entry moved out of the gear menu: the gamepad's costume button
++// beside the gear opens it (DmGamepad.m -> dm_costume_open_picker(), C
++// entry point below). The picker is no longer full-screen: it is the
++// launcher's right glass box, ~550pt wide on the iPhone 15 Pro Max
++// landscape canvas, the game visible around it; tap outside the box (or
++// 完成) to close it. Presentation follows HudPadEditor
++// (dm_hud_pad_open_editor): main queue, key window, modal over the root
++// view controller. The scale formula is the launcher's
++// (Launcher.swift:1414).
+ 
+ private var dmCostumePickerController: DmHostingController<InGameCostumePickerView>?
+ 
+-/// GameMenu.swift calls this (C entry point, declared in DmGameMenu.h).
+-func dm_costume_open_picker() {
++/// DmGamepad.m calls this (C entry point, declared in DmGameMenu.h).
++@_cdecl("dm_costume_open_picker")
++public func dm_costume_open_picker() {
+     DispatchQueue.main.async {
+         guard dmCostumePickerController == nil else { return }  // already open
+         var window: UIWindow?
+@@ -29,7 +35,8 @@ func dm_costume_open_picker() {
+         window = window ?? UIApplication.shared.keyWindow
+         guard let w = window, let root = w.rootViewController else { return }
+         let picker = DmHostingController(rootView: InGameCostumePickerView())
+-        picker.modalPresentationStyle = .fullScreen
++        picker.modalPresentationStyle = .overFullScreen
++        picker.view.backgroundColor = .clear
+         dmCostumePickerController = picker
+         root.present(picker, animated: true)
+     }
+@@ -37,14 +44,17 @@ func dm_costume_open_picker() {
+ 
+ private struct InGameCostumePickerView: View {
+     @Environment(\.dismiss) private var dismiss
++    @AppStorage("DmGlassOpacity") private var glassOpacity: Double = 70
+ 
+     var body: some View {
+         GeometryReader { geo in
+             let scale = min(max(geo.size.width / 932, 0.5), 1.6)
+             ZStack {
+                 // The game is behind the picker; a dim backdrop keeps the
+-                // picker readable without hiding the game entirely.
++                // picker readable without hiding the game entirely. Tap
++                // outside the box to close it.
+                 Color.black.opacity(0.45).ignoresSafeArea()
++                    .onTapGesture { dismiss() }
+                 VStack(spacing: 12) {
+                     HStack {
+                         Text("换装")
+@@ -61,10 +71,16 @@ private struct InGameCostumePickerView: View {
+                     }
+                     .padding(.horizontal, 20)
+                     CharacterPickerView(scale: scale)
+-                    Spacer()
+                 }
+-                .padding(.top, 16)
++                .padding(.vertical, 16)
++                // 0249: the launcher's right glass box, not full-screen:
++                // 550pt wide on the reference canvas (the launcher's box
++                // is ~550 wide there), clamped to the screen; the height
++                // follows the content, as the launcher's box does.
++                .frame(width: min(550 * scale, geo.size.width - 24))
++                .dmGlassCard(cornerRadius: 24, opacity: glassOpacity)
+             }
++            .frame(width: geo.size.width, height: geo.size.height)
+         }
+         .onDisappear { dmCostumePickerController = nil }
+     }
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index df9fabd..ecc3f1f 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -163,7 +163,7 @@ private struct DocumentPicker: UIViewControllerRepresentable {
+ /// Liquid Glass for the launcher's panels (0181, 0194, 0201, 0206, 0217): iOS 26 native .glassEffect, regular; below iOS 26 a translucent material fill. The deployment target is iOS 26, so the fallback is dead code kept for the pattern's sake — the same ladder the pad's discs use (0111: real UIGlassEffect on 26+, vector disc below). Layered, not flat: a soft inner highlight along the top edge and a gentle drop shadow give the card depth; the corner radius is a little larger (32) for the game's rounded, playful shapes. Glass needs something behind it to refract: the backdrop is a deep navy-black base, neutral on purpose — the text is white on dark glass, and a loud backdrop would fight it.
+ ///
+ /// `opacity` (0194, 0201, 0206, 0217) is the ONE glass-intensity setting (UserDefaults DmGlassOpacity, 0-100, default 70): 0 makes the glass vanish entirely (no effect, no tint, no shadow), 100 is the deepest. The box and the bottom bar read the same value, so one slider drives both. `light` is the bottom bar's pale pill: a white tint instead of the dark navy one, so its dark icons stay readable. (0217: one .regular glass throughout, .interactive() so it shimmers under a touch like the pad's discs; the strength fades the glass layer's own opacity 0 -> 1 from the slider's 0 to the 70 anchor and holds 1 past it, and the tint is one continuous line over the whole range, deepening to 100. The 0206 .clear/.regular switch at 35 is gone — it made the panel jump colour the instant the slider crossed it; now 0 -> 100 is a single smooth ramp.)
+-private extension View {
++extension View {   // (0249) was private: the in-game costume picker (InGameCostumePicker.swift) reuses the same glass card, so the box looks like the launcher's and follows the same DmGlassOpacity slider
+     @ViewBuilder func dmGlassCard(cornerRadius: CGFloat = 32, opacity: Double = 70, light: Bool = false) -> some View {
+         let op = max(0, min(100, opacity)) / 100
+         dmGlassBase(cornerRadius: cornerRadius, opacity: op, light: light)
+diff --git a/dm/ios/Sources/PadIcons/pad_line_costume.png b/dm/ios/Sources/PadIcons/pad_line_costume.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..0e94992fe066450019801fdf3fda8185f62b5888
+GIT binary patch
+literal 10964
+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
+W(QFB%Ib`^^Us+y5u3F|@*#84^q9|wp
+
+literal 0
+HcmV?d00001
+
