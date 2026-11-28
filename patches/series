@@ -197,3 +197,4 @@
 0251-ingame-scene-accept-idle-next.patch
 0252-costume-title-to-header.patch
 0253-fix-0252-init-args.patch
+0254-picker-flags-mutable-for-init.patch
