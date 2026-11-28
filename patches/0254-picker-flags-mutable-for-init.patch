@@ -1,0 +1,44 @@
+From b79bec3555a40cbb18fb262a51ca86f0a75a13e0 Mon Sep 17 00:00:00 2001
+From: seedds <seedds@gmail.com>
+Date: Sat, 28 Nov 2026 00:12:28 +0000
+Subject: [PATCH] 0254: let->var for the 0252 picker flags so the 0253 init can
+ assign them
+
+---
+ dm/ios/Sources/Launcher.swift | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index beb2e60b..d51cc190 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -467,7 +467,7 @@ struct OutfitGridView: View {
+     let scale: CGFloat
+     // (0252) False in-game: the title lives in the header row above the
+     // picker instead. The launcher keeps the default (true).
+-    let showTitle: Bool = true
++    var showTitle: Bool = true
+     let onSelect: (DeckItem) -> Void
+ 
+     // (0253) Explicit initializer matching the call site's argument
+@@ -693,7 +693,7 @@ struct CartridgeCoverFlowView: View {
+     let onOpenChange: (Bool) -> Void
+     // (0252) False in-game: the title lives in the header row above the
+     // picker instead. The launcher keeps the default (true).
+-    let showTitle: Bool = true
++    var showTitle: Bool = true
+ 
+     // (0253) Explicit initializer matching the call site's argument
+     // labels and order (showTitle before onSelect); the default keeps
+@@ -1244,7 +1244,7 @@ struct CharacterPickerView: View {
+     // out of the narrow hero-side column into a full-width header row
+     // above the picker. The launcher keeps the default (false) and is
+     // unchanged.
+-    let titleInHeader: Bool = false
++    var titleInHeader: Bool = false
+ 
+     // (0253) Explicit initializer matching the call site's argument
+     // labels; the default keeps the launcher call unchanged.
+-- 
+2.43.0
+
